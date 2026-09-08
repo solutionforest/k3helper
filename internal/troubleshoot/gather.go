@@ -14,6 +14,8 @@ type Gatherer struct {
 	Server ssh.Executor
 	// Hosts: node name → executor for host-level probes (nil skips host layer).
 	Hosts map[string]ssh.Executor
+	// Unreachable: nodes in the targets file we could not connect to.
+	Unreachable []UnreachableNode
 }
 
 // Collect assembles an Evidence bundle. Never fails: collection problems
@@ -27,6 +29,7 @@ func (g Gatherer) Collect() Evidence {
 		K3sService:      map[string]string{},
 		HostMetrics:     map[string]HostMetric{},
 		PVCEvents:       map[string][]string{},
+		Unreachable:     g.Unreachable,
 	}
 
 	// --- cluster layer via kubectl ---

@@ -1,6 +1,6 @@
 //go:build integration
 
-package vm
+package vm_test
 
 import (
 	"os"
@@ -8,37 +8,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/solutionforest/k3helper/internal/sandbox"
 	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/vm"
 )
 
-// sandboxClient connects to a sandbox VM.
-func sandboxClient(port int) (*ssh.Client, error) {
-	return ssh.Dial(ssh.Node{
-		Host: "127.0.0.1", Port: port, User: "sandbox",
-		Key: "../../test/sandbox/ssh/id_ed25519",
-	})
-}
-
 // TestSandboxClusterReady verifies the sandbox cluster (bootstrapped via
-// `k3helper vm setup`) has all nodes Ready. Run after sandbox-up + vm setup.
+// `k3helper vm setup`) has every node in the targets file Ready.
 func TestSandboxClusterReady(t *testing.T) {
-	server, err := sandboxClient(2221)
+	server := sandbox.Dial(t, "server")
+
+	targets, err := sandbox.Targets()
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("load targets: %v", err)
 	}
-	defer server.Close()
+	wantNodes := len(targets.Nodes)
 
 	deadline := time.Now().Add(60 * time.Second)
+	var out string
+	var code int
 	for {
-		out, code, err := server.SudoRun(`k3s kubectl get nodes --no-headers`)
-		if err == nil && code == 0 && strings.Count(out, "Ready") >= 3 {
+		out, code, err = server.SudoRun(`k3s kubectl get nodes --no-headers`)
+		if err == nil && code == 0 && countReady(out) >= wantNodes {
 			return // success
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("cluster not ready in time; kubectl output: %q (code %d, err %v)", out, code, err)
+			t.Fatalf("only %d/%d nodes Ready in time; kubectl output: %q (code %d, err %v)",
+				countReady(out), wantNodes, out, code, err)
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// countReady counts nodes whose STATUS column is exactly "Ready"; a substring
+// match would also count "NotReady".
+func countReady(kubectlOutput string) int {
+	n := 0
+	for _, line := range strings.Split(kubectlOutput, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[1] == "Ready" {
+			n++
+		}
+	}
+	return n
 }
 
 // TestFullBootstrap reinstalls the whole cluster from scratch. It is slow
@@ -47,36 +59,43 @@ func TestFullBootstrap(t *testing.T) {
 	if os.Getenv("K3HELPER_FULL_BOOTSTRAP") != "1" {
 		t.Skip("set K3HELPER_FULL_BOOTSTRAP=1 to run the full cluster reinstall")
 	}
-	// uninstall k3s everywhere
-	for _, port := range []int{2222, 2223, 2221} {
-		c, err := sandboxClient(port)
+	serverNode, err := sandbox.Node("server")
+	if err != nil {
+		t.Skipf("sandbox targets unavailable: %v", err)
+	}
+	agentNodes, err := sandbox.Agents()
+	if err != nil {
+		t.Fatalf("load agents: %v", err)
+	}
+
+	// uninstall k3s everywhere (agents first, then the server)
+	for _, n := range append(append([]ssh.Node{}, agentNodes...), serverNode) {
+		c, err := ssh.Dial(n)
 		if err != nil {
-			t.Fatalf("connect :%d: %v", port, err)
+			t.Fatalf("connect %s: %v", n.Host, err)
 		}
 		c.SudoRun(`/usr/local/bin/k3s-uninstall.sh 2>/dev/null; /usr/local/bin/k3s-agent-uninstall.sh 2>/dev/null; true`)
 		c.Close()
 	}
 
-	server, err := sandboxClient(2221)
-	if err != nil {
-		t.Fatalf("connect server: %v", err)
-	}
-	defer server.Close()
-	agent1, _ := sandboxClient(2222)
-	defer agent1.Close()
-	agent2, _ := sandboxClient(2223)
-	defer agent2.Close()
-
-	srvNode := ssh.Node{Host: "127.0.0.1", Port: 2221, User: "sandbox", Key: "../../test/sandbox/ssh/id_ed25519"}
-	agents := []struct {
+	server := sandbox.Dial(t, "server")
+	agents := make([]struct {
 		Node   ssh.Node
 		Client *ssh.Client
-	}{
-		{ssh.Node{Host: "127.0.0.1", Port: 2222, User: "sandbox", Key: "../../test/sandbox/ssh/id_ed25519"}, agent1},
-		{ssh.Node{Host: "127.0.0.1", Port: 2223, User: "sandbox", Key: "../../test/sandbox/ssh/id_ed25519"}, agent2},
+	}, 0, len(agentNodes))
+	for _, n := range agentNodes {
+		c, err := ssh.Dial(n)
+		if err != nil {
+			t.Fatalf("connect agent %s: %v", n.Host, err)
+		}
+		defer c.Close()
+		agents = append(agents, struct {
+			Node   ssh.Node
+			Client *ssh.Client
+		}{n, c})
 	}
 
-	err = Setup(server, srvNode, agents, Options{
+	err = vm.Setup(server, serverNode, agents, vm.Options{
 		ServerExtraArgs: "--snapshotter=native --disable=traefik",
 		AgentExtraArgs:  "--snapshotter=native",
 	})

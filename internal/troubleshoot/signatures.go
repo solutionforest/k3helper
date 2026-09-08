@@ -37,6 +37,9 @@ type Evidence struct {
 	PVCEvents map[string][]string
 	// KubeconfigError: error text if kubeconfig/auth is broken
 	KubeconfigError string
+	// Unreachable: nodes that could not be contacted at all. Absence of
+	// evidence from a node is itself a finding, never a reason to stay silent.
+	Unreachable []UnreachableNode
 
 	// livePods: namespace/pod keys of pods that currently exist.
 	// Populated by parsePods; used to drop stale evidence for deleted pods.
@@ -48,6 +51,12 @@ type Evidence struct {
 type HostMetric struct {
 	DiskUsedPercent int
 	AvailMemMB      int
+}
+
+// UnreachableNode is a targets-file node that could not be contacted.
+type UnreachableNode struct {
+	Name   string
+	Reason string
 }
 
 // Diagnosis is a ranked possible root cause.
@@ -79,6 +88,19 @@ func Diagnose(e Evidence) []Diagnosis {
 }
 
 var registry = []Signature{
+	{
+		ID:    "node.unreachable",
+		Title: "Node unreachable over SSH (no evidence could be gathered)",
+		Match: func(e Evidence) int {
+			if len(e.Unreachable) == 0 {
+				return 0
+			}
+			// A node we cannot reach may hide any other fault, so this
+			// outranks the signatures that depend on host evidence.
+			return min(95, 75+len(e.Unreachable)*10)
+		},
+		Remediation: "Confirm the node is powered on and reachable (`ping`), that sshd is running, and that the host/port/user/key in the targets file are correct. Until it responds, no host-level diagnosis is possible for that node.",
+	},
 	{
 		ID:    "pod.imagepull",
 		Title: "Pods failing to pull images (ImagePullBackOff / ErrImagePull)",

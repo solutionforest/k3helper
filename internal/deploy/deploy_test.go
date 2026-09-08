@@ -3,6 +3,7 @@ package deploy
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -29,12 +30,12 @@ error line without format`
 }
 
 func TestDeployDryRunSuccess(t *testing.T) {
-	exec := fakeExec{check.MapExec{
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f m.yaml 2>&1": {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
 			Out: "deployment.apps/web created (server dry run)\n", Code: 0,
 		},
-	}}
-	res, err := Deploy(exec, "m.yaml", Options{DryRun: true})
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{DryRun: true})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -43,13 +44,134 @@ func TestDeployDryRunSuccess(t *testing.T) {
 	}
 }
 
+// TestDeployUploadsManifest: the manifest lives on the caller's machine, so
+// Deploy must ship it to the target and clean it up rather than assuming
+// kubectl can already see the path.
+func TestDeployUploadsManifest(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
+			Out: "namespace/x created (server dry run)\n", Code: 0,
+		},
+	})
+	local := writeManifest(t)
+	want, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Deploy(exec, local, Options{DryRun: true}); err != nil {
+		t.Fatalf("deploy: %v", err)
+	}
+	if len(exec.written) != 1 {
+		t.Fatalf("uploads = %d, want 1", len(exec.written))
+	}
+	for path, data := range exec.written {
+		if !strings.HasPrefix(path, "/tmp/k3helper-") {
+			t.Errorf("upload path = %q, want a /tmp/k3helper- temp path", path)
+		}
+		if string(data) != string(want) {
+			t.Errorf("uploaded contents = %q, want %q", data, want)
+		}
+	}
+	if len(exec.removed) != 1 {
+		t.Errorf("removed = %v, want the temp file cleaned up", exec.removed)
+	}
+}
+
+// TestDeployAppliesNamespaceOverride: --namespace must actually reach kubectl.
+// It used to be parsed, stored in Options and never read, so deploys landed in
+// the default namespace while reporting success.
+func TestDeployAppliesNamespaceOverride(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -n 'staging' -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web created (server dry run)\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -n 'staging' -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web created\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status -n 'staging' 'deployment.apps/web' --timeout=5s 2>&1": {
+			Out: "deployment \"web\" successfully rolled out\n", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{Namespace: "staging", WaitTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.RolledOut) != 1 {
+		t.Errorf("rolledOut = %v, want the deployment; namespace flag likely not threaded through", res.RolledOut)
+	}
+}
+
+// TestDeployRejectsNamespaceConflict: silently redirecting a document that
+// names its own namespace is how resources land in the wrong place.
+func TestDeployRejectsNamespaceConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ns.yaml")
+	manifest := "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: prod\nspec:\n  ports:\n    - port: 80\n"
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := newFakeExec(check.MapExec{})
+	_, err := Deploy(exec, path, Options{Namespace: "staging"})
+	if err == nil {
+		t.Fatal("expected a conflict error, got nil")
+	}
+	if !strings.Contains(err.Error(), "conflicts with the manifest") {
+		t.Errorf("err = %v, want a namespace conflict error", err)
+	}
+	if len(exec.written) != 0 {
+		t.Error("nothing should have been uploaded after a conflict")
+	}
+}
+
+// A document that agrees with the flag, or omits the namespace, is fine.
+func TestDeployAllowsMatchingOrAbsentNamespace(t *testing.T) {
+	for name, manifest := range map[string]string{
+		"matching": "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\n  namespace: staging\nspec:\n  ports:\n    - port: 80\n",
+		"absent":   "apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  ports:\n    - port: 80\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "s.yaml")
+			if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			exec := newFakeExec(check.MapExec{
+				"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -n 'staging' -f '<remote>' 2>&1": {
+					Out: "service/web created (server dry run)\n", Code: 0,
+				},
+			})
+			if _, err := Deploy(exec, path, Options{Namespace: "staging", DryRun: true}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeployRejectsInvalidNamespace(t *testing.T) {
+	for _, bad := range []string{"Staging", "has space", "x'; rm -rf /; '", "-lead", "trail-"} {
+		exec := newFakeExec(check.MapExec{})
+		if _, err := Deploy(exec, writeManifest(t), Options{Namespace: bad}); err == nil {
+			t.Errorf("namespace %q accepted, want rejection", bad)
+		}
+	}
+}
+
+func TestDeployMissingLocalManifest(t *testing.T) {
+	exec := newFakeExec(check.MapExec{})
+	_, err := Deploy(exec, filepath.Join(t.TempDir(), "nope.yaml"), Options{DryRun: true})
+	if err == nil {
+		t.Fatal("expected an error for a manifest that does not exist locally")
+	}
+	if !strings.Contains(err.Error(), "read manifest") {
+		t.Errorf("err = %v, want a read-manifest error", err)
+	}
+}
+
 func TestDeployDryRunValidationFailure(t *testing.T) {
-	exec := fakeExec{check.MapExec{
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f bad.yaml 2>&1": {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
 			Out: "error: unable to recognize \"bad.yaml\"\n", Code: 1,
 		},
-	}}
-	_, err := Deploy(exec, "bad.yaml", Options{DryRun: true})
+	})
+	_, err := Deploy(exec, writeManifest(t), Options{DryRun: true})
 	if err == nil {
 		t.Fatal("expected validation failure")
 	}
@@ -59,21 +181,21 @@ func TestDeployDryRunValidationFailure(t *testing.T) {
 }
 
 func TestDeployApplyThenRolloutWait(t *testing.T) {
-	exec := fakeExec{check.MapExec{
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f m.yaml 2>&1": {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
 			Out: "deployment.apps/web created (server dry run)\n", Code: 0,
 		},
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f m.yaml 2>&1": {
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f '<remote>' 2>&1": {
 			Out: "deployment.apps/web created\nservice/web-svc created\n", Code: 0,
 		},
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status deployment.apps/web --timeout=5s 2>&1": {
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status 'deployment.apps/web' --timeout=5s 2>&1": {
 			Out: "deployment \"web\" successfully rolled out\n", Code: 0,
 		},
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get service/web-svc -o name 2>&1": {
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get 'service/web-svc' -o name 2>&1": {
 			Out: "service/web-svc\n", Code: 0,
 		},
-	}}
-	res, err := Deploy(exec, "m.yaml", Options{WaitTimeout: 5 * time.Second})
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{WaitTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -86,18 +208,18 @@ func TestDeployApplyThenRolloutWait(t *testing.T) {
 }
 
 func TestDeployRolloutFailureRecorded(t *testing.T) {
-	exec := fakeExec{check.MapExec{
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f m.yaml 2>&1": {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
 			Out: "deployment.apps/web created (server dry run)\n", Code: 0,
 		},
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f m.yaml 2>&1": {
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f '<remote>' 2>&1": {
 			Out: "deployment.apps/web created\n", Code: 0,
 		},
-		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status deployment.apps/web --timeout=5s 2>&1": {
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status 'deployment.apps/web' --timeout=5s 2>&1": {
 			Out: "error: deployment \"web\" exceeded its progress deadline\n", Code: 1,
 		},
-	}}
-	res, err := Deploy(exec, "m.yaml", Options{WaitTimeout: 5 * time.Second})
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{WaitTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatalf("deploy itself should not error, only record: %v", err)
 	}
@@ -109,14 +231,47 @@ func TestDeployRolloutFailureRecorded(t *testing.T) {
 	}
 }
 
-func TestWaitReadyIntegration(t *testing.T) {
-	if os.Getenv("K3HELPER_SANDBOX") != "1" {
-		t.Skip("sandbox only")
-	}
-	_ = filepath.Join // keep import
+// fakeExec adapts check.MapExec to the deploy.Executor interface, recording
+// the uploads Deploy performs. Commands are matched with the generated remote
+// path normalised back to a stable placeholder so cases stay readable.
+type fakeExec struct {
+	cmds    check.MapExec
+	written map[string][]byte
+	removed []string
 }
 
-// fakeExec adapts check.MapExec to the deploy.Executor interface.
-type fakeExec struct{ check.MapExec }
+func newFakeExec(cmds check.MapExec) *fakeExec {
+	return &fakeExec{cmds: cmds, written: map[string][]byte{}}
+}
 
-func (f fakeExec) Run(cmd string) (string, int, error) { return f.MapExec.Run(cmd) }
+func (f *fakeExec) Run(cmd string) (string, int, error) {
+	return f.cmds.Run(normalizeRemotePath(cmd))
+}
+
+func (f *fakeExec) WriteFile(remotePath string, data []byte, mode os.FileMode) error {
+	f.written[remotePath] = data
+	return nil
+}
+
+func (f *fakeExec) RemoveFile(remotePath string) error {
+	f.removed = append(f.removed, remotePath)
+	return nil
+}
+
+// normalizeRemotePath rewrites the random /tmp/k3helper-<hex>-<base> path
+// Deploy generates into "<remote>" so test fixtures can be written literally.
+var remotePathRe = regexp.MustCompile(`/tmp/k3helper-[0-9a-f]{8}-[^' ]*`)
+
+func normalizeRemotePath(cmd string) string {
+	return remotePathRe.ReplaceAllString(cmd, "<remote>")
+}
+
+// writeManifest creates a local manifest file for Deploy to upload.
+func writeManifest(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	if err := os.WriteFile(path, []byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}

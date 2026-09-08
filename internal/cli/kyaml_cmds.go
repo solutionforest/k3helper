@@ -6,24 +6,58 @@ import (
 	"os"
 	"text/tabwriter"
 
+	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/kyaml"
+	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/spf13/cobra"
 )
 
 func newVerifyCmd() *cobra.Command {
-	var jsonOut bool
+	var (
+		jsonOut     bool
+		serverDry   bool
+		targetsPath string
+	)
 	cmd := &cobra.Command{
 		Use:   "verify <file...>",
-		Short: "Validate Kubernetes YAML manifests (syntax + structure)",
+		Short: "Validate Kubernetes YAML manifests (syntax + structure, optionally against a live API server)",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// --dry-run=server adds validation layer 3: submit each manifest to
+			// the real API server, which catches unknown fields, admission
+			// rejections and CRD schemas that offline rules cannot.
+			var server *ssh.Client
+			if serverDry {
+				targets, err := config.LoadTargets(targetsPath)
+				if err != nil {
+					return err
+				}
+				srvNode, err := targets.Server()
+				if err != nil {
+					return err
+				}
+				server, err = ssh.Dial(toSSHNode(*srvNode))
+				if err != nil {
+					return fmt.Errorf("connect to server: %w", err)
+				}
+				defer server.Close()
+			}
+
 			anyFailed := false
 			for _, path := range args {
 				data, err := os.ReadFile(path)
 				if err != nil {
 					return fmt.Errorf("read %s: %w", path, err)
 				}
-				res := kyaml.Verify(data)
+				var res *kyaml.Result
+				if server != nil {
+					res, err = kyaml.VerifyLive(server, data, path)
+					if err != nil {
+						return fmt.Errorf("verify %s against server: %w", path, err)
+					}
+				} else {
+					res = kyaml.Verify(data)
+				}
 				if jsonOut {
 					enc := json.NewEncoder(cmd.OutOrStdout())
 					enc.SetIndent("", "  ")
@@ -44,6 +78,8 @@ func newVerifyCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "output results as JSON")
+	cmd.Flags().BoolVar(&serverDry, "dry-run-server", false, "also validate against the live API server (kubectl apply --dry-run=server)")
+	cmd.Flags().StringVarP(&targetsPath, "targets", "t", "targets.yaml", "path to targets YAML (used with --dry-run-server)")
 	return cmd
 }
 
@@ -64,7 +100,12 @@ func printVerifyResult(cmd *cobra.Command, path string, res *kyaml.Result) {
 			if field != "" {
 				field = " [" + field + "]"
 			}
-			fmt.Fprintf(w, "  \tline %d%s\t%s\n", issue.Line, field, issue.Message)
+			// Line 0 means "no line to point at" (server-reported issues).
+			loc := "  "
+			if issue.Line > 0 {
+				loc = fmt.Sprintf("line %d", issue.Line)
+			}
+			fmt.Fprintf(w, "  \t%s%s\t%s\n", loc, field, issue.Message)
 		}
 	}
 	w.Flush()

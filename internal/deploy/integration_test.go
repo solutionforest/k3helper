@@ -1,40 +1,31 @@
 //go:build integration
 
-package deploy
+package deploy_test
 
 import (
-	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/deploy"
+	"github.com/solutionforest/k3helper/internal/kyaml"
+	"github.com/solutionforest/k3helper/internal/sandbox"
 )
 
-// TestDeployLiveDeployDemo applies a tiny nginx deployment on the sandbox
-// server and waits for rollout.
+// TestDeployLiveDeployDemo deploys a local manifest to the sandbox cluster.
+// The manifest is never copied by hand: shipping it to the target is Deploy's
+// job, and this test exists to prove it.
 func TestDeployLiveDeployDemo(t *testing.T) {
-	if os.Getenv("K3HELPER_SANDBOX") != "1" {
-		t.Skip("set K3HELPER_SANDBOX=1 with live sandbox")
-	}
-	server, err := ssh.Dial(ssh.Node{Host: "192.168.139.177", Port: 22, User: "sandbox", Key: "../../test/sandbox/ssh/id_ed25519"})
-	if err != nil {
+	server := sandbox.Dial(t, "server")
+
+	manifest := filepath.Join(t.TempDir(), "demo.yaml")
+	if err := os.WriteFile(manifest, []byte(demoManifest), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
 
-	dir := t.TempDir()
-	manifest := filepath.Join(dir, "demo.yaml")
-	if err := os.WriteFile(manifest, []byte(demoManifest), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := scpTo(server, manifest, "/tmp/k3helper-demo.yaml"); err != nil {
-		t.Fatalf("copy manifest: %v", err)
-	}
-
-	res, err := Deploy(server, "/tmp/k3helper-demo.yaml", Options{WaitTimeout: 90 * time.Second})
+	res, err := deploy.Deploy(server, manifest, deploy.Options{WaitTimeout: 90 * time.Second})
 	if err != nil {
 		t.Fatalf("deploy: %v", err)
 	}
@@ -46,7 +37,34 @@ func TestDeployLiveDeployDemo(t *testing.T) {
 	}
 
 	// cleanup
-	server.Run("sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml delete deployment k3helper-demo --ignore-not-found")
+	server.Run(kyaml.KubectlBase + " delete deployment k3helper-demo --ignore-not-found")
+}
+
+// TestGeneratedManifestsPassServerDryRun is the round-trip guarantee with
+// teeth: every kind `gen` supports must be accepted by a real API server.
+// The offline rules in Verify cannot prove this on their own.
+func TestGeneratedManifestsPassServerDryRun(t *testing.T) {
+	server := sandbox.Dial(t, "server")
+
+	for kind := range kyaml.KnownKinds {
+		t.Run(kind, func(t *testing.T) {
+			out, err := kyaml.Generate(kyaml.GenParams{
+				Kind:  kind,
+				Name:  "gen-" + strings.ToLower(kind),
+				Image: "busybox:latest",
+			})
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			res, err := kyaml.VerifyLive(server, []byte(out), kind+".yaml")
+			if err != nil {
+				t.Fatalf("verify against server: %v", err)
+			}
+			if !res.OK {
+				t.Errorf("API server rejected generated %s: %+v\n---\n%s", kind, res.Issues, out)
+			}
+		})
+	}
 }
 
 const demoManifest = `apiVersion: apps/v1
@@ -69,17 +87,3 @@ spec:
         ports:
         - containerPort: 80
 `
-
-// scpTo copies a local file to the remote host via base64 over ssh.
-func scpTo(c *ssh.Client, localPath, remotePath string) error {
-	data, err := os.ReadFile(localPath)
-	if err != nil {
-		return err
-	}
-	enc := base64.StdEncoding.EncodeToString(data)
-	_, code, err := c.Run("echo " + enc + " | base64 -d > " + remotePath + " && chmod 644 " + remotePath)
-	if err != nil || code != 0 {
-		return err
-	}
-	return nil
-}

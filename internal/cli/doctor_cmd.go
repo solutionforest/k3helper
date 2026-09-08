@@ -32,31 +32,44 @@ func newDoctorCmd() *cobra.Command {
 			}
 			defer server.Close()
 
+			// Every node gets its own connection except the one we already
+			// dialled for kubectl. A node we cannot reach is evidence, not
+			// something to skip: silently dropping it lets doctor report a
+			// healthy cluster while a node is down.
 			hosts := map[string]ssh.Executor{}
+			var unreachable []troubleshoot.UnreachableNode
 			for _, n := range targets.Nodes {
-				if n.Role == "agent" {
-					if c, err := ssh.Dial(toSSHNode(n)); err == nil {
-						defer c.Close()
-						hosts[n.Name] = c
-					}
-				} else {
+				if n.Name == srvNode.Name {
 					hosts[n.Name] = server
+					continue
 				}
+				c, err := ssh.Dial(toSSHNode(n))
+				if err != nil {
+					unreachable = append(unreachable, troubleshoot.UnreachableNode{Name: n.Name, Reason: err.Error()})
+					continue
+				}
+				defer c.Close()
+				hosts[n.Name] = c
 			}
 
-			g := troubleshoot.Gatherer{Server: server, Hosts: hosts}
+			g := troubleshoot.Gatherer{Server: server, Hosts: hosts, Unreachable: unreachable}
 			evidence := g.Collect()
 			diagnoses := troubleshoot.Diagnose(evidence)
 
-			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+			out := cmd.OutOrStdout()
+			for _, u := range evidence.Unreachable {
+				fmt.Fprintf(out, "✗ node %s unreachable: %s\n", u.Name, u.Reason)
+			}
+			w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 			if evidence.KubeconfigError != "" {
 				fmt.Fprintf(w, "! kubeconfig/cluster access problem:\t%s\n", evidence.KubeconfigError)
 			}
 			if len(diagnoses) == 0 {
-				fmt.Fprintln(cmd.OutOrStdout(), "✓ no issues detected — cluster looks healthy")
+				w.Flush()
+				fmt.Fprintln(out, "✓ no issues detected — cluster looks healthy")
 				return nil
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Found %d likely issue(s), ranked by confidence:\n\n", len(diagnoses))
+			fmt.Fprintf(out, "Found %d likely issue(s), ranked by confidence:\n\n", len(diagnoses))
 			for i, d := range diagnoses {
 				fmt.Fprintf(w, "%d.\t[%d%%]\t%s\n", i+1, d.Confidence, d.Title)
 				fmt.Fprintf(w, " \tfix:\t%s\n", wrapText(d.Remediation, " \t      "))

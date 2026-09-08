@@ -80,6 +80,29 @@ func TestKubeconfigError(t *testing.T) {
 	}
 }
 
+// TestUnreachableNodeIsNeverHealthy: a node we could not contact must produce
+// a finding. Reporting "healthy" for a cluster we only partly inspected is the
+// worst possible failure mode for a troubleshooter.
+func TestUnreachableNodeIsNeverHealthy(t *testing.T) {
+	e := Evidence{
+		// everything we *could* see looks fine
+		PodStatuses:  map[string]string{},
+		NodeNotReady: []string{},
+		K3sService:   map[string]string{"server": "active"},
+		Unreachable:  []UnreachableNode{{Name: "agent1", Reason: "dial tcp 10.0.0.5:22: connect: no route to host"}},
+	}
+	d := Diagnose(e)
+	if len(d) == 0 {
+		t.Fatal("unreachable node produced no diagnosis")
+	}
+	if d[0].SignatureID != "node.unreachable" {
+		t.Errorf("expected node.unreachable first, got %+v", d)
+	}
+	if d[0].Confidence < 80 {
+		t.Errorf("confidence = %d, want >=80", d[0].Confidence)
+	}
+}
+
 func TestHealthyEvidenceYieldsNoDiagnoses(t *testing.T) {
 	e := Evidence{
 		PodEvents:    map[string][]string{},

@@ -1,10 +1,12 @@
 package ssh
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	gossh "golang.org/x/crypto/ssh"
@@ -97,6 +99,54 @@ func (c *Client) Stream(cmd string, w io.Writer) (int, error) {
 		err = nil
 	}
 	return code, err
+}
+
+// WriteFile creates remotePath on the node with the given contents and mode.
+// Contents are streamed over stdin, so manifest size is not bounded by ARG_MAX.
+func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) error {
+	if err := validRemotePath(remotePath); err != nil {
+		return err
+	}
+	sess, err := c.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("new session: %w", err)
+	}
+	defer sess.Close()
+	sess.Stdin = bytes.NewReader(data)
+	var errBuf bytes.Buffer
+	sess.Stderr = &errBuf
+	cmd := fmt.Sprintf("umask 077 && cat > '%s' && chmod %o '%s'", remotePath, mode.Perm(), remotePath)
+	if err := sess.Run(cmd); err != nil {
+		return fmt.Errorf("write %s: %w: %s", remotePath, err, strings.TrimSpace(errBuf.String()))
+	}
+	return nil
+}
+
+// RemoveFile deletes remotePath, ignoring "already gone".
+func (c *Client) RemoveFile(remotePath string) error {
+	if err := validRemotePath(remotePath); err != nil {
+		return err
+	}
+	out, code, err := c.Run(fmt.Sprintf("rm -f '%s'", remotePath))
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("rm %s (exit %d): %s", remotePath, code, strings.TrimSpace(out))
+	}
+	return nil
+}
+
+// validRemotePath rejects paths that would break out of the single quotes
+// used to build the remote shell command.
+func validRemotePath(p string) error {
+	if p == "" {
+		return fmt.Errorf("remote path is empty")
+	}
+	if strings.ContainsAny(p, "'\n\x00") {
+		return fmt.Errorf("invalid remote path %q: quotes and newlines are not allowed", p)
+	}
+	return nil
 }
 
 // Close closes the connection.

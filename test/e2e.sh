@@ -33,7 +33,9 @@ assert_exit() { # desc expected_exit actual_exit
   else echo "  ✗ $1 — expected exit $2, got $3"; FAIL=$((FAIL+1)); fi
 }
 
-[ -f bin/k3helper ] || { echo "building..."; go build -o bin/k3helper ./cmd/k3helper; }
+# always rebuild: a stale bin/ would silently test a different revision
+echo "building..."
+go build -o bin/k3helper ./cmd/k3helper || exit 1
 K=bin/k3helper
 
 # ── 0. sandbox ────────────────────────────────────────────────────────────────
@@ -76,8 +78,12 @@ assert_contains "no disk pressure" "$OUT" "disk 4"
 step "4. gen → verify → deploy"
 $K gen deployment e2e-web -i nginx:alpine -r 1 -p 80 -o /tmp/e2e-web.yaml
 OUT=$($K verify /tmp/e2e-web.yaml 2>&1)
-assert_contains "generated manifest verifies" "$OUT" "Deployment/e2e-web"
-scp -q $SSHOPTS /tmp/e2e-web.yaml sandbox@$SERVER_IP:/tmp/e2e-web.yaml 2>/dev/null
+assert_contains "generated manifest verifies (offline)" "$OUT" "Deployment/e2e-web"
+# validation layer 3: the real API server must accept it too
+OUT=$($K verify /tmp/e2e-web.yaml --dry-run-server -t $TARGETS 2>&1)
+assert_contains "generated manifest verifies (server dry-run)" "$OUT" "Deployment/e2e-web"
+# deploy ships the local manifest to the target itself — no manual scp here,
+# otherwise the e2e would not be testing the path real users take.
 OUT=$($K deploy -f /tmp/e2e-web.yaml -t $TARGETS 2>&1)
 assert_contains "applied" "$OUT" "applied deployment.apps/e2e-web"
 assert_contains "rolled out" "$OUT" "rolled out deployment.apps/e2e-web"
