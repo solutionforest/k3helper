@@ -201,7 +201,16 @@ Found 1 likely issue(s), ranked by confidence:
     fix:   On the affected node: `sudo systemctl restart k3s` (or k3s-agent), then check
           `sudo journalctl -u k3s -n 100 --no-pager` for the underlying cause.
 ```
-Doctor gathers evidence across every layer — VM host (`df`, `free`, cgroups, systemd), the k3s service, node conditions, pod statuses, container states, events — then matches it against a signature knowledge base (ImagePullBackOff, OOMKilled, CrashLoopBackOff, unschedulable/taints, DiskPressure, PVC pending, kubeconfig auth…). Exit code `2` when findings exist.
+Doctor gathers evidence across every layer — VM host (`df`, `free`, cgroups, systemd), the k3s service, node conditions, pod statuses, container states, events, endpoints, TLS certificates — then matches it against a signature knowledge base. Exit code `2` when findings exist.
+
+| Layer | Signatures |
+|---|---|
+| Workload | ImagePullBackOff · CrashLoopBackOff · OOMKilled · unschedulable (resources/taints) · evicted |
+| Node | k3s service down + NotReady · DiskPressure · MemoryPressure · unreachable over SSH |
+| Cluster | embedded-etcd quorum lost or at risk · TLS certificates expiring · kubeconfig/auth broken |
+| Network / storage | CoreDNS has no ready replicas · Services with no ready endpoints · PVC stuck Pending |
+
+Ranking is by confidence, so a cause that explains the others floats to the top — a total CoreDNS outage outranks the individual Services it takes down. Signatures that need evidence k3s doesn't have stay silent rather than guessing: a sqlite-backed single-server cluster has no etcd, so the quorum signature never fires there.
 
 A node it cannot reach is reported, never skipped — partial inspection must not read as a clean bill of health:
 

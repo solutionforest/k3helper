@@ -40,6 +40,18 @@ type Evidence struct {
 	// Unreachable: nodes that could not be contacted at all. Absence of
 	// evidence from a node is itself a finding, never a reason to stay silent.
 	Unreachable []UnreachableNode
+	// CoreDNS: ready/desired replicas of the cluster DNS deployment (nil when
+	// the deployment could not be read).
+	CoreDNS *ReadyRatio
+	// Etcd: ready/total embedded-etcd member nodes (nil on sqlite-backed k3s).
+	Etcd *ReadyRatio
+	// CertExpiryDays: days until the soonest k3s certificate expires, with its
+	// subject. Zero days with an empty subject means "no evidence gathered".
+	CertExpiryDays int
+	CertSubject    string
+	// EmptyEndpoints: namespace/name of Services whose endpoints have no
+	// ready addresses — reachable in DNS, but nothing behind them.
+	EmptyEndpoints []string
 
 	// livePods: namespace/pod keys of pods that currently exist.
 	// Populated by parsePods; used to drop stale evidence for deleted pods.
@@ -57,6 +69,12 @@ type HostMetric struct {
 type UnreachableNode struct {
 	Name   string
 	Reason string
+}
+
+// ReadyRatio is a ready-out-of-desired count for a replicated component.
+type ReadyRatio struct {
+	Ready   int
+	Desired int
 }
 
 // Diagnosis is a ranked possible root cause.
@@ -100,6 +118,80 @@ var registry = []Signature{
 			return min(95, 75+len(e.Unreachable)*10)
 		},
 		Remediation: "Confirm the node is powered on and reachable (`ping`), that sshd is running, and that the host/port/user/key in the targets file are correct. Until it responds, no host-level diagnosis is possible for that node.",
+	},
+	{
+		ID:    "cluster.etcd-quorum",
+		Title: "Embedded etcd has lost or is about to lose quorum",
+		Match: func(e Evidence) int {
+			if e.Etcd == nil || e.Etcd.Desired == 0 {
+				return 0 // sqlite-backed cluster: no etcd to lose
+			}
+			quorum := e.Etcd.Desired/2 + 1
+			switch {
+			case e.Etcd.Ready < quorum:
+				// below quorum the API server is read-only or down entirely
+				return 95
+			case e.Etcd.Ready < e.Etcd.Desired:
+				// still quorate, but one more failure ends the cluster
+				return 70
+			}
+			return 0
+		},
+		Remediation: "Check each etcd server node: `sudo systemctl status k3s` and `sudo k3s etcd-snapshot ls`. Restore a failed member by restarting k3s on it; if a member is permanently gone, remove it with `k3s server --cluster-reset` on a surviving server (snapshot first). An even number of servers gains no quorum — run 3 or 5.",
+	},
+	{
+		ID:    "cluster.cert-expiry",
+		Title: "k3s TLS certificates expiring soon",
+		Match: func(e Evidence) int {
+			if e.CertSubject == "" {
+				return 0 // no cert evidence gathered
+			}
+			switch {
+			case e.CertExpiryDays < 0:
+				return 95 // already expired: the API server is rejecting clients
+			case e.CertExpiryDays <= 7:
+				return 90
+			case e.CertExpiryDays <= 30:
+				return 60
+			}
+			return 0
+		},
+		Remediation: "k3s rotates its certificates on restart when they are within 90 days of expiry: `sudo systemctl restart k3s` on each server, then restart agents. Verify with `sudo k3s certificate check`. If they already expired, the same restart still rotates them, but client kubeconfigs must be re-fetched afterwards.",
+	},
+	{
+		ID:    "network.coredns",
+		Title: "CoreDNS has no ready replicas (cluster DNS is down)",
+		Match: func(e Evidence) int {
+			// nil means the deployment could not be read at all (no evidence).
+			// A deployment that exists with zero desired replicas is a real
+			// outage — someone scaled DNS to nothing — not a reason to skip.
+			if e.CoreDNS == nil {
+				return 0
+			}
+			if e.CoreDNS.Ready == 0 {
+				// nothing in the cluster can resolve a Service name
+				return 95
+			}
+			if e.CoreDNS.Ready < e.CoreDNS.Desired {
+				return 55
+			}
+			return 0
+		},
+		Remediation: "Inspect the pods: `kubectl -n kube-system get pods -l k8s-app=kube-dns` and `kubectl -n kube-system logs -l k8s-app=kube-dns`. Common causes: the node hosting CoreDNS is NotReady, insufficient memory, or a broken /etc/resolv.conf on the host causing a forwarding loop. On k3s, CoreDNS is redeployed from the bundled manifest if you delete the deployment.",
+	},
+	{
+		ID:    "network.empty-endpoints",
+		Title: "Services with no ready endpoints (nothing is serving them)",
+		Match: func(e Evidence) int {
+			n := len(e.EmptyEndpoints)
+			if n == 0 {
+				return 0
+			}
+			// A Service resolves fine and still black-holes every request, so
+			// this is worth surfacing even for a single occurrence.
+			return min(85, 50+n*15)
+		},
+		Remediation: "The Service selector matches no ready pod. Compare them: `kubectl get svc <svc> -o wide` and `kubectl get pods -l <selector>`. Usual causes: a selector that does not match the pod labels, pods failing their readiness probe, or all backing pods being down — check the pod-level findings above first.",
 	},
 	{
 		ID:    "pod.imagepull",

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/solutionforest/k3helper/internal/ssh"
 )
@@ -33,7 +34,7 @@ func (g Gatherer) Collect() Evidence {
 	}
 
 	// --- cluster layer via kubectl ---
-	nodesJSON, code, err := g.Server.Run(`sudo -n k3s kubectl get nodes -o json --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl get nodes -o json 2>/dev/null`)
+	nodesJSON, code, err := g.Server.Run(kubectl(`get nodes -o json`))
 	if err != nil || code != 0 || strings.TrimSpace(nodesJSON) == "" {
 		e.KubeconfigError = fmt.Sprintf("kubectl get nodes failed (exit %d): %s", code, firstLine(nodesJSON))
 	} else {
@@ -81,18 +82,84 @@ func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
 	}
 
 	// pod statuses + events
-	if pods, code, err := g.Server.Run(`sudo -n k3s kubectl get pods -A -o json --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl get pods -A -o json 2>/dev/null`); err == nil && code == 0 {
+	if pods, code, err := g.Server.Run(kubectl(`get pods -A -o json`)); err == nil && code == 0 {
 		parsePods(pods, e)
 	}
 	// events linger ~1h after pod deletion; events for dead pods are stale
 	// evidence that would fire signatures on a healthy cluster.
-	if evs, code, err := g.Server.Run(`sudo -n k3s kubectl get events -A -o json --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl get events -A -o json 2>/dev/null`); err == nil && code == 0 {
+	if evs, code, err := g.Server.Run(kubectl(`get events -A -o json`)); err == nil && code == 0 {
 		parseEvents(evs, e)
 	}
 	filterStalePodEvidence(e)
-	if pvcs, code, err := g.Server.Run(`sudo -n k3s kubectl get pvc -A -o json --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl get pvc -A -o json 2>/dev/null`); err == nil && code == 0 {
+	if pvcs, code, err := g.Server.Run(kubectl(`get pvc -A -o json`)); err == nil && code == 0 {
 		parsePVCs(pvcs, e)
 	}
+	// endpoints back every Service; a Service with none is a silent outage
+	// that no pod-level signature reports.
+	if eps, code, err := g.Server.Run(kubectl(`get endpoints -A -o json`)); err == nil && code == 0 {
+		parseEndpoints(eps, e)
+	}
+	g.collectCoreDNS(e)
+	g.collectCerts(e)
+	g.collectEtcd(e)
+}
+
+// kubectl builds a server-side kubectl command, preferring the k3s bundled
+// binary and falling back to a kubectl already on PATH.
+func kubectl(args string) string {
+	return fmt.Sprintf(
+		`sudo -n k3s kubectl %s --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl %s 2>/dev/null`,
+		args, args)
+}
+
+// collectCoreDNS records whether cluster DNS has ready replicas. Everything
+// in the cluster resolves through it, so it is worth its own signature
+// rather than being buried in a generic "pod not ready" finding.
+func (g Gatherer) collectCoreDNS(e *Evidence) {
+	out, code, err := g.Server.Run(kubectl(`get deployment coredns -n kube-system -o jsonpath={.status.readyReplicas}/{.spec.replicas}`))
+	if err != nil || code != 0 {
+		return
+	}
+	ready, desired, ok := parseReadyRatio(out)
+	if !ok {
+		return
+	}
+	e.CoreDNS = &ReadyRatio{Ready: ready, Desired: desired}
+}
+
+// collectCerts reads k3s certificate expiry. k3s auto-rotates on restart
+// within 90 days of expiry, but a server that has not restarted in a year
+// will simply stop accepting connections.
+func (g Gatherer) collectCerts(e *Evidence) {
+	// `k3s certificate check` prints lines like:
+	//   Checking certificate CN=k3s-serving, expires 2027-01-05
+	out, code, err := g.Server.Run(`sudo -n k3s certificate check 2>&1`)
+	if err != nil || code != 0 {
+		return
+	}
+	e.CertExpiryDays, e.CertSubject = parseCertExpiry(out, time.Now())
+}
+
+// collectEtcd checks etcd quorum when the cluster runs embedded etcd. On a
+// single-server k3s (sqlite backend) there is no etcd and this is skipped.
+func (g Gatherer) collectEtcd(e *Evidence) {
+	out, code, err := g.Server.Run(kubectl(`get nodes -l node-role.kubernetes.io/etcd=true -o json`))
+	if err != nil || code != 0 {
+		return
+	}
+	nodes, err := parseNodes(out)
+	if err != nil || len(nodes) == 0 {
+		return // sqlite-backed cluster: no etcd members to check
+	}
+	total, ready := len(nodes), 0
+	for _, n := range nodes {
+		for _, c := range n.Conditions {
+			if c.Type == "Ready" && c.Status == "True" {
+				ready++
+			}
+		}
+	}
+	e.Etcd = &ReadyRatio{Ready: ready, Desired: total}
 }
 
 func hostMetric(exec ssh.Executor) (HostMetric, bool) {
