@@ -28,6 +28,10 @@ assert_contains() { # desc haystack needle
   if echo "$2" | grep -q "$3"; then echo "  ✓ $1"; PASS=$((PASS+1));
   else echo "  ✗ $1 — expected '$3' in:"; echo "$2" | sed 's/^/    /' | head -5; FAIL=$((FAIL+1)); fi
 }
+assert_matches() { # desc haystack extended-regex
+  if echo "$2" | grep -qE "$3"; then echo "  ✓ $1"; PASS=$((PASS+1));
+  else echo "  ✗ $1 — expected match /$3/ in:"; echo "$2" | sed 's/^/    /' | head -5; FAIL=$((FAIL+1)); fi
+}
 assert_exit() { # desc expected_exit actual_exit
   if [ "$2" = "$3" ]; then echo "  ✓ $1 (exit=$3)"; PASS=$((PASS+1));
   else echo "  ✗ $1 — expected exit $2, got $3"; FAIL=$((FAIL+1)); fi
@@ -72,7 +76,10 @@ sleep 10
 OUT=$($K check -t $TARGETS 2>&1)
 assert_contains "server k3s active" "$OUT" "k3s is active"
 assert_contains "agent k3s-agent active" "$OUT" "k3s-agent is active"
-assert_contains "no disk pressure" "$OUT" "disk 4"
+# The OK branch of the disk check reads "disk N% used"; the Warn/Fail branches
+# read "disk N% full". Match the verdict, not a specific percentage, so the
+# assertion tracks disk pressure rather than the base image's fill level.
+assert_matches "no disk pressure" "$OUT" "disk [0-9]+% used"
 
 # ── 4. gen → verify → deploy ─────────────────────────────────────────────────
 step "4. gen → verify → deploy"
@@ -132,9 +139,21 @@ spec:
 EOF
 scp -q $SSHOPTS /tmp/e2e-oom.yaml sandbox@$SERVER_IP:/tmp/e2e-oom.yaml 2>/dev/null
 kctl apply -f /tmp/e2e-oom.yaml >/dev/null
-echo "  (waiting 45s for OOMKill)"; sleep 45
-STATE=$(kctl get pod e2e-oom -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}' 2>/dev/null)
-if [ "$STATE" = "OOMKilled" ]; then echo "  ✓ pod OOMKilled in cluster"; PASS=$((PASS+1)); else echo "  ✗ expected OOMKilled, got '$STATE'"; FAIL=$((FAIL+1)); fi
+# The pod restarts on a loop (restartPolicy: Always), so a single sample of
+# lastState can catch a restart whose exit the kubelet reported as a generic
+# "Error" rather than "OOMKilled". Poll both state and lastState until either
+# reports OOMKilled instead of betting on one 45s snapshot.
+echo "  (waiting up to 90s for OOMKill)"
+STATE=""
+for _ in $(seq 1 18); do
+  sleep 5
+  STATE=$(kctl get pod e2e-oom -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
+  case "$STATE" in *OOMKilled*) break ;; esac
+done
+case "$STATE" in
+  *OOMKilled*) echo "  ✓ pod OOMKilled in cluster"; PASS=$((PASS+1)) ;;
+  *) echo "  ✗ expected OOMKilled in state/lastState, got '$STATE'"; FAIL=$((FAIL+1)) ;;
+esac
 OUT=$($K doctor -t $TARGETS 2>&1)
 assert_contains "doctor catches OOMKill" "$OUT" "OOMKilled"
 

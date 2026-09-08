@@ -2,9 +2,9 @@ package cli
 
 import (
 	"github.com/charmbracelet/lipgloss"
-	"github.com/spf13/cobra"
 	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/tui"
+	"github.com/spf13/cobra"
 )
 
 func newTUICmd() *cobra.Command {

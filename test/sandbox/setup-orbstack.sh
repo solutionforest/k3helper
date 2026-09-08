@@ -16,8 +16,17 @@ create() {
   orb create ubuntu:24.04 "$name" 2>/dev/null || echo "(machine $name exists, reconfiguring)" >&2
   orb -m "$name" sudo bash -c "apt-get update -qq && apt-get install -y -qq openssh-server sudo curl" >/dev/null
   orb -m "$name" sudo bash -c "useradd -m -s /bin/bash -G sudo sandbox 2>/dev/null; echo 'sandbox:sandbox' | chpasswd; echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox; systemctl enable --now ssh"
+  # /etc/skel on ubuntu:24.04 has no .ssh, and `useradd -m` copies only what
+  # skel contains — so the directory must be created before writing the key.
+  orb -m "$name" sudo bash -c "mkdir -p /home/sandbox/.ssh"
   orb -m "$name" sudo bash -c "cat > /home/sandbox/.ssh/authorized_keys" < "$KEY"
   orb -m "$name" sudo bash -c "chmod 700 /home/sandbox/.ssh; chmod 600 /home/sandbox/.ssh/authorized_keys; chown -R sandbox:sandbox /home/sandbox/.ssh"
+  # orb does not reliably propagate the guest command's exit status, so assert
+  # the key actually landed rather than discovering it at SSH-verify time.
+  if ! orb -m "$name" sudo test -s /home/sandbox/.ssh/authorized_keys; then
+    echo "provisioning $name failed: /home/sandbox/.ssh/authorized_keys is missing or empty" >&2
+    exit 1
+  fi
   orb -m "$name" hostname -I | awk '{print $1}'
 }
 
