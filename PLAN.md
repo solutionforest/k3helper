@@ -28,8 +28,12 @@
 Layered, offline-first:
 1. **Syntax** — `sigs.k8s.io/yaml` parse.
 2. **Structural** — required fields (`apiVersion`, `kind`, `metadata.name`).
-3. **Schema** — `kubectl apply --dry-run=server -f` when a cluster is reachable; offline schema validation (kubeconform-style embedded schemas) as fallback.
-Outputs precise line/field errors + exit code.
+3. **Schema** — per-kind shape rules offline (Job restartPolicy, DaemonSet
+   replicas, container name/image, StatefulSet serviceName…), plus
+   `kubectl apply --dry-run=server` against a live cluster via
+   `verify --dry-run-server`. Unknown kinds get layers 1–2 only.
+Outputs field paths, the line the offending document starts on, and a non-zero
+exit code. `--json` for scripts.
 
 ### 2. YAML generate (#4)
 `k3helper gen <kind>` for the common kinds (Deployment, Service, Ingress, ConfigMap, Secret, PVC, Namespace, StatefulSet, Job, CronJob, k3s-specific like IngressRoute). Interactive prompt flow in TUI; `--flags` for scripts. Emits valid, schema-correct YAML with current `apiVersion`s. Round-trip guarantee: everything `gen` emits must pass `verify`.
@@ -92,114 +96,155 @@ A resource browser in the k9s mold (type `:` + alias to jump between resource vi
 
 ## Testing strategy
 
-Four layers; every feature lands with its tests.
+Five layers. Every feature lands with its tests.
 
 ### Layer 1 — Unit tests (no cluster, fast)
-- **yaml**: verify layer 1/2/3 against a fixture corpus (`good/`, `bad-syntax/`, `bad-structure/`, `bad-schema/`).
-- **gen**: golden-file tests — `gen deployment ...` output must byte-match goldens AND pass `verify` (round-trip property test).
-- **check**: each check given synthetic `kubectl`/SSH output fixtures (JSON stdin), assert pass/warn/fail + remediation text.
-- **troubleshoot**: signature matcher fed synthetic evidence bundles, assert ranked root causes.
-- Table-driven, `go test ./...` in seconds.
+- **kyaml**: verify layers 1–3 against a fixture corpus, plus per-kind shape
+  rules (a Job with `restartPolicy: Always`, a DaemonSet with `spec.replicas`).
+  Round-trip property test: everything `gen` emits must pass `verify`.
+- **check**: each check fed synthetic systemd/`df`/`free` output; distro
+  detection fed unit-file listings.
+- **troubleshoot**: signature matcher fed synthetic evidence bundles; asserts
+  ranked root causes, and that a healthy bundle yields *zero* findings.
+- **tui**: command bar, filters, drill-down and refresh driven through the
+  model without a terminal.
+- **ssh**: host key verification — unknown, accept-new, changed — against a
+  scratch known_hosts.
+- Table-driven, `go test ./...` in seconds, and `-race` in CI.
 
-### Layer 2 — Integration tests (real cluster, gated by `-tags=integration`)
-- Run against the Docker sandbox (below). Real SSH, real k3s, real kubectl.
-- Bootstrap flow test: fresh sandbox → `vm setup` → `check` passes all.
-- Deploy flow test: `gen` → `verify` → `deploy` → pod Running → rollout report.
-- Doctor smoke: healthy cluster ⇒ zero critical findings.
+### Layer 2 — Integration tests (real cluster, `-tags=integration`)
+Run against the OrbStack sandbox. Real SSH, real k3s, real kubectl.
+Node addresses come from `targets.sandbox.yaml`, never hardcoded — OrbStack
+reassigns IPs on every recreate. With no sandbox running they skip rather than
+fail. `K3HELPER_TARGETS` points them at another cluster.
 
-### Layer 3 — Fault-injection tests (the troubleshooter's exam)
-Inject each failure into the sandbox, run `doctor`, assert the expected signature + remediation fires:
+- Bootstrap: fresh sandbox → `vm setup` → all nodes Ready.
+- Deploy: local manifest → uploaded → applied → rolled out → temp file removed.
+- Generator: **every** kind submitted to the live API server via
+  `verify --dry-run-server`. The offline rules cannot prove this alone.
+- Gatherer: asserts the cluster probes actually return data — a silently
+  failing probe is otherwise indistinguishable from a healthy cluster.
 
-| Injected fault | How | Expected signature |
+### Layer 3 — Fault-injection matrix (the troubleshooter's exam)
+`test/faults/fault.sh` injects a fault; `make fault-check-all` injects each in
+turn, asserts `doctor` reports the signature that fault should produce, then
+cleans up. Matching is on signature IDs from `doctor --json`, not display
+titles, so rewording a finding cannot silently break the suite.
+
+| Fault | How | Expected signature |
 |---|---|---|
-| k3s service down | `systemctl stop k3s` on a node | k3s service check fails, node NotReady |
-| Disk full | `fallocate` a big file in container | DiskPressure / node check fail |
-| Wrong join token | join agent with bad token | agent fails to join; check reports |
-| ImagePullBackOff | deploy with nonexistent image | workload signature → wrong image/registry |
-| CrashLoopBackOff | bad container command | workload signature → app crash, point at logs |
-| OOMKilled | memory limit 16Mi + allocation | OOM signature → raise limits |
-| Pending pod | request 100 CPU | scheduling signature → insufficient resources |
-| PVC pending | claim with missing storage class | storage signature |
-| Node cordoned | `kubectl cordon` | scheduling signature → node unschedulable |
-| Bad kubeconfig | corrupt config file | config/auth signature |
+| `k3s-down` | `systemctl stop k3s-agent` | `node.notready-k3s-down` |
+| `disk-full` | `fallocate` to fill `/` | `node.diskpressure` |
+| `imagepull` | pod with a nonexistent image | `pod.imagepull` |
+| `crashloop` | container command exits 1 | `pod.crashloop` |
+| `oom` | 10Mi limit, 50MB allocation | `pod.oom` |
+| `pending` | request 100 CPU | `pod.pending-sched` |
+| `cordon` | cordon every node | `pod.pending-sched` |
+| `pvc-pending` | claim on a missing storage class | `storage.pvc-pending` |
+| `coredns` | scale CoreDNS to zero | `network.coredns` |
+| `empty-endpoints` | Service whose selector matches nothing | `network.empty-endpoints` |
+| `bad-kubeconfig` | corrupt `k3s.yaml` | `cluster.kubeconfig` |
 
-Each is a Makefile target (`make fault-disk-full`, `make fault-clean`) so tests and humans can both run them.
+Each is `make fault-<name>`, with `make fault-list` and `make fault-clean`.
 
-### Layer 4 — TUI tests
-- `teatest` (charmbracelet's Bubble Tea test harness): send keys, assert views render, flows complete (e.g., gen prompt → output file created).
+Verified 2026-09-08: **10 passed, 0 failed.**
 
-### Layer 5 — Full-lifecycle E2E (`test/e2e.sh`, run via `make e2e`)
-The screen-demo saved as a repeatable script. Two modes:
-- `make e2e` — resets the sandbox from scratch, then runs the full lifecycle (~10-15 min)
-- `make e2e-fast` (`--keep`) — reuses the running sandbox (~6 min)
+> This layer earns its keep. It found that `pod.pending-sched` never matched a
+> cordoned node — the remediation said "kubectl uncordon" while no matcher
+> looked for `were unschedulable`, and the `0/N nodes are available` literal
+> could never fire because the real message carries a live count. It also found
+> that deleted PVCs kept reporting "stuck Pending" for an hour, because the
+> stale-event filter written for pods was never extended to PVCs.
 
-Steps (16 assertions):
-1. Sandbox up, SSH verified
-2. `check` BEFORE install → k3s reported missing
-3. `vm setup` bootstrap → cluster ready
-4. `check` AFTER install → all green
-5. `gen` → `verify` → `deploy` → pod Running
-6. `doctor` on healthy cluster → zero findings, exit 0
-7. FAULT: stop k3s-agent → `doctor` catches at 90%, exit 2
-8. RECOVER → doctor healthy again
-9. FAULT: OOMKill pod (10Mi limit, 50MB alloc) → `doctor` catches at 95%
-10. Cleanup → doctor healthy
+### Layer 4 — E2E (`test/e2e.sh`, via `make e2e`)
+The whole product against three fresh VMs:
 
-Verified 2026-09-08: **16 passed, 0 failed.**
+1. Sandbox reset, SSH verified
+2. `init` — scaffold, reload, refuse to clobber, `--local`; missing-file error suggests it
+3. Host keys — unknown refused, accept-new records, recorded key verifies, **changed key refused**, opt-outs exclusive
+4. `check` before install → reports *not installed*, and says to install rather than restart
+5. `vm setup` → waits for all three nodes to register **and** go Ready
+6. Fetched kubeconfig has no loopback address and **`kubectl` connects with it from this machine**
+7. `check` after install → green; `--strict` escalates warnings
+8. `gen` → `verify` offline → `verify --dry-run-server`; every kind (incl. kubectl short aliases) accepted by the live API server; an invalid Job caught offline
+9. `deploy` ships the local manifest itself and leaves no temp files
+10. `deploy --diff`, `--namespace` (missing, conflicting, correct)
+11. Multi-cluster `ctx` / `--context`
+12. `doctor` healthy + `--json`; an unreachable node is never a clean bill of health
+13. Fault → detect → recover
+14. Fault sweep across six signatures
+15. Cleanup → healthy
 
-## Docker sandbox — simulating 3 VMs
+Modes: `make e2e` (fresh sandbox, ~12 min), `make e2e-fast` (`--keep`),
+`make e2e-quick` (`--keep --quick`, skips the sweep).
 
-`test/sandbox/`: three containers that behave like SSH-reachable Linux VMs.
+Verified 2026-09-08: **66 passed, 0 failed.**
 
-```
-docker-compose.yml:
-  sandbox-server  → ubuntu:24.04 + openssh-server + systemd, privileged, port 2221→22
-  sandbox-agent1  → same, port 2222→22
-  sandbox-agent2  → same, port 2223→22
-```
+### Layer 5 — CI
+GitHub Actions on every push: gofmt, `go vet`, `go vet -tags=integration`
+(those files are never compiled by a plain vet and rot silently otherwise),
+`go test -race`, and a cross-compile.
 
-> Base image: `ubuntu:24.04` LTS (systemd support, matches production k3s hosts). `ubuntu:26.04` is a drop-in swap via build arg once validated — keep the image pinned through `ARG UBUNTU_VERSION=24.04` so the sandbox matrix can test both.
+The sandbox E2E needs OrbStack VMs, which GitHub-hosted runners cannot
+provide, so that job targets a self-hosted macOS runner and is **skipped**
+elsewhere rather than reported as passing.
 
-- **Privileged + systemd entrypoint** so `systemctl status k3s`, cgroups, and kernel-module checks work realistically inside containers.
-- Passwordless sudo + shared test SSH key baked in (localhost-only).
-- `targets.sandbox.yaml` checked into repo pointing k3helper at `localhost:2221-2223`.
-- k3s installed by OUR bootstrap code over SSH (dogfooding — the sandbox is never pre-installed with k3s by the image; that's what we're testing).
-- Resource-light: containers with 1-2GB limits run a 3-node k3s cluster fine on a laptop.
+## OrbStack sandbox — three real VMs
 
-Makefile:
-```
-make sandbox-up      # start 3 VMs
-make sandbox-down    # stop + remove
-make sandbox-reset   # fresh state (for bootstrap tests)
-make test            # unit tests
-make test-integration# unit + integration (-tags=integration, needs sandbox)
-make fault-<name>    # inject fault N
-make fault-clean     # remove all faults
-```
+`test/sandbox/`: three OrbStack Linux VMs that behave like SSH-reachable hosts.
 
-CI: GitHub Actions runs unit tests on every push; integration job boots the sandbox, runs bootstrap + fault-injection suite.
+> Docker containers were tried first and abandoned: they share the macOS
+> kernel, and kubelet's PLEG kills pods spuriously under it. Real lightweight
+> VMs avoid that. On a Linux CI runner the constraint does not apply, which is
+> what makes a k3s-in-docker port viable there.
+
+- `setup-orbstack.sh` creates the VMs, installs sshd, provisions the `sandbox`
+  user with passwordless sudo, and writes `targets.sandbox.yaml` with live IPs.
+  It asserts the key landed rather than trusting `orb`, which does not
+  propagate the guest command's exit status.
+- k3s is installed by *our* bootstrap code over SSH — the image never ships it,
+  because installing it is what we are testing.
+- `insecure_host_key: true` in the generated targets: these VMs get a new IP
+  and host key on every recreate.
 
 ## Project layout
 ```
 cmd/k3helper/main.go
-internal/{tui,cli,check,troubleshoot,yaml,deploy,vm,kube,config}
+internal/
+  cli/          cobra commands (init, ctx, check, doctor, deploy, gen, verify, vm, tui)
+  config/       targets file: single- and multi-cluster, validation
+  ssh/          SSH + local transport, host key verification, file transfer
+  vm/           k3s bootstrap over SSH, kubeconfig fetch/rewrite
+  kyaml/        YAML verify (3 layers, offline + live) + generate (12 kinds)
+  kube/         cluster reads via kubectl: pods, nodes, events, logs, describe
+  check/        check registry + per-distribution host layer (k3s / kubeadm)
+  troubleshoot/ evidence gathering, signature matching, ranked diagnosis
+  deploy/       dry-run → diff → apply → rollout wait
+  tui/          Bubble Tea dashboard + resource browser
+  sandbox/      locates the test sandbox for integration tests
 test/
-  sandbox/          # docker-compose.yml, Dockerfile, targets.sandbox.yaml
-  faults/           # fault-injection scripts
-  fixtures/         # yaml corpus, command output fixtures, goldens
-targets.example.yaml
+  sandbox/      OrbStack VM provisioning + targets.sandbox.yaml
+  faults/       fault.sh (inject) + check-all.sh (the exam)
+  fixtures/     yaml corpus
+  e2e.sh        full-lifecycle E2E
+install.sh      release installer
+scripts/bundle.sh
 ```
 
-## Phased delivery (each ends in something usable + tested)
-0. **Sandbox** — docker-compose 3 VMs, SSH working, `make sandbox-up` verified. (Built first: everything after is tested against it.)
-1. **Scaffold** — go.mod, cobra CLI, config loading, version. Unit tests for config.
-2. **YAML verify + generate** — fixture corpus + golden + round-trip tests.
-3. **Check engine** — synthetic fixture tests.
-4. **VM setup over SSH** — integration test: bootstrap sandbox from scratch, `check` green.
-5. **Troubleshoot engine** — fault-injection suite green for the full matrix above.
-6. **Deploy** — integration test: gen→verify→deploy→running.
-7. **TUI** — teatest interaction tests + manual QA against sandbox.
-8. **Polish + release** — cross-compile Makefile, README, demo recording.
+## Delivery status
+0. **Sandbox** — three OrbStack VMs, `make sandbox-up`. ✅
+1. **Scaffold** — cobra CLI, config loading, version. ✅
+2. **YAML verify + generate** — fixture corpus, per-kind rules, live dry-run. ✅
+3. **Check engine** — synthetic fixtures; k3s and kubeadm host layers. ✅
+4. **VM setup over SSH** — bootstrap from scratch, waits for the full node count. ✅
+5. **Troubleshoot engine** — 15 signatures, fault matrix green. ✅
+6. **Deploy** — upload, dry-run, diff, namespace handling, rollout wait. ✅
+7. **TUI** — dashboard + resource browser (pods/nodes/events/logs/describe). ✅
+8. **Polish + release** — cross-compile, installer, README, CI. ✅
+
+Remaining: HA control plane (multiple servers, embedded etcd), a Linux CI
+sandbox so the E2E can run on GitHub-hosted runners, and the TUI extras
+(port-forward manager, multi-pod log tailing).
 
 ## Research — similar tools
 
@@ -231,6 +276,11 @@ No existing tool spans **VM host layer → k3s service → cluster → workloads
 - **Leverage:** wrap `kubectl`, `k3s check-config`, kubeconform-style schemas, k3sup's SSH bootstrap pattern.
 - **Concentrate effort on:** (1) cross-layer `doctor`/signature engine, (2) YAML generator, (3) unified TUI, (4) the fault-injection test suite that keeps the troubleshooter honest.
 
-## Open questions
-1. Binary name — `k3helper` ok, or prefer something else?
-2. Offline schema validation: embed kubeconform schemas (bigger binary, full validation) vs structural checks only (tiny binary)? Leaning: embed — portability means we can't assume kubectl/network everywhere.
+## Resolved questions
+1. **Binary name** — `k3helper`. Settled.
+2. **Offline schema validation** — neither extreme. `verify` ships hand-written
+   per-kind rules for the kinds we generate (cheap, no embedded schema blob)
+   and defers full schema checking to the live API server via
+   `--dry-run-server`. Unknown kinds and CRDs get structural checks only rather
+   than guessed-at rules. Embedding kubeconform schemas remains an option if
+   offline full validation is ever needed.
