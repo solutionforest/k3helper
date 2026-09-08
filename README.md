@@ -191,10 +191,13 @@ The namespace must already exist — `deploy` never creates cluster state the ma
 k3helper deploy -f web.yaml -t targets.yaml --diff --dry-run
 ```
 ```diff
-@@ -29,7 +29,7 @@
+--- live
++++ merged
+-  replicas: 1
++  replicas: 3
        containers:
--      - image: nginx:1.24-alpine
-+      - image: nginx:1.25-alpine
+-      - image: nginx:1.24
++      - image: nginx:1.25
 ```
 
 Pair it with `--dry-run` to look without touching anything. When the manifest already matches the cluster you get `= no changes against live cluster state`.
