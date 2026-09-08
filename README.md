@@ -225,7 +225,24 @@ A node it cannot reach is reported, never skipped — partial inspection must no
 ```bash
 k3helper tui -t targets.yaml
 ```
-Dashboard with per-node check cards, severity colors, remediation hints, `r` refresh, `q` quit.
+
+Opens on a dashboard of per-node check cards with severity colours and remediation hints, and carries a k9s-style resource browser.
+
+**Navigation** — press `:` for the command bar:
+
+| Command | Shows |
+|---|---|
+| `:pods` (`:po`) | pods across all namespaces: ready, status, restarts, node, age |
+| `:nodes` (`:no`) | nodes: status, roles, kubelet version, age |
+| `:events` (`:ev`) | recent events, newest first |
+| `:dashboard` (`:dash`) | back to the health cards |
+| `:ns <name>` | scope resource views to one namespace (`:ns all` clears it) |
+
+**Keys** — `↑↓` move · `enter`/`l` pod logs · `d` describe · `/` filter · `esc` back or clear filter · `r` refresh now · `q` quit.
+
+The status column shows the container's waiting or terminated reason rather than the pod phase, so a `CrashLoopBackOff` reads as `CrashLoopBackOff` instead of `Pending`. Opening logs on a crashlooping pod whose current instance has produced nothing falls back to the previous instance automatically — that's where the cause usually is.
+
+Views reload every 5 seconds, preserving your cursor position so a refresh doesn't move the row under you.
 
 ## No SSH from your machine (browser console only)
 
@@ -381,6 +398,7 @@ internal/
              for `local: true` nodes, direct /bin/sh execution
   vm/        k3s bootstrap over SSH (server → token → agents → wait Ready)
   kyaml/     YAML verify (3 layers, offline + live) + generate (12 kinds)
+  kube/      cluster reads through kubectl: pods, nodes, events, logs, describe
   sandbox/   locates the test sandbox from targets.sandbox.yaml
   deploy/    dry-run → apply → rollout wait
   check/     check registry: {status, summary, evidence, remediation}
@@ -410,7 +428,6 @@ Current, and worth knowing before pointing this at production:
 - [ ] k8s (kubeadm) host-layer adapter: `kubelet`/`containerd` units, `/etc/kubernetes/admin.conf`
 - [ ] More failure signatures (cert expiry, etcd quorum, CoreDNS, service endpoints)
 - [ ] Fault-injection matrix as `make fault-<name>` targets (disk full, bad token, ImagePull, PVC pending, cordon)
-- [ ] TUI resource browser (pods/logs/events views); live auto-refresh
 - [ ] Deploy diff view, multi-cluster contexts
 - [ ] GitHub Actions CI running unit + sandbox E2E
 
