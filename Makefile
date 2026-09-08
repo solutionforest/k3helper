@@ -14,9 +14,9 @@ SSH_OPTS   := -i $(SSH_KEY) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/d
 # Sandbox nodes are OrbStack Linux VMs (NOT Docker containers — OrbStack
 # containers share the macOS kernel and kubelet PLEG kills pods falsely).
 
-.PHONY: help build build-all test test-integration clean e2e \
+.PHONY: help build build-all test test-integration clean e2e e2e-fast e2e-quick \
         sandbox-up sandbox-down sandbox-reset sandbox-verify sandbox-ssh \
-        bootstrap check doctor fault-clean release release-upload bundle
+        bootstrap check doctor fault-clean fault-list fault-check-all release release-upload bundle
 
 help:
 	@echo "Build:"
@@ -25,7 +25,8 @@ help:
 	@echo "  make test             unit tests"
 	@echo "  make test-integration integration tests (needs sandbox)"
 	@echo "  make e2e              full lifecycle E2E (resets sandbox, ~10-15 min)"
-	@echo "  make e2e-fast         E2E reusing running sandbox (~6 min)"
+	@echo "  make e2e-fast         E2E reusing running sandbox (~8 min)"
+	@echo "  make e2e-quick        E2E without the fault sweep (~4 min)"
 	@echo "  make clean            remove bin/ and dist/"
 	@echo "Distribution:"
 	@echo "  make release          stripped binaries + checksums.txt in dist/"
@@ -38,6 +39,9 @@ help:
 	@echo "  make bootstrap        install k3s on all nodes via k3helper"
 	@echo "  make check            run k3helper check"
 	@echo "  make doctor           run k3helper doctor"
+	@echo "  make fault-list       list faults + the signature each should trigger"
+	@echo "  make fault-<name>     inject one fault (e.g. make fault-oom)"
+	@echo "  make fault-check-all  inject every fault, assert doctor catches each"
 	@echo "  make fault-clean      undo injected faults"
 
 build:
@@ -58,12 +62,17 @@ test-integration:
 
 # Full lifecycle E2E: sandbox→bootstrap→check→deploy→fault→doctor→recover.
 # make e2e            full run incl. fresh sandbox reset (~10-15 min)
-# make e2e-fast       reuse running sandbox (~6 min)
+# make e2e-fast       reuse running sandbox (~8 min)
+# make e2e-quick      reuse sandbox, skip the fault sweep (~4 min)
 e2e:
 	./test/e2e.sh
 
 e2e-fast:
 	./test/e2e.sh --keep
+
+# Skips the multi-fault sweep as well; the shortest useful loop.
+e2e-quick:
+	./test/e2e.sh --keep --quick
 
 # Release artifacts consumed by install.sh: one binary per platform plus a
 # checksums.txt the installer verifies the download against.
@@ -99,7 +108,7 @@ _write-targets:
 	@S=$$(orb -m sandbox-server hostname -I | awk '{print $$1}'); \
 	A1=$$(orb -m sandbox-agent1 hostname -I | awk '{print $$1}'); \
 	A2=$$(orb -m sandbox-agent2 hostname -I | awk '{print $$1}'); \
-	printf 'cluster: sandbox\nnodes:\n  - name: server\n    role: server\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n  - name: agent1\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n  - name: agent2\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n' $$S $$A1 $$A2 > $(TARGETS)
+	printf 'cluster: sandbox\nnodes:\n  - name: server\n    role: server\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n  - name: agent1\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n  - name: agent2\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n' $$S $$A1 $$A2 > $(TARGETS)
 
 sandbox-down:
 	-orb delete sandbox-server --force 2>/dev/null
@@ -130,7 +139,17 @@ check:
 doctor:
 	go run ./cmd/k3helper doctor -t $(TARGETS)
 
+# Fault injection. `make fault-list` shows every fault and the doctor
+# signature it is expected to trigger.
+fault-list:
+	@test/faults/fault.sh list
+
+fault-%:
+	@test/faults/fault.sh $*
+
 fault-clean:
-	@for ip in $$(grep 'host:' $(TARGETS) | awk '{print $$2}'); do \
-	  ssh $(SSH_OPTS) sandbox@$$ip 'sudo rm -f /bigfile /tmp/oom-pod*.yaml 2>/dev/null; sudo systemctl start k3s k3s-agent 2>/dev/null' 2>/dev/null; \
-	done; echo faults cleaned
+	@test/faults/fault.sh clean
+
+# The troubleshooter's exam: inject each fault, assert doctor diagnoses it.
+fault-check-all:
+	@test/faults/check-all.sh

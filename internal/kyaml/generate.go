@@ -32,15 +32,7 @@ func Generate(p GenParams) (string, error) {
 	if p.Kind == "" {
 		return "", fmt.Errorf("kind is required")
 	}
-	// case-insensitive kind lookup (kubectl convention: "deployment" == "Deployment")
-	if _, ok := KnownKinds[p.Kind]; !ok {
-		for k := range KnownKinds {
-			if strings.EqualFold(k, p.Kind) {
-				p.Kind = k
-				break
-			}
-		}
-	}
+	p.Kind = canonicalKind(p.Kind)
 	apiVer, ok := KnownKinds[p.Kind]
 	if !ok {
 		return "", fmt.Errorf("unsupported kind %q (supported: %s)", p.Kind, supportedKinds())
@@ -173,6 +165,40 @@ func specFor(p GenParams) (object, error) {
 		}}, nil
 	}
 	return nil, fmt.Errorf("unsupported kind %q (supported: %s)", p.Kind, supportedKinds())
+}
+
+// kindAliases maps the short names kubectl accepts to our canonical kinds.
+// Someone who types `kubectl get pvc` every day will type `gen pvc`.
+var kindAliases = map[string]string{
+	"po": "Pod", "pods": "Pod",
+	"svc": "Service", "services": "Service",
+	"deploy": "Deployment", "deployments": "Deployment",
+	"sts": "StatefulSet", "statefulsets": "StatefulSet",
+	"ds": "DaemonSet", "daemonsets": "DaemonSet",
+	"ns": "Namespace", "namespaces": "Namespace",
+	"cm": "ConfigMap", "configmaps": "ConfigMap",
+	"pvc": "PersistentVolumeClaim", "persistentvolumeclaims": "PersistentVolumeClaim",
+	"ing": "Ingress", "ingresses": "Ingress",
+	"cj": "CronJob", "cronjobs": "CronJob",
+	"jobs": "Job", "secrets": "Secret",
+}
+
+// canonicalKind resolves a user-supplied kind to its canonical spelling,
+// accepting exact names, any casing, and kubectl's short aliases.
+func canonicalKind(kind string) string {
+	if _, ok := KnownKinds[kind]; ok {
+		return kind
+	}
+	lower := strings.ToLower(strings.TrimSpace(kind))
+	if canonical, ok := kindAliases[lower]; ok {
+		return canonical
+	}
+	for k := range KnownKinds {
+		if strings.EqualFold(k, kind) {
+			return k
+		}
+	}
+	return kind
 }
 
 func imageOr(img, def string) string {

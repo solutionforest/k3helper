@@ -5,8 +5,13 @@ import (
 	"os"
 	"strings"
 
+	"github.com/solutionforest/k3helper/internal/ssh"
 	"sigs.k8s.io/yaml"
 )
+
+// HostKeyPolicy is the process-wide SSH host key policy, set once from the
+// CLI flags. A node's own insecure_host_key still wins for that node.
+var HostKeyPolicy = ssh.HostKeyVerify
 
 // Node is a single SSH-reachable machine that hosts (or will host) k3s.
 // A node with local: true is the machine k3helper itself runs on; it needs
@@ -19,6 +24,24 @@ type Node struct {
 	User  string `json:"user"`
 	Key   string `json:"key"` // path to private key
 	Local bool   `json:"local"`
+	// InsecureHostKey disables SSH host key verification for this node.
+	// Intended for throwaway environments whose addresses churn, such as the
+	// test sandbox — never for a machine you care about.
+	InsecureHostKey bool `json:"insecure_host_key,omitempty"`
+}
+
+// SSH converts a targets-file node into connection details. Every caller
+// goes through this: hand-copying the fields is how `local` and the host key
+// policy each got silently dropped from one call site.
+func (n Node) SSH() ssh.Node {
+	mode := HostKeyPolicy
+	if n.InsecureHostKey {
+		mode = ssh.HostKeyInsecure
+	}
+	return ssh.Node{
+		Host: n.Host, Port: n.Port, User: n.User, Key: n.Key,
+		Local: n.Local, HostKey: mode,
+	}
 }
 
 // Targets is one cluster: a name and the machines that make it up.
@@ -54,6 +77,16 @@ type File struct {
 func Load(path string) (*File, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// The most common first-run failure. Say how to fix it rather
+			// than leaving the user to guess the file format.
+			return nil, fmt.Errorf(
+				"no targets file at %s\n\nCreate one with:\n"+
+					"  k3helper init --server <host> --agent <host> --user <user> --key <path>\n"+
+					"  k3helper init --local          # this machine, no SSH\n"+
+					"  k3helper init                  # a template to edit\n\n"+
+					"Or point at an existing file with -t/--targets.", path)
+		}
 		return nil, fmt.Errorf("read targets: %w", err)
 	}
 	f := &File{}

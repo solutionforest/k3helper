@@ -1,40 +1,52 @@
 #!/bin/bash
 # =============================================================================
-# k3helper E2E test — full lifecycle, run against the OrbStack sandbox
+# k3helper E2E — the whole product, exercised against the OrbStack sandbox.
 #
-#   sandbox reset → SSH → check(no k3s) → bootstrap → check(green)
-#   → gen → verify → deploy → doctor(healthy)
-#   → fault: k3s-agent stop   → doctor detects (90%)
-#   → recover                 → doctor healthy
-#   → fault: OOMKill pod      → doctor detects (95%)
-#   → cleanup                 → doctor healthy
+#   sandbox reset → init → host keys → check(no k3s) → bootstrap → kubeconfig
+#   → check(green) → gen → verify(offline+live) → deploy → diff → namespaces
+#   → contexts → doctor(healthy) → fault sweep → recover → cleanup
 #
 # Usage:
-#   ./test/e2e.sh            # full run incl. sandbox reset (~10 min)
-#   ./test/e2e.sh --keep     # skip sandbox reset (reuses running sandbox)
+#   ./test/e2e.sh                 full run incl. sandbox reset (~12 min)
+#   ./test/e2e.sh --keep          skip the reset, reuse a running sandbox
+#   ./test/e2e.sh --keep --quick  skip the multi-fault sweep too
 #
-# Exit code 0 = all assertions passed.
+# Exit code 0 = every assertion passed.
 # =============================================================================
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 TARGETS=test/sandbox/targets.sandbox.yaml
-KEEP_SANDBOX=${1:-}
+KEEP=0; QUICK=0
+for a in "$@"; do
+  case "$a" in
+    --keep)  KEEP=1 ;;
+    --quick) QUICK=1 ;;
+    *) echo "unknown flag: $a"; exit 2 ;;
+  esac
+done
 
 PASS=0; FAIL=0
+FAILED_NAMES=()
 step() { echo; echo "━━━ $* ━━━"; }
+ok()   { echo "  ✓ $1"; PASS=$((PASS+1)); }
+bad()  { echo "  ✗ $1"; FAILED_NAMES+=("$1"); FAIL=$((FAIL+1)); }
+
 assert_contains() { # desc haystack needle
-  if echo "$2" | grep -q "$3"; then echo "  ✓ $1"; PASS=$((PASS+1));
-  else echo "  ✗ $1 — expected '$3' in:"; echo "$2" | sed 's/^/    /' | head -5; FAIL=$((FAIL+1)); fi
+  if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1"
+  else bad "$1 — expected '$3' in:"; printf '%s' "$2" | sed 's/^/      /' | head -6; fi
+}
+assert_not_contains() { # desc haystack needle
+  if printf '%s' "$2" | grep -qF -- "$3"; then bad "$1 — did NOT expect '$3' in:"; printf '%s' "$2" | sed 's/^/      /' | head -6
+  else ok "$1"; fi
 }
 assert_matches() { # desc haystack extended-regex
-  if echo "$2" | grep -qE "$3"; then echo "  ✓ $1"; PASS=$((PASS+1));
-  else echo "  ✗ $1 — expected match /$3/ in:"; echo "$2" | sed 's/^/    /' | head -5; FAIL=$((FAIL+1)); fi
+  if printf '%s' "$2" | grep -qE -- "$3"; then ok "$1"
+  else bad "$1 — expected match /$3/ in:"; printf '%s' "$2" | sed 's/^/      /' | head -6; fi
 }
-assert_exit() { # desc expected_exit actual_exit
-  if [ "$2" = "$3" ]; then echo "  ✓ $1 (exit=$3)"; PASS=$((PASS+1));
-  else echo "  ✗ $1 — expected exit $2, got $3"; FAIL=$((FAIL+1)); fi
+assert_exit() { # desc expected actual
+  if [ "$2" = "$3" ]; then ok "$1 (exit=$3)"; else bad "$1 — expected exit $2, got $3"; fi
 }
 
 # always rebuild: a stale bin/ would silently test a different revision
@@ -43,130 +55,292 @@ go build -o bin/k3helper ./cmd/k3helper || exit 1
 K=bin/k3helper
 
 # ── 0. sandbox ────────────────────────────────────────────────────────────────
-if [ "$KEEP_SANDBOX" != "--keep" ]; then
+if [ "$KEEP" = 0 ]; then
   step "0. Reset sandbox (3 fresh Ubuntu 24.04 VMs)"
   make sandbox-down >/dev/null 2>&1
   if ! test/sandbox/setup-orbstack.sh > /tmp/e2e-sandbox.log 2>&1; then
-    echo "sandbox setup failed:"; tail -5 /tmp/e2e-sandbox.log; exit 1
+    echo "sandbox setup failed:"; tail -8 /tmp/e2e-sandbox.log; exit 1
   fi
-  grep -q "sandbox ready" /tmp/e2e-sandbox.log && echo "  ✓ 3 VMs up, SSH verified"
+  grep -q "sandbox ready" /tmp/e2e-sandbox.log && ok "3 VMs up, SSH verified"
 fi
-SERVER_IP=$(grep -A3 'name: server' "$TARGETS" | grep 'host:' | awk '{print $2}')
-SSHOPTS="-i test/sandbox/ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5"
-kctl() { ssh $SSHOPTS sandbox@$SERVER_IP "sudo k3s kubectl $*" 2>/dev/null; }
 
-# ── 1. check before install: k3s missing ─────────────────────────────────────
-if [ "$KEEP_SANDBOX" != "--keep" ]; then
-  step "1. check BEFORE install — k3s must be reported missing"
+read_host() { grep -A5 "name: $1\$" "$TARGETS" | grep 'host:' | head -1 | awk '{print $2}'; }
+SERVER_IP=$(read_host server)
+AGENT1_IP=$(read_host agent1)
+SSHO=(-i test/sandbox/ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o BatchMode=yes)
+kctl() { ssh "${SSHO[@]}" "sandbox@$SERVER_IP" "sudo k3s kubectl $*" 2>/dev/null; }
+
+# ── 1. init: build a targets file from nothing ───────────────────────────────
+step "1. init — scaffold a targets file"
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+OUT=$($K init --server "$SERVER_IP" --agent "$AGENT1_IP" --user sandbox \
+        --key "$ROOT/test/sandbox/ssh/id_ed25519" --insecure-host-key \
+        -o "$WORK/targets.yaml" 2>&1)
+assert_contains "init writes a targets file" "$OUT" "wrote $WORK/targets.yaml"
+OUT=$($K ctx -t "$WORK/targets.yaml" 2>&1)
+assert_matches "the generated file loads back" "$OUT" "my-cluster +2"
+OUT=$($K init -o "$WORK/targets.yaml" 2>&1); RC=$?
+assert_exit "init refuses to clobber an existing file" 1 $RC
+OUT=$($K init --local -o "$WORK/local.yaml" 2>&1)
+assert_contains "init --local describes this machine" "$OUT" "this machine (local)"
+
+# a missing targets file must explain itself, not just fail to open
+OUT=$($K check -t "$WORK/definitely-absent.yaml" 2>&1)
+assert_contains "missing targets file suggests init" "$OUT" "k3helper init"
+
+# ── 2. SSH host key verification ─────────────────────────────────────────────
+step "2. SSH host key verification"
+grep -v 'insecure_host_key' "$TARGETS" > "$WORK/strict.yaml"
+KH="$WORK/known_hosts"
+OUT=$(HOME="$WORK" $K check -t "$WORK/strict.yaml" 2>&1)
+assert_contains "unknown host is refused by default" "$OUT" "is not in known_hosts"
+assert_contains "refusal shows the fingerprint" "$OUT" "SHA256:"
+assert_contains "refusal offers a way forward" "$OUT" "--accept-new-host-key"
+
+OUT=$(HOME="$WORK" $K check -t "$WORK/strict.yaml" --accept-new-host-key 2>&1)
+assert_not_contains "--accept-new-host-key connects" "$OUT" "not in known_hosts"
+[ -s "$WORK/.ssh/known_hosts" ] && ok "the accepted key was recorded" || bad "known_hosts was not written"
+OUT=$(HOME="$WORK" $K check -t "$WORK/strict.yaml" 2>&1)
+assert_not_contains "the recorded key then verifies without the flag" "$OUT" "not in known_hosts"
+
+# A changed key must be refused even in accept-new mode. The substituted key
+# has to be a *valid* different key: a mangled line is skipped as unparseable,
+# which makes the host look unknown rather than changed.
+ssh-keygen -q -t ed25519 -N '' -f "$WORK/other" <<<y >/dev/null 2>&1
+OTHER_KEY=$(awk '{print $1" "$2}' "$WORK/other.pub")
+awk -v k="$OTHER_KEY" '{print $1" "k}' "$WORK/.ssh/known_hosts" > "$WORK/.ssh/known_hosts.new"
+mv "$WORK/.ssh/known_hosts.new" "$WORK/.ssh/known_hosts"
+OUT=$(HOME="$WORK" $K check -t "$WORK/strict.yaml" --accept-new-host-key 2>&1)
+assert_contains "a CHANGED host key is refused even with --accept-new" "$OUT" "CHANGED"
+assert_contains "and says how to clear it once verified" "$OUT" "ssh-keygen -R"
+rm -rf "$WORK/.ssh"
+
+OUT=$($K check -t "$WORK/strict.yaml" --insecure-host-key --accept-new-host-key 2>&1)
+assert_contains "the two opt-outs are mutually exclusive" "$OUT" "mutually exclusive"
+
+# ── 3. check BEFORE install ──────────────────────────────────────────────────
+if [ "$KEEP" = 0 ]; then
+  step "3. check BEFORE install — k3s must be reported missing, with the right fix"
   OUT=$($K check -t $TARGETS 2>&1)
-  assert_contains "k3s service reported down" "$OUT" "k3s is inactive"
+  assert_contains "k3s reported as not installed" "$OUT" "not found"
+  # the whole point of the fix: don't tell someone to restart a service that
+  # was never installed
+  assert_contains "remediation says to install it" "$OUT" "get.k3s.io"
+  assert_not_contains "remediation does not say 'restart'" "$OUT" "systemctl restart"
 fi
 
-# ── 2. bootstrap ──────────────────────────────────────────────────────────────
-step "2. Bootstrap k3s on all 3 nodes over SSH"
+# ── 4. bootstrap ─────────────────────────────────────────────────────────────
+step "4. Bootstrap k3s on all 3 nodes over SSH"
+rm -f "$WORK/kubeconfig"
 OUT=$($K vm setup -t $TARGETS \
   --server-extra-args "--snapshotter=native --disable=traefik" \
   --agent-extra-args "--snapshotter=native" \
-  --kubeconfig sandbox-kubeconfig.yaml 2>&1)
+  --kubeconfig "$WORK/kubeconfig" 2>&1)
 assert_contains "cluster ready" "$OUT" "cluster ready"
+assert_matches "waited for all 3 nodes, not just the registered ones" "$OUT" "waiting for 3 node"
 
-# ── 3. check after install ───────────────────────────────────────────────────
-step "3. check AFTER install — all green"
+# ── 5. the fetched kubeconfig must work from HERE ────────────────────────────
+step "5. Fetched kubeconfig is usable from this machine"
+if [ -f "$WORK/kubeconfig" ]; then
+  ok "kubeconfig written"
+  assert_not_contains "loopback address was rewritten" "$(cat "$WORK/kubeconfig")" "127.0.0.1"
+  assert_contains "points at the real server address" "$(cat "$WORK/kubeconfig")" "$SERVER_IP"
+  if command -v kubectl >/dev/null 2>&1; then
+    OUT=$(KUBECONFIG="$WORK/kubeconfig" kubectl get nodes --request-timeout=15s 2>&1)
+    assert_contains "kubectl reaches the cluster with it" "$OUT" "Ready"
+  else
+    echo "  - kubectl not installed locally; skipping the live connection check"
+  fi
+else
+  bad "kubeconfig was not written"
+fi
+
+# ── 6. check AFTER install ───────────────────────────────────────────────────
+step "6. check AFTER install — all green"
 sleep 10
 OUT=$($K check -t $TARGETS 2>&1)
 assert_contains "server k3s active" "$OUT" "k3s is active"
 assert_contains "agent k3s-agent active" "$OUT" "k3s-agent is active"
-# The OK branch of the disk check reads "disk N% used"; the Warn/Fail branches
-# read "disk N% full". Match the verdict, not a specific percentage, so the
-# assertion tracks disk pressure rather than the base image's fill level.
 assert_matches "no disk pressure" "$OUT" "disk [0-9]+% used"
+$K check -t $TARGETS >/dev/null 2>&1; assert_exit "check exits 0 when only warnings are present" 0 $?
+# the sandbox has swap on, which is a warning; --strict must escalate it
+OUT=$($K check -t $TARGETS 2>&1)
+if printf '%s' "$OUT" | grep -q "WARN"; then
+  $K check -t $TARGETS --strict >/dev/null 2>&1; assert_exit "--strict escalates warnings to a failure" 2 $?
+else
+  echo "  - no warnings on this cluster; skipping the --strict check"
+fi
 
-# ── 4. gen → verify → deploy ─────────────────────────────────────────────────
-step "4. gen → verify → deploy"
-$K gen deployment e2e-web -i nginx:alpine -r 1 -p 80 -o /tmp/e2e-web.yaml
-OUT=$($K verify /tmp/e2e-web.yaml 2>&1)
-assert_contains "generated manifest verifies (offline)" "$OUT" "Deployment/e2e-web"
-# validation layer 3: the real API server must accept it too
-OUT=$($K verify /tmp/e2e-web.yaml --dry-run-server -t $TARGETS 2>&1)
-assert_contains "generated manifest verifies (server dry-run)" "$OUT" "Deployment/e2e-web"
-# deploy ships the local manifest to the target itself — no manual scp here,
-# otherwise the e2e would not be testing the path real users take.
-OUT=$($K deploy -f /tmp/e2e-web.yaml -t $TARGETS 2>&1)
+# ── 7. gen → verify → deploy ─────────────────────────────────────────────────
+step "7. gen → verify (offline + live) → deploy"
+$K gen deployment e2e-web -i nginx:alpine -r 1 -p 80 -o "$WORK/web.yaml"
+OUT=$($K verify "$WORK/web.yaml" 2>&1)
+assert_contains "generated manifest verifies offline" "$OUT" "Deployment/e2e-web"
+OUT=$($K verify "$WORK/web.yaml" --dry-run-server -t $TARGETS 2>&1)
+assert_contains "and against the live API server" "$OUT" "Deployment/e2e-web"
+
+# every kind gen emits must be accepted by a real API server
+GENFAIL=""
+for kind in namespace configmap secret service pod pvc deploy sts ds job cj ing; do
+  $K gen "$kind" "e2e-$kind" -i busybox:latest -o "$WORK/k.yaml" 2>/dev/null || { GENFAIL="$GENFAIL $kind(gen)"; continue; }
+  $K verify "$WORK/k.yaml" --dry-run-server -t $TARGETS >/dev/null 2>&1 || GENFAIL="$GENFAIL $kind"
+done
+[ -z "$GENFAIL" ] && ok "every kind (incl. kubectl short aliases) is accepted by the API server" \
+                  || bad "API server rejected generated:$GENFAIL"
+
+# a manifest the offline rules should catch, without needing a cluster
+cat > "$WORK/bad.yaml" <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: e2e-bad
+spec:
+  template:
+    spec:
+      containers:
+        - name: c
+          image: busybox:latest
+EOF
+OUT=$($K verify "$WORK/bad.yaml" 2>&1); RC=$?
+assert_exit "an invalid Job fails verification offline" 1 $RC
+assert_contains "and says which field is wrong" "$OUT" "restartPolicy"
+
+# deploy ships the local manifest itself — no manual scp
+OUT=$($K deploy -f "$WORK/web.yaml" -t $TARGETS 2>&1)
 assert_contains "applied" "$OUT" "applied deployment.apps/e2e-web"
 assert_contains "rolled out" "$OUT" "rolled out deployment.apps/e2e-web"
 PODS=$(kctl get pods -l app=e2e-web --no-headers 2>/dev/null | grep -c Running)
-if [ "$PODS" -ge 1 ]; then echo "  ✓ pod Running in cluster"; PASS=$((PASS+1)); else echo "  ✗ pod not running"; FAIL=$((FAIL+1)); fi
+[ "${PODS:-0}" -ge 1 ] && ok "pod Running in cluster" || bad "pod not running"
+# and cleans up after itself
+LEFT=$(ssh "${SSHO[@]}" "sandbox@$SERVER_IP" 'ls /tmp/k3helper-* 2>/dev/null | wc -l' 2>/dev/null)
+[ "${LEFT:-0}" = "0" ] && ok "no temp manifests left on the server" || bad "deploy left $LEFT temp file(s) behind"
 
-# ── 5. doctor on healthy cluster ─────────────────────────────────────────────
-step "5. doctor on healthy cluster — zero findings"
-sleep 5
+# ── 8. deploy --diff ─────────────────────────────────────────────────────────
+step "8. deploy --diff against live state"
+OUT=$($K deploy -f "$WORK/web.yaml" -t $TARGETS --diff --dry-run 2>&1)
+assert_contains "unchanged manifest reports no changes" "$OUT" "no changes against live cluster state"
+$K gen deployment e2e-web -i nginx:1.25-alpine -r 2 -p 80 -o "$WORK/web2.yaml"
+OUT=$($K deploy -f "$WORK/web2.yaml" -t $TARGETS --diff --dry-run 2>&1)
+assert_contains "a changed image shows in the diff" "$OUT" "nginx:1.25-alpine"
+assert_matches "a changed replica count shows too" "$OUT" '\+  replicas: 2'
+$K deploy -f "$WORK/web2.yaml" -t $TARGETS >/dev/null 2>&1; assert_exit "--dry-run changed nothing, so the real apply works" 0 $?
+
+# ── 9. namespaces ────────────────────────────────────────────────────────────
+step "9. deploy --namespace"
+OUT=$($K deploy -f "$WORK/web.yaml" -t $TARGETS -n e2e-missing-ns 2>&1); RC=$?
+assert_exit "a namespace that does not exist fails" 1 $RC
+assert_contains "and says so" "$OUT" "not found"
+kctl create namespace e2e-ns >/dev/null 2>&1
+OUT=$($K deploy -f "$WORK/web.yaml" -t $TARGETS -n e2e-ns 2>&1)
+assert_contains "deploys into the requested namespace" "$OUT" "rolled out"
+LANDED=$(kctl get deploy e2e-web -n e2e-ns --no-headers 2>/dev/null | wc -l | tr -d ' ')
+[ "$LANDED" = "1" ] && ok "the resource really landed in e2e-ns" || bad "resource is not in e2e-ns"
+printf 'apiVersion: v1\nkind: Service\nmetadata:\n  name: e2e-conflict\n  namespace: prod\nspec:\n  ports:\n    - port: 80\n' > "$WORK/conflict.yaml"
+OUT=$($K deploy -f "$WORK/conflict.yaml" -t $TARGETS -n e2e-ns 2>&1)
+assert_contains "a namespace conflict is refused, not silently redirected" "$OUT" "conflicts with the manifest"
+
+# ── 10. contexts ─────────────────────────────────────────────────────────────
+step "10. Multi-cluster contexts"
+{
+  echo "clusters:"
+  echo "  - cluster: sandbox"
+  echo "    nodes:"
+  # re-indent the sandbox node list by four spaces to sit under this entry
+  sed -n '/^nodes:/,$p' "$TARGETS" | sed '1d' | sed 's/^/    /'
+  echo "  - cluster: elsewhere"
+  echo "    nodes:"
+  echo "      - name: server"
+  echo "        role: server"
+  echo "        host: 10.255.255.1"
+  echo "        user: nobody"
+  echo "        key: $ROOT/test/sandbox/ssh/id_ed25519"
+  echo "        insecure_host_key: true"
+  echo "current: sandbox"
+} > "$WORK/multi.yaml"
+OUT=$($K ctx -t "$WORK/multi.yaml" 2>&1)
+assert_contains "ctx lists both clusters" "$OUT" "elsewhere"
+assert_matches "and marks the current one" "$OUT" '\* +sandbox'
+$K doctor -t "$WORK/multi.yaml" >/dev/null 2>&1; assert_exit "default context targets the healthy sandbox" 0 $?
+OUT=$($K check -t "$WORK/multi.yaml" --context nope 2>&1)
+assert_contains "an unknown context lists the real ones" "$OUT" "have: sandbox, elsewhere"
+
+# ── 11. doctor on a healthy cluster ──────────────────────────────────────────
+step "11. doctor on a healthy cluster — zero findings"
+kctl delete deployment e2e-web -n e2e-ns >/dev/null 2>&1
+kctl delete namespace e2e-ns >/dev/null 2>&1
+sleep 8
 OUT=$($K doctor -t $TARGETS 2>&1)
 assert_contains "healthy verdict" "$OUT" "no issues detected"
-$K doctor -t $TARGETS >/dev/null 2>&1; assert_exit "exit code 0 when healthy" 0 $?
+$K doctor -t $TARGETS >/dev/null 2>&1; assert_exit "exit 0 when healthy" 0 $?
+OUT=$($K doctor -t $TARGETS --json 2>&1)
+assert_contains "--json reports healthy" "$OUT" '"healthy": true'
 
-# ── 6. fault: k3s-agent stopped ───────────────────────────────────────────────
-step "6. FAULT: stop k3s-agent on agent1"
-AGENT1_IP=$(grep -A3 'name: agent1' "$TARGETS" | grep 'host:' | awk '{print $2}')
-ssh $SSHOPTS sandbox@$AGENT1_IP 'sudo systemctl stop k3s-agent' 2>/dev/null
-echo "  (waiting 40s for node to go NotReady)"; sleep 40
-OUT=$($K doctor -t $TARGETS 2>&1)
-assert_contains "doctor catches k3s down" "$OUT" "k3s service is down"
-$K doctor -t $TARGETS >/dev/null 2>&1; assert_exit "exit code 2 when faulted" 2 $?
+# an unreachable node must never read as healthy
+sed "s/$AGENT1_IP/10.255.255.2/" "$TARGETS" > "$WORK/ghost.yaml"
+OUT=$($K doctor -t "$WORK/ghost.yaml" --json 2>&1); RC=$?
+assert_contains "an unreachable node is reported" "$OUT" '"signature_id": "node.unreachable"'
+assert_exit "and is not a clean bill of health" 2 $RC
 
-# ── 7. recover ────────────────────────────────────────────────────────────────
-step "7. RECOVER: restart k3s-agent"
-ssh $SSHOPTS sandbox@$AGENT1_IP 'sudo systemctl start k3s-agent' 2>/dev/null
-echo "  (waiting 60s for node Ready)"; sleep 60
-OUT=$($K doctor -t $TARGETS 2>&1)
-assert_contains "healthy again" "$OUT" "no issues detected"
+# ── 12. fault: k3s-agent down ────────────────────────────────────────────────
+step "12. FAULT: stop k3s-agent on agent1"
+ssh "${SSHO[@]}" "sandbox@$AGENT1_IP" 'sudo systemctl stop k3s-agent' 2>/dev/null
+echo "  (waiting up to 60s for the node to go NotReady)"
+DETECTED=0
+for _ in $(seq 1 12); do
+  sleep 5
+  # capture before grepping: doctor exits 2 on findings and pipefail would
+  # make that beat grep's success
+  DOC=$($K doctor -t $TARGETS --json 2>/dev/null) || true
+  if printf '%s' "$DOC" | grep -q '"signature_id": "node.notready-k3s-down"'; then DETECTED=1; break; fi
+done
+[ "$DETECTED" = 1 ] && ok "doctor catches the stopped service" || bad "doctor missed the stopped k3s-agent"
+$K doctor -t $TARGETS >/dev/null 2>&1; assert_exit "exit 2 when faulted" 2 $?
 
-# ── 8. fault: OOMKilled ───────────────────────────────────────────────────────
-step "8. FAULT: OOMKilled pod (10Mi limit, 50MB allocation)"
-cat > /tmp/e2e-oom.yaml <<'EOF'
-apiVersion: v1
-kind: Pod
-metadata:
-  name: e2e-oom
-spec:
-  restartPolicy: Always
-  containers:
-  - name: hog
-    image: busybox:latest
-    resources:
-      limits:
-        memory: "10Mi"
-    command: ["sh", "-c", "head -c 50000000 /dev/zero | tr '\\0' 'x' > /tmp/big; VAR=$(cat /tmp/big); echo VARSIZE ${#VAR}; sleep 60"]
-EOF
-scp -q $SSHOPTS /tmp/e2e-oom.yaml sandbox@$SERVER_IP:/tmp/e2e-oom.yaml 2>/dev/null
-kctl apply -f /tmp/e2e-oom.yaml >/dev/null
-# The pod restarts on a loop (restartPolicy: Always), so a single sample of
-# lastState can catch a restart whose exit the kubelet reported as a generic
-# "Error" rather than "OOMKilled". Poll both state and lastState until either
-# reports OOMKilled instead of betting on one 45s snapshot.
-echo "  (waiting up to 90s for OOMKill)"
-STATE=""
+# ── 13. recover ──────────────────────────────────────────────────────────────
+step "13. RECOVER: restart k3s-agent"
+ssh "${SSHO[@]}" "sandbox@$AGENT1_IP" 'sudo systemctl start k3s-agent' 2>/dev/null
+echo "  (waiting up to 90s for the node to return)"
+RECOVERED=0
 for _ in $(seq 1 18); do
   sleep 5
-  STATE=$(kctl get pod e2e-oom -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}{" "}{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
-  case "$STATE" in *OOMKilled*) break ;; esac
+  if $K doctor -t $TARGETS >/dev/null 2>&1; then RECOVERED=1; break; fi
 done
-case "$STATE" in
-  *OOMKilled*) echo "  ✓ pod OOMKilled in cluster"; PASS=$((PASS+1)) ;;
-  *) echo "  ✗ expected OOMKilled in state/lastState, got '$STATE'"; FAIL=$((FAIL+1)) ;;
-esac
-OUT=$($K doctor -t $TARGETS 2>&1)
-assert_contains "doctor catches OOMKill" "$OUT" "OOMKilled"
+[ "$RECOVERED" = 1 ] && ok "healthy again after recovery" || bad "cluster did not recover"
 
-# ── 9. cleanup ────────────────────────────────────────────────────────────────
-step "9. Cleanup: remove OOM pod → healthy"
-kctl delete pod e2e-oom --force --grace-period=0 >/dev/null 2>&1
+# ── 14. fault sweep ──────────────────────────────────────────────────────────
+if [ "$QUICK" = 0 ]; then
+  step "14. Fault sweep — each fault must produce its own signature"
+  if test/faults/check-all.sh imagepull crashloop pvc-pending empty-endpoints coredns oom 2>&1 | tee "$WORK/faults.log" | grep -E '^  (✓|✗)'; then :; fi
+  # grep -c exits 1 on zero matches; capture the count without letting that
+  # append a second "0" and break the arithmetic below
+  SWEEP=$(grep -c '^  ✓' "$WORK/faults.log" 2>/dev/null); SWEEP=${SWEEP:-0}
+  SWEEP_BAD=$(grep -c '^  ✗' "$WORK/faults.log" 2>/dev/null); SWEEP_BAD=${SWEEP_BAD:-0}
+  PASS=$((PASS+SWEEP)); FAIL=$((FAIL+SWEEP_BAD))
+  [ "$SWEEP_BAD" -gt 0 ] && FAILED_NAMES+=("fault sweep: $SWEEP_BAD undiagnosed")
+else
+  echo "  (--quick: skipping the fault sweep)"
+fi
+
+# ── 15. cleanup → healthy ────────────────────────────────────────────────────
+step "15. Cleanup → cluster healthy again"
+test/faults/fault.sh clean >/dev/null 2>&1
+kctl delete deployment e2e-web --ignore-not-found >/dev/null 2>&1
 sleep 12
-OUT=$($K doctor -t $TARGETS 2>&1)
-assert_contains "healthy again" "$OUT" "no issues detected"
+RECOVERED=0
+for _ in $(seq 1 12); do
+  if $K doctor -t $TARGETS >/dev/null 2>&1; then RECOVERED=1; break; fi
+  sleep 5
+done
+if [ "$RECOVERED" = 1 ]; then ok "healthy again"
+else bad "cluster not healthy after cleanup"; $K doctor -t $TARGETS 2>&1 | sed 's/^/      /' | head -12; fi
 
 # ── summary ───────────────────────────────────────────────────────────────────
 echo
 echo "════════════════════════════════════════"
 echo "  E2E RESULT: $PASS passed, $FAIL failed"
+if [ "$FAIL" -gt 0 ]; then
+  echo
+  for f in "${FAILED_NAMES[@]}"; do echo "  ✗ $f"; done
+fi
 echo "════════════════════════════════════════"
 [ "$FAIL" -eq 0 ]

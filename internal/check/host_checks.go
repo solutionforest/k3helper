@@ -127,42 +127,6 @@ func (c CgroupCheck) Run(ctx Context) Result {
 		Remediation: "Add `cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory` to kernel cmdline (/boot/cmdline.txt or /etc/default/grub), then reboot", Evidence: []string{out}}
 }
 
-// K3sServiceCheck verifies the k3s systemd unit is active.
-type K3sServiceCheck struct {
-	// Role of this node: server → "k3s", agent → "k3s-agent"
-	Role string
-}
-
-func (c K3sServiceCheck) ID() string       { return "k3s.service" }
-func (c K3sServiceCheck) Name() string     { return "k3s systemd service" }
-func (c K3sServiceCheck) Category() string { return "k3s" }
-
-func (c K3sServiceCheck) Run(ctx Context) Result {
-	unit := "k3s"
-	if c.Role == "agent" {
-		unit = "k3s-agent"
-	}
-	out, code, err := ctx.Exec.Run(fmt.Sprintf(`sudo -n systemctl is-active %s 2>/dev/null`, unit))
-	active := strings.TrimSpace(out)
-	if err != nil && code == -1 {
-		return Result{ID: c.ID(), Category: c.Category(), Name: c.Name(), Status: Skip,
-			Summary: "systemctl unavailable", Details: out}
-	}
-	switch {
-	case active == "active":
-		return Result{ID: c.ID(), Category: c.Category(), Name: c.Name(), Status: OK,
-			Summary: fmt.Sprintf("%s is active", unit), Evidence: []string{out}}
-	case active == "" && code != 0:
-		return Result{ID: c.ID(), Category: c.Category(), Name: c.Name(), Status: Fail,
-			Summary:     fmt.Sprintf("%s unit not found: k3s may not be installed", unit),
-			Remediation: "Install k3s: `curl -sfL https://get.k3s.io | sh -` or run `k3helper vm setup`", Evidence: []string{out}}
-	default:
-		return Result{ID: c.ID(), Category: c.Category(), Name: c.Name(), Status: Fail,
-			Summary:     fmt.Sprintf("%s is %s", unit, active),
-			Remediation: fmt.Sprintf("Inspect logs: `sudo journalctl -u %s -n 100 --no-pager`; try `sudo systemctl restart %s`", unit, unit), Evidence: []string{out}}
-	}
-}
-
 // --- fixture-based Executor for tests ---
 
 // MapExec is an Executor returning canned outputs per command (tests).

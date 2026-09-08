@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -22,6 +22,9 @@ type Node struct {
 	// executed through /bin/sh instead of an SSH connection, so no sshd,
 	// key or loopback network access is required.
 	Local bool
+	// HostKey selects how the server's host key is verified. The zero value
+	// verifies against known_hosts.
+	HostKey HostKeyMode
 }
 
 // Executor is the minimal command-execution surface (satisfied by *Client).
@@ -46,21 +49,27 @@ func Dial(n Node) (*Client, error) {
 	if n.Port == 0 {
 		n.Port = 22
 	}
-	key, err := os.ReadFile(n.Key)
+	keyPath, err := expandHome(n.Key)
 	if err != nil {
-		return nil, fmt.Errorf("read ssh key %s: %w", n.Key, err)
+		return nil, err
+	}
+	key, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read ssh key %s: %w", keyPath, err)
 	}
 	signer, err := gossh.ParsePrivateKey(key)
 	if err != nil {
-		return nil, fmt.Errorf("parse ssh key %s: %w", n.Key, err)
+		return nil, fmt.Errorf("parse ssh key %s: %w", keyPath, err)
+	}
+	callback, err := hostKeyCallback(n.HostKey)
+	if err != nil {
+		return nil, err
 	}
 	cfg := &gossh.ClientConfig{
-		User: n.User,
-		Auth: []gossh.AuthMethod{gossh.PublicKeys(signer)},
-		HostKeyCallback: func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-			return nil // sandbox/dev: no host key verification
-		},
-		Timeout: 10 * time.Second,
+		User:            n.User,
+		Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
+		HostKeyCallback: callback,
+		Timeout:         10 * time.Second,
 	}
 	addr := fmt.Sprintf("%s:%d", n.Host, n.Port)
 	conn, err := gossh.Dial("tcp", addr, cfg)
@@ -190,4 +199,23 @@ func (c *Client) Close() error {
 		return c.conn.Close()
 	}
 	return nil
+}
+
+// expandHome resolves a leading ~ in a key path; targets files are written by
+// humans and "~/.ssh/id_ed25519" is what they type.
+func expandHome(p string) (string, error) {
+	if p == "" || !strings.HasPrefix(p, "~") {
+		return p, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand %q: %w", p, err)
+	}
+	if p == "~" {
+		return home, nil
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:]), nil
+	}
+	return "", fmt.Errorf("cannot expand %q: ~user paths are not supported", p)
 }

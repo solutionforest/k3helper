@@ -261,6 +261,9 @@ func parseEvents(data string, e *Evidence) {
 }
 
 func parsePVCs(data string, e *Evidence) {
+	if e.livePVCs == nil {
+		e.livePVCs = map[string]bool{}
+	}
 	var raw struct {
 		Items []struct {
 			Metadata struct {
@@ -276,8 +279,9 @@ func parsePVCs(data string, e *Evidence) {
 		return
 	}
 	for _, it := range raw.Items {
+		key := it.Metadata.Namespace + "/" + it.Metadata.Name
+		e.livePVCs[key] = true
 		if it.Status.Phase == "Pending" {
-			key := it.Metadata.Namespace + "/" + it.Metadata.Name
 			if _, ok := e.PVCEvents[key]; !ok {
 				e.PVCEvents[key] = []string{"PVC status: Pending"}
 			}

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"fmt"
+
 	"github.com/solutionforest/k3helper/internal/config"
+	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/spf13/cobra"
 )
 
@@ -11,6 +14,14 @@ var version = "0.1.0"
 // multi-cluster targets file. Empty means the file's `current`, or its only
 // cluster.
 var contextName string
+
+// Host key policy flags. Verification is on by default; both opt-outs are
+// explicit because silently trusting any key is how an SSH session gets
+// intercepted — and vm setup pipes an install script to sudo sh over it.
+var (
+	insecureHostKey  bool
+	acceptNewHostKey bool
+)
 
 // loadTargets resolves the targets file honouring --context. Every command
 // goes through this so the flag cannot be silently ignored by one of them.
@@ -31,13 +42,31 @@ func NewRootCmd() *cobra.Command {
   check       run cluster/node/k3s health checks
   doctor      troubleshoot: find issues + remediation
   ctx         list clusters defined in the targets file
+  init        create a targets.yaml describing your nodes
   tui         launch the interactive dashboard`,
 		SilenceUsage: true,
 	}
 	// --context selects a cluster from a multi-cluster targets file. It is
 	// persistent so every subcommand honours it without repeating the flag.
 	root.PersistentFlags().StringVar(&contextName, "context", "", "cluster to use from a multi-cluster targets file")
+	root.PersistentFlags().BoolVar(&insecureHostKey, "insecure-host-key", false, "skip SSH host key verification entirely")
+	root.PersistentFlags().BoolVar(&acceptNewHostKey, "accept-new-host-key", false, "trust unknown hosts on first use and record them in known_hosts")
+	root.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if insecureHostKey && acceptNewHostKey {
+			return fmt.Errorf("--insecure-host-key and --accept-new-host-key are mutually exclusive")
+		}
+		switch {
+		case insecureHostKey:
+			config.HostKeyPolicy = ssh.HostKeyInsecure
+		case acceptNewHostKey:
+			config.HostKeyPolicy = ssh.HostKeyAcceptNew
+		default:
+			config.HostKeyPolicy = ssh.HostKeyVerify
+		}
+		return nil
+	}
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newInitCmd())
 	root.AddCommand(newCtxCmd())
 	root.AddCommand(newVerifyCmd())
 	root.AddCommand(newGenCmd())

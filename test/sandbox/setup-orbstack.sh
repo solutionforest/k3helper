@@ -36,6 +36,9 @@ IP_AGENT2=$(create sandbox-agent2)
 
 # regenerate targets with live IPs
 TARGETS="$ROOT/test/sandbox/targets.sandbox.yaml"
+# insecure_host_key: OrbStack hands out a new IP and a new host key every
+# time these VMs are recreated, so known_hosts would reject them on every
+# reset. Acceptable for a throwaway local sandbox; never for a real node.
 cat > "$TARGETS" <<EOF
 cluster: sandbox
 nodes:
@@ -45,18 +48,21 @@ nodes:
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519
+    insecure_host_key: true
   - name: agent1
     role: agent
     host: $IP_AGENT1
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519
+    insecure_host_key: true
   - name: agent2
     role: agent
     host: $IP_AGENT2
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519
+    insecure_host_key: true
 EOF
 echo "targets written: $TARGETS"
 

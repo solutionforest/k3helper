@@ -16,13 +16,18 @@ type Executor interface {
 	Run(cmd string) (string, int, error)
 }
 
-// Base is the kubectl invocation used on a k3s server node. It prefers the
-// bundled k3s binary and falls back to a kubectl already on PATH.
+// Base is the kubectl invocation used on a k3s server node.
 const Base = `sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml`
 
-// Cmd builds a kubectl command with the PATH fallback applied.
+// Cmd builds a kubectl command that works on either distribution: the k3s
+// bundled binary, a kubeadm admin.conf, or a kubectl already configured on
+// PATH. Each candidate is tried in turn so one command serves every node.
 func Cmd(args string) string {
-	return fmt.Sprintf(`%s %s 2>/dev/null || kubectl %s 2>/dev/null`, Base, args, args)
+	return fmt.Sprintf(
+		`sudo -n k3s kubectl %s --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null `+
+			`|| sudo -n kubectl %s --kubeconfig /etc/kubernetes/admin.conf 2>/dev/null `+
+			`|| kubectl %s 2>/dev/null`,
+		args, args, args)
 }
 
 // nsFlag renders the namespace selector: empty means all namespaces.

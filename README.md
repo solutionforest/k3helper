@@ -5,6 +5,7 @@
 ```
 k3helper is a portable k3s/kubernetes helper with a TUI.
 
+  init        create a targets.yaml describing your nodes
   vm setup    install k3s on target VMs over SSH
   verify      validate Kubernetes YAML manifests
   gen         generate correct Kubernetes YAML
@@ -94,7 +95,14 @@ You want `ssh ok` **and** `sudo ok` from each. Common fixes:
 
 ### 1. Describe your nodes
 
-`targets.yaml`:
+```bash
+k3helper init --server 10.0.0.10 --agent 10.0.0.11 \
+    --user ubuntu --key ~/.ssh/id_ed25519
+# ✓ wrote targets.yaml
+```
+
+`k3helper init --local` describes this machine instead, and plain `k3helper init`
+writes a template to edit. The file it produces:
 
 ```yaml
 cluster: my-cluster
@@ -115,6 +123,25 @@ nodes:
 
 `port` defaults to `22`. A node can instead set `local: true` and omit `host`/`user`/`key` — that's the machine k3helper is running on, and it's how the [browser-console flow](#no-ssh-from-your-machine-browser-console-only) works.
 
+#### SSH host keys
+
+Host keys are verified against `~/.ssh/known_hosts` by default. A first
+connection to an unrecorded host is refused, with the fingerprint and the ways
+forward:
+
+```
+host 10.0.0.10:22 is not in known_hosts (key SHA256:cxF1AFz7...).
+Verify the fingerprint out of band, then either:
+  ssh-keyscan -H 10.0.0.10 >> ~/.ssh/known_hosts
+or re-run with --accept-new-host-key to trust it on first use,
+or --insecure-host-key to skip verification entirely.
+```
+
+`--accept-new-host-key` trusts unknown hosts on first use and records them.
+A key that *changed* is always refused, in every mode — that is the case worth
+stopping for. Per node, `insecure_host_key: true` in the targets file skips
+verification for hosts whose address churns (the test sandbox does this).
+
 ### 2. Install k3s on all nodes
 
 ```bash
@@ -123,6 +150,13 @@ k3helper vm setup -t targets.yaml \
   --kubeconfig ./kubeconfig      # fetched back to your machine
 # ✓ cluster ready
 ```
+
+The fetched kubeconfig has its server address rewritten from k3s's `127.0.0.1`
+to the node's real address, so it works from your machine as-is.
+
+`vm setup` waits for every node in the targets file to register *and* go Ready,
+not just for whichever have registered so far — otherwise "cluster ready" can
+mean a server with no agents attached.
 
 ### 3. Check health
 
@@ -138,7 +172,9 @@ k3helper check -t targets.yaml
 == node worker1 (agent) ==
 ...
 ```
-Exit code: `0` healthy · `2` findings.
+Exit code: `0` when nothing failed, `2` when a check failed or a node was
+unreachable. **Warnings do not change the exit code** — a swap warning should
+not fail a pipeline the same way a dead k3s does. `--strict` escalates them.
 
 ### 4. Generate & verify YAML
 
@@ -147,7 +183,10 @@ k3helper gen deployment web -i nginx:1.25 -r 3 -p 8080 -o web.yaml
 k3helper verify web.yaml            # → ✓ Deployment/web (apps/v1)
 ```
 
-Supported kinds: Deployment, StatefulSet, DaemonSet, Pod, Service, Ingress, ConfigMap, Secret, PVC, Namespace, Job, CronJob.
+Supported kinds: Deployment, StatefulSet, DaemonSet, Pod, Service, Ingress,
+ConfigMap, Secret, PersistentVolumeClaim, Namespace, Job, CronJob — by full
+name, any casing, or the kubectl short alias (`pvc`, `deploy`, `svc`, `sts`,
+`ds`, `ns`, `cm`, `ing`, `cj`, `po`).
 
 `verify` runs three layers:
 
@@ -249,7 +288,7 @@ Doctor gathers evidence across every layer — VM host (`df`, `free`, cgroups, s
 | Layer | Signatures |
 |---|---|
 | Workload | ImagePullBackOff · CrashLoopBackOff · OOMKilled · unschedulable (resources/taints) · evicted |
-| Node | k3s service down + NotReady · DiskPressure · MemoryPressure · unreachable over SSH |
+| Node | k3s/kubelet service down + NotReady · container runtime down · DiskPressure · MemoryPressure · clock skew · image-cache bloat · unreachable over SSH |
 | Cluster | embedded-etcd quorum lost or at risk · TLS certificates expiring · kubeconfig/auth broken |
 | Network / storage | CoreDNS has no ready replicas · Services with no ready endpoints · PVC stuck Pending |
 
@@ -399,12 +438,18 @@ Back on the server, `k3s kubectl get nodes` should show them joining. You lose `
 
 ## k3s vs k8s support
 
-| Area | k3s | other k8s |
+| Area | k3s | kubeadm / other k8s |
 |---|---|---|
 | verify / gen | ✅ | ✅ (pure YAML) |
 | deploy / doctor cluster layer | ✅ | ✅ (kubectl-based) |
-| check host service layer | ✅ (`k3s`/`k3s-agent` units) | ❌ unit names differ (`kubelet`, `containerd`) |
+| check host service layer | ✅ (`k3s`/`k3s-agent`) | ✅ (`kubelet` + `containerd`) |
+| kubeconfig discovery | ✅ `/etc/rancher/k3s/k3s.yaml` | ✅ `/etc/kubernetes/admin.conf` |
+| certificate expiry | ✅ (`k3s certificate check`) | ❌ k3s-specific command |
 | vm setup | ✅ | ❌ install script is k3s-specific |
+
+The distribution is detected per node from its unit files, so a mixed
+inventory works: kubectl is invoked through whichever kubeconfig exists, and
+the service check looks for the units that distribution actually installs.
 
 ## Testing
 
@@ -418,10 +463,34 @@ make e2e             # full lifecycle, ~10-15 min
 make e2e-fast        # reuse running sandbox, ~6 min
 make test            # unit tests
 make test-integration
+make fault-list      # every fault + the signature it should trigger
+make fault-<name>    # inject one fault, e.g. make fault-oom
+make fault-check-all # inject each fault, assert doctor diagnoses it
+make fault-clean     # undo them
 make release         # stripped binaries + checksums.txt in dist/
 make release-upload  # cut/refresh the GitHub release and upload dist/
 make bundle          # offline paste bundle (see the browser-console section)
 ```
+
+**The troubleshooter's exam.** `make fault-check-all` injects each fault in turn, asserts `doctor` reports the signature that fault is supposed to produce, then cleans up:
+
+| Fault | Expected signature |
+|---|---|
+| `imagepull` · `crashloop` · `oom` | `pod.imagepull` · `pod.crashloop` · `pod.oom` |
+| `pending` · `cordon` | `pod.pending-sched` |
+| `pvc-pending` | `storage.pvc-pending` |
+| `coredns` · `empty-endpoints` | `network.coredns` · `network.empty-endpoints` |
+| `k3s-down` · `disk-full` | `node.notready-k3s-down` · `node.diskpressure` |
+| `bad-kubeconfig` | `cluster.kubeconfig` |
+
+Matching is on signature IDs from `doctor --json`, not display titles, so rewording a finding cannot silently break the suite.
+
+`make e2e` is the full product exercised end to end against three fresh VMs —
+`init`, host-key verification (including a *changed* key), bootstrap, the
+fetched kubeconfig actually connecting from your machine, every generated kind
+against the live API server, deploy/diff/namespaces, contexts, `doctor` on a
+healthy and a faulted cluster, and the fault sweep. `make e2e-quick` skips the
+sweep for a fast loop.
 
 The E2E script proves the whole loop: fresh VMs → check detects missing k3s → bootstrap → all green → gen/verify/deploy → doctor healthy → **inject faults (k3s stop, OOMKill) → doctor catches each → recover**.
 
@@ -460,19 +529,19 @@ test/
 
 Current, and worth knowing before pointing this at production:
 
-- **SSH host keys are not verified.** `k3helper` accepts any host key on every connection. On an untrusted network this is exposed to machine-in-the-middle — and `vm setup` sends the cluster join token and pipes an install script to `sudo sh` over that connection. Use it on networks you trust until known-hosts checking lands. (A `local: true` node has no connection to intercept, but every other node in the file still does.)
-- **`vm setup` reports "cluster ready" once the *registered* nodes are Ready**, without comparing against the expected node count. An agent that has not registered yet can be missed.
-- **The fetched kubeconfig is not rewritten.** `--kubeconfig` copies the server's `k3s.yaml` verbatim, so it still points at `https://127.0.0.1:6443` and won't work from your machine as-is. (It is correct as-is when k3helper runs on the server itself via `local: true`.)
-- **Host-layer checks are k3s-specific** (`k3s`/`k3s-agent` systemd units). See the support matrix above.
+- **Host-layer checks assume systemd.** Nodes without it (some minimal or
+  container-based images) get cluster-layer findings only.
+- **`doctor` reads the cluster through the first server node.** If that node is
+  down, cluster-layer evidence is unavailable even when other servers are up.
+- **Certificate expiry is read via `k3s certificate check`**, so it is not
+  collected on kubeadm clusters.
 
 ## Roadmap
 
-- [ ] SSH known-hosts verification, with an explicit opt-out flag
-- [ ] Rewrite the fetched kubeconfig's server address to the node's reachable IP
-- [ ] `vm setup`: wait for the expected node count, not just the registered ones
-- [ ] k8s (kubeadm) host-layer adapter: `kubelet`/`containerd` units, `/etc/kubernetes/admin.conf`
-- [ ] More failure signatures (kubelet/containerd health, image GC, clock skew)
-- [ ] Fault-injection matrix as `make fault-<name>` targets (disk full, bad token, ImagePull, PVC pending, cordon)
+- [ ] HA control plane: multiple servers, `--cluster-init`, embedded etcd setup
+- [ ] Port-forward manager and multi-pod log tailing in the TUI
+- [ ] `doctor --watch` for continuous monitoring
+- [ ] Sandbox on Linux CI (k3s-in-docker) so the E2E can run on GitHub runners
 
 ## License
 

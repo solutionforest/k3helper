@@ -5,6 +5,7 @@ package troubleshoot
 import (
 	"sort"
 	"strings"
+	"time"
 )
 
 // Signature is a known failure pattern.
@@ -52,7 +53,15 @@ type Evidence struct {
 	// EmptyEndpoints: namespace/name of Services whose endpoints have no
 	// ready addresses — reachable in DNS, but nothing behind them.
 	EmptyEndpoints []string
+	// ContainerRuntime: node → "unit=state" for the container runtime, e.g.
+	// "containerd=active". Absent when the distribution embeds its runtime.
+	ContainerRuntime map[string]string
+	// ClockSkew: node → absolute clock offset from the machine running
+	// k3helper.
+	ClockSkew map[string]time.Duration
 
+	// livePVCs: namespace/pvc keys of PVCs that currently exist.
+	livePVCs map[string]bool
 	// livePods: namespace/pod keys of pods that currently exist.
 	// Populated by parsePods; used to drop stale evidence for deleted pods.
 	// Unexported: internal to the gather/parse pipeline.
@@ -63,6 +72,8 @@ type Evidence struct {
 type HostMetric struct {
 	DiskUsedPercent int
 	AvailMemMB      int
+	// Images is the number of container images cached on the node.
+	Images int
 }
 
 // UnreachableNode is a targets-file node that could not be contacted.
@@ -118,6 +129,67 @@ var registry = []Signature{
 			return min(95, 75+len(e.Unreachable)*10)
 		},
 		Remediation: "Confirm the node is powered on and reachable (`ping`), that sshd is running, and that the host/port/user/key in the targets file are correct. Until it responds, no host-level diagnosis is possible for that node.",
+	},
+	{
+		ID:    "node.runtime-down",
+		Title: "Container runtime is not running",
+		Match: func(e Evidence) int {
+			n := 0
+			for _, state := range e.ContainerRuntime {
+				_, status, ok := strings.Cut(state, "=")
+				if ok && status != "" && status != "active" {
+					n++
+				}
+			}
+			if n == 0 {
+				return 0
+			}
+			// Without a runtime the kubelet cannot start a single container,
+			// so this explains almost any workload symptom on that node.
+			return min(95, 80+n*10)
+		},
+		Remediation: "Restart the runtime on the affected node (`sudo systemctl restart containerd`), then check `sudo journalctl -u containerd -n 100 --no-pager`. A runtime that will not start is often out of disk or has a corrupt state directory under /var/lib/containerd.",
+	},
+	{
+		ID:    "node.clock-skew",
+		Title: "Node clock is out of sync",
+		Match: func(e Evidence) int {
+			worst := time.Duration(0)
+			for _, skew := range e.ClockSkew {
+				if skew > worst {
+					worst = skew
+				}
+			}
+			switch {
+			case worst >= 5*time.Minute:
+				// Beyond this, TLS handshakes and token validation fail
+				// outright and the symptoms look like anything but a clock.
+				return 90
+			case worst >= 60*time.Second:
+				return 55
+			}
+			return 0
+		},
+		Remediation: "Enable time sync on the node: `sudo timedatectl set-ntp true` (or install chrony/systemd-timesyncd), then confirm with `timedatectl status`. Certificates, service-account tokens and etcd leases are all time-sensitive, so a skewed clock surfaces as TLS and auth failures.",
+	},
+	{
+		ID:    "node.image-bloat",
+		Title: "Disk filling up with cached container images",
+		Match: func(e Evidence) int {
+			n := 0
+			for _, m := range e.HostMetrics {
+				// Only meaningful once the disk is actually under pressure:
+				// a large image cache on a half-empty disk is not a problem.
+				if m.DiskUsedPercent >= 85 && m.Images >= 40 {
+					n++
+				}
+			}
+			if n == 0 {
+				return 0
+			}
+			return min(75, 45+n*15)
+		},
+		Remediation: "Prune unused images on the node: `sudo k3s crictl rmi --prune` (or `sudo crictl rmi --prune`). If it refills, lower the kubelet image GC thresholds (--image-gc-high-threshold/--image-gc-low-threshold) or give the node a bigger disk.",
 	},
 	{
 		ID:    "cluster.etcd-quorum",
@@ -257,8 +329,7 @@ var registry = []Signature{
 			n := 0
 			for _, evs := range e.PodEvents {
 				for _, ev := range evs {
-					if strings.Contains(ev, "Insufficient cpu") || strings.Contains(ev, "Insufficient memory") ||
-						strings.Contains(ev, "node(s) had untolerated taint") || strings.Contains(ev, "0/N nodes are available") {
+					if matchesAny(ev, unschedulableReasons) {
 						n++
 					}
 				}
@@ -363,6 +434,33 @@ var registry = []Signature{
 		},
 		Remediation: "Evictions come from node pressure (disk/memory). Fix the node pressure first, then delete evicted pods: `kubectl delete pod <pod>` so the controller recreates them.",
 	},
+}
+
+// unschedulableReasons are the scheduler's own phrases for "this pod cannot
+// be placed". They are matched as substrings of the FailedScheduling event.
+//
+// Note "were unschedulable" (a cordoned node) and "nodes are available" — the
+// latter is preceded by a live count like "0/3", so matching the literal
+// "0/N" as this once did never fired at all.
+var unschedulableReasons = []string{
+	"Insufficient cpu",
+	"Insufficient memory",
+	"Insufficient ephemeral-storage",
+	"had untolerated taint",
+	"were unschedulable",
+	"nodes are available",
+	"didn't match Pod's node affinity",
+	"didn't match node selector",
+	"had volume node affinity conflict",
+}
+
+func matchesAny(s string, needles []string) bool {
+	for _, n := range needles {
+		if strings.Contains(s, n) {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(list []string, s string) bool {

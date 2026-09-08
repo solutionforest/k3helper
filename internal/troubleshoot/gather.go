@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/solutionforest/k3helper/internal/kube"
 	"github.com/solutionforest/k3helper/internal/ssh"
 )
 
@@ -23,14 +24,16 @@ type Gatherer struct {
 // are recorded as evidence (e.g. broken kubeconfig is itself a diagnosis input).
 func (g Gatherer) Collect() Evidence {
 	e := Evidence{
-		PodEvents:       map[string][]string{},
-		PodStatuses:     map[string]string{},
-		ContainerStates: map[string]string{},
-		NodeConditions:  map[string][]string{},
-		K3sService:      map[string]string{},
-		HostMetrics:     map[string]HostMetric{},
-		PVCEvents:       map[string][]string{},
-		Unreachable:     g.Unreachable,
+		PodEvents:        map[string][]string{},
+		PodStatuses:      map[string]string{},
+		ContainerStates:  map[string]string{},
+		NodeConditions:   map[string][]string{},
+		K3sService:       map[string]string{},
+		HostMetrics:      map[string]HostMetric{},
+		PVCEvents:        map[string][]string{},
+		ContainerRuntime: map[string]string{},
+		ClockSkew:        map[string]time.Duration{},
+		Unreachable:      g.Unreachable,
 	}
 
 	// --- cluster layer via kubectl ---
@@ -57,8 +60,51 @@ func (g Gatherer) Collect() Evidence {
 		if m, ok := hostMetric(exec); ok {
 			e.HostMetrics[name] = m
 		}
+		if state, ok := runtimeState(exec); ok {
+			e.ContainerRuntime[name] = state
+		}
+		if skew, ok := clockSkew(exec, time.Now()); ok {
+			e.ClockSkew[name] = skew
+		}
 	}
 	return e
+}
+
+// runtimeState reports the container runtime unit's state. k3s embeds
+// containerd inside its own unit, so an absent containerd.service is normal
+// there and reported as "" (no evidence) rather than a fault.
+func runtimeState(exec ssh.Executor) (string, bool) {
+	out, _, err := exec.Run(
+		`for u in containerd cri-o docker; do ` +
+			`if systemctl list-unit-files $u.service --no-legend 2>/dev/null | grep -q $u; then ` +
+			`echo "$u=$(sudo -n systemctl is-active $u 2>/dev/null)"; break; fi; done`)
+	if err != nil {
+		return "", false
+	}
+	s := strings.TrimSpace(out)
+	if s == "" {
+		return "", false
+	}
+	return s, true
+}
+
+// clockSkew measures the node's clock against this machine's. Certificates
+// and etcd leases are time-sensitive, and a badly skewed node fails TLS in
+// ways that look like anything but a clock problem.
+func clockSkew(exec ssh.Executor, now time.Time) (time.Duration, bool) {
+	out, code, err := exec.Run(`date +%s`)
+	if err != nil || code != 0 {
+		return 0, false
+	}
+	secs, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	skew := time.Unix(secs, 0).Sub(now)
+	if skew < 0 {
+		skew = -skew
+	}
+	return skew, true
 }
 
 func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
@@ -93,6 +139,7 @@ func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
 	filterStalePodEvidence(e)
 	if pvcs, code, err := g.Server.Run(kubectl(`get pvc -A -o json`)); err == nil && code == 0 {
 		parsePVCs(pvcs, e)
+		filterStalePVCEvidence(e)
 	}
 	// endpoints back every Service; a Service with none is a silent outage
 	// that no pod-level signature reports.
@@ -104,12 +151,9 @@ func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
 	g.collectEtcd(e)
 }
 
-// kubectl builds a server-side kubectl command, preferring the k3s bundled
-// binary and falling back to a kubectl already on PATH.
+// kubectl builds a server-side kubectl command that works on k3s or kubeadm.
 func kubectl(args string) string {
-	return fmt.Sprintf(
-		`sudo -n k3s kubectl %s --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null || kubectl %s 2>/dev/null`,
-		args, args)
+	return kube.Cmd(args)
 }
 
 // collectCoreDNS records whether cluster DNS has ready replicas. Everything
@@ -179,6 +223,15 @@ func hostMetric(exec ssh.Executor) (HostMetric, bool) {
 			m.AvailMemMB = mb
 		}
 	}
+	// Image count feeds the image-GC signature: disk filling up with a large
+	// image cache has a different fix from disk filling up with data.
+	outImg, codeImg, errImg := exec.Run(
+		`(sudo -n k3s crictl images -q 2>/dev/null || sudo -n crictl images -q 2>/dev/null) | wc -l`)
+	if errImg == nil && codeImg == 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(outImg)); err == nil {
+			m.Images = n
+		}
+	}
 	return m, true
 }
 
@@ -187,6 +240,20 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// filterStalePVCEvidence drops events for PVCs that have been deleted.
+// Events outlive their object by about an hour, so a PVC removed minutes ago
+// keeps reporting "stuck Pending" long after the problem is gone.
+func filterStalePVCEvidence(e *Evidence) {
+	if e.livePVCs == nil {
+		return // PVC list unavailable; can't judge staleness
+	}
+	for key := range e.PVCEvents {
+		if !e.livePVCs[key] {
+			delete(e.PVCEvents, key)
+		}
+	}
 }
 
 // filterStalePodEvidence removes event evidence for pods that no longer exist

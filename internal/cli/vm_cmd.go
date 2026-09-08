@@ -86,7 +86,7 @@ func newVMSetupCmd() *cobra.Command {
 				return err
 			}
 			if kubeconfig != "" {
-				if err := vm.FetchKubeconfig(server, kubeconfig); err != nil {
+				if err := vm.FetchKubeconfig(server, kubeconfig, srvNode.Host); err != nil {
 					return fmt.Errorf("fetch kubeconfig: %w", err)
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "kubeconfig written to %s\n", kubeconfig)
@@ -107,5 +107,5 @@ func newVMSetupCmd() *cobra.Command {
 var agentExtraArgs string
 
 func toSSHNode(n config.Node) ssh.Node {
-	return ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key, Local: n.Local}
+	return n.SSH()
 }

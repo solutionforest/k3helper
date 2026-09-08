@@ -4,6 +4,7 @@ package vm
 import (
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 
@@ -90,9 +91,10 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 		}
 	}
 
-	// 5. wait for nodes to become ready
-	progressf("waiting for nodes to become ready...")
-	return waitReady(server, 120*time.Second)
+	// 5. wait for every node to register AND become ready
+	expected := 1 + len(agents)
+	progressf("waiting for %d node(s) to become ready...", expected)
+	return waitReady(server, expected, 180*time.Second)
 }
 
 func withSpace(s string) string {
@@ -143,20 +145,48 @@ func serverInternalIP(server Runner) (string, error) {
 	return ip, nil
 }
 
-// waitReady polls `kubectl get nodes` on the server until all are Ready or timeout.
-func waitReady(server Runner, timeout time.Duration) error {
+// waitReady polls until `expected` nodes have registered and all are Ready.
+//
+// Counting only the nodes that happen to have registered would let the server
+// alone satisfy the wait while agents are still joining, so "cluster ready"
+// could be reported for a cluster that is missing most of itself.
+func waitReady(server Runner, expected int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	var lines []string
 	for time.Now().Before(deadline) {
 		out, code, err := server.SudoRun(`k3s kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}={.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'`)
 		if err == nil && code == 0 {
-			lines := nonEmpty(strings.Split(out, "\n"))
-			if len(lines) > 0 && allReady(lines) {
+			lines = nonEmpty(strings.Split(out, "\n"))
+			if len(lines) >= expected && allReady(lines) {
 				return nil
 			}
 		}
 		time.Sleep(3 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for nodes Ready after %s", timeout)
+	return fmt.Errorf("timeout after %s: %s", timeout, readySummary(lines, expected))
+}
+
+// readySummary explains which half of the wait failed, because "registered
+// but NotReady" and "never registered" have different causes.
+func readySummary(lines []string, expected int) string {
+	if len(lines) < expected {
+		names := make([]string, 0, len(lines))
+		for _, l := range lines {
+			name, _, _ := strings.Cut(l, "=")
+			names = append(names, name)
+		}
+		return fmt.Sprintf("only %d of %d node(s) registered (%s); check the agent install output and that they can reach the server on port 6443",
+			len(lines), expected, strings.Join(names, ", "))
+	}
+	var notReady []string
+	for _, l := range lines {
+		if !strings.HasSuffix(l, "=True") {
+			name, _, _ := strings.Cut(l, "=")
+			notReady = append(notReady, name)
+		}
+	}
+	return fmt.Sprintf("all %d node(s) registered but not Ready: %s; check `journalctl -u k3s-agent` on those nodes",
+		expected, strings.Join(notReady, ", "))
 }
 
 func nonEmpty(ss []string) []string {
@@ -181,11 +211,44 @@ func allReady(lines []string) bool {
 	return true
 }
 
-// FetchKubeconfig copies /etc/rancher/k3s/k3s.yaml from the server to local path.
-func FetchKubeconfig(server *ssh.Client, localPath string) error {
+// FetchKubeconfig copies /etc/rancher/k3s/k3s.yaml from the server to
+// localPath, rewriting the server address so the file works from here.
+//
+// k3s writes 127.0.0.1 into its kubeconfig because it expects to be used on
+// the node. Copied verbatim to another machine it points kubectl at the
+// caller's own loopback, so it must be rewritten to an address that actually
+// reaches the server.
+func FetchKubeconfig(server *ssh.Client, localPath, serverHost string) error {
 	out, code, err := server.SudoRun(`cat /etc/rancher/k3s/k3s.yaml`)
 	if err != nil || code != 0 {
 		return fmt.Errorf("read k3s.yaml (exit %d): %s", code, out)
 	}
-	return writeFile(localPath, []byte(out))
+	rewritten, err := rewriteKubeconfigServer(out, serverHost)
+	if err != nil {
+		return err
+	}
+	return writeFile(localPath, []byte(rewritten))
+}
+
+// loopbackServerRe matches the `server:` URL k3s writes for the local node.
+var loopbackServerRe = regexp.MustCompile(`(?m)^(\s*server:\s*https://)(127\.0\.0\.1|localhost|\[::1\])(:\d+)`)
+
+// rewriteKubeconfigServer points the kubeconfig at host. A node that is
+// genuinely local needs no rewrite, and a kubeconfig already naming a
+// routable address is left alone.
+func rewriteKubeconfigServer(kubeconfig, host string) (string, error) {
+	if host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return kubeconfig, nil
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]" // bare IPv6
+	}
+	out := loopbackServerRe.ReplaceAllString(kubeconfig, "${1}"+host+"${3}")
+	if out == kubeconfig && !strings.Contains(kubeconfig, "server: https://"+host) {
+		// Nothing matched and the address is not already correct: report it
+		// rather than handing back a kubeconfig that will not connect.
+		return "", fmt.Errorf("could not find a server address to rewrite in the kubeconfig; "+
+			"check it manually and set the cluster server to https://%s:6443", host)
+	}
+	return out, nil
 }

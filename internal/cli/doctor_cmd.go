@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -12,7 +13,10 @@ import (
 )
 
 func newDoctorCmd() *cobra.Command {
-	var targetsPath string
+	var (
+		targetsPath string
+		jsonOut     bool
+	)
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Troubleshoot: gather evidence across host + k3s + cluster, rank root causes with fixes",
@@ -56,6 +60,32 @@ func newDoctorCmd() *cobra.Command {
 			diagnoses := troubleshoot.Diagnose(evidence)
 
 			out := cmd.OutOrStdout()
+
+			// Machine-readable output: the fault-injection suite matches on
+			// signature IDs, which are stable, rather than on display titles.
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				report := struct {
+					Healthy     bool                           `json:"healthy"`
+					Unreachable []troubleshoot.UnreachableNode `json:"unreachable,omitempty"`
+					Kubeconfig  string                         `json:"kubeconfig_error,omitempty"`
+					Diagnoses   []troubleshoot.Diagnosis       `json:"diagnoses"`
+				}{
+					Healthy:     len(diagnoses) == 0,
+					Unreachable: evidence.Unreachable,
+					Kubeconfig:  evidence.KubeconfigError,
+					Diagnoses:   diagnoses,
+				}
+				if err := enc.Encode(report); err != nil {
+					return err
+				}
+				if len(diagnoses) > 0 {
+					os.Exit(2)
+				}
+				return nil
+			}
+
 			for _, u := range evidence.Unreachable {
 				fmt.Fprintf(out, "✗ node %s unreachable: %s\n", u.Name, u.Reason)
 			}
@@ -79,6 +109,7 @@ func newDoctorCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVarP(&targetsPath, "targets", "t", "targets.yaml", "path to targets YAML")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit findings as JSON (signature IDs, for scripts)")
 	return cmd
 }
 

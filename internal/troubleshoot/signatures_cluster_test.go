@@ -299,3 +299,183 @@ func TestParseEndpointsSkipsKubernetesService(t *testing.T) {
 		t.Errorf("default/kubernetes should be ignored, got %v", e.EmptyEndpoints)
 	}
 }
+
+// --- host-layer signatures ---
+
+func TestContainerRuntimeDownSignature(t *testing.T) {
+	cases := []struct {
+		name  string
+		state map[string]string
+		fires bool
+	}{
+		{"healthy", map[string]string{"agent1": "containerd=active"}, false},
+		{"failed", map[string]string{"agent1": "containerd=failed"}, true},
+		{"inactive", map[string]string{"agent1": "containerd=inactive"}, true},
+		{"docker runtime", map[string]string{"agent1": "docker=failed"}, true},
+		// k3s embeds containerd, so no separate unit is normal, not a fault.
+		{"no evidence", map[string]string{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Diagnose(Evidence{ContainerRuntime: tc.state})
+			got := hasSig(d, "node.runtime-down")
+			if got != tc.fires {
+				t.Errorf("fired = %v, want %v (%+v)", got, tc.fires, d)
+			}
+		})
+	}
+}
+
+func TestClockSkewSignature(t *testing.T) {
+	cases := []struct {
+		skew  time.Duration
+		fires bool
+		conf  int
+	}{
+		{time.Second, false, 0},
+		{30 * time.Second, false, 0},
+		{90 * time.Second, true, 55},
+		{10 * time.Minute, true, 90},
+	}
+	for _, tc := range cases {
+		d := Diagnose(Evidence{ClockSkew: map[string]time.Duration{"n": tc.skew}})
+		if got := hasSig(d, "node.clock-skew"); got != tc.fires {
+			t.Errorf("skew %v: fired = %v, want %v", tc.skew, got, tc.fires)
+			continue
+		}
+		if tc.fires && d[0].Confidence != tc.conf {
+			t.Errorf("skew %v: confidence = %d, want %d", tc.skew, d[0].Confidence, tc.conf)
+		}
+	}
+}
+
+// A big image cache only matters once the disk is actually under pressure.
+func TestImageBloatSignatureNeedsBothDiskAndImages(t *testing.T) {
+	cases := []struct {
+		name  string
+		m     HostMetric
+		fires bool
+	}{
+		{"full disk, many images", HostMetric{DiskUsedPercent: 90, Images: 60}, true},
+		{"full disk, few images", HostMetric{DiskUsedPercent: 90, Images: 3}, false},
+		{"roomy disk, many images", HostMetric{DiskUsedPercent: 40, Images: 200}, false},
+		{"nothing", HostMetric{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := Diagnose(Evidence{HostMetrics: map[string]HostMetric{"n": tc.m}})
+			if got := hasSig(d, "node.image-bloat"); got != tc.fires {
+				t.Errorf("fired = %v, want %v (%+v)", got, tc.fires, d)
+			}
+		})
+	}
+}
+
+// A dead runtime explains every workload symptom on that node, so it must
+// outrank the pod-level findings it causes.
+func TestRuntimeDownOutranksPodSymptoms(t *testing.T) {
+	e := Evidence{
+		ContainerRuntime: map[string]string{"agent1": "containerd=failed"},
+		PodStatuses:      map[string]string{"prod/a": "CrashLoopBackOff"},
+	}
+	d := Diagnose(e)
+	if len(d) < 2 {
+		t.Fatalf("expected both signatures, got %+v", d)
+	}
+	if d[0].SignatureID != "node.runtime-down" {
+		t.Errorf("top = %s, want node.runtime-down", d[0].SignatureID)
+	}
+}
+
+// The healthy-cluster guarantee must survive every signature added here.
+func TestHealthyClusterWithHostEvidenceStaysSilent(t *testing.T) {
+	e := Evidence{
+		K3sService:       map[string]string{"server": "active"},
+		ContainerRuntime: map[string]string{"server": "containerd=active"},
+		ClockSkew:        map[string]time.Duration{"server": 2 * time.Second},
+		HostMetrics:      map[string]HostMetric{"server": {DiskUsedPercent: 46, AvailMemMB: 6000, Images: 12}},
+		CoreDNS:          &ReadyRatio{Ready: 1, Desired: 1},
+		CertExpiryDays:   364,
+		CertSubject:      "client.crt",
+	}
+	if d := Diagnose(e); len(d) != 0 {
+		t.Errorf("healthy cluster produced findings: %+v", d)
+	}
+}
+
+func hasSig(ds []Diagnosis, id string) bool {
+	for _, d := range ds {
+		if d.SignatureID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// TestUnschedulableReasons pins the scheduler phrases that must be recognised.
+// The cordon case was missed entirely at first: the remediation already told
+// people to uncordon, but no matcher looked for "were unschedulable", and the
+// "0/N nodes are available" literal never fired because the real message
+// carries a live count like "0/3".
+func TestUnschedulableReasons(t *testing.T) {
+	realMessages := []string{
+		"0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available",
+		"0/3 nodes are available: 3 node(s) were unschedulable.",
+		"0/3 nodes are available: 3 node(s) had untolerated taint {node.kubernetes.io/unreachable: }",
+		"0/2 nodes are available: 2 Insufficient memory.",
+		"0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector.",
+	}
+	for _, msg := range realMessages {
+		e := Evidence{PodEvents: map[string][]string{"default/p": {msg}}}
+		if !hasSig(Diagnose(e), "pod.pending-sched") {
+			t.Errorf("not recognised as unschedulable:\n  %s", msg)
+		}
+	}
+
+	// An unrelated warning must not fire it.
+	e := Evidence{PodEvents: map[string][]string{"default/p": {"Readiness probe failed: HTTP 503"}}}
+	if hasSig(Diagnose(e), "pod.pending-sched") {
+		t.Error("an unrelated event fired the scheduling signature")
+	}
+}
+
+// Events outlive their object by about an hour. A PVC deleted minutes ago
+// kept reporting "stuck Pending" long after the problem was gone — the same
+// staleness bug already fixed for pods, missed for PVCs.
+func TestStalePVCEventsAreDropped(t *testing.T) {
+	e := &Evidence{PVCEvents: map[string][]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"default"},
+	  "involvedObject":{"kind":"PersistentVolumeClaim","name":"gone"},
+	  "type":"Warning","reason":"ProvisioningFailed",
+	  "message":"storageclass.storage.k8s.io \"does-not-exist\" not found"}]}`, e)
+	if len(e.PVCEvents) != 1 {
+		t.Fatalf("event not recorded: %+v", e.PVCEvents)
+	}
+
+	// The PVC list no longer contains it: the object is gone.
+	parsePVCs(`{"items":[]}`, e)
+	filterStalePVCEvidence(e)
+	if len(e.PVCEvents) != 0 {
+		t.Errorf("events for a deleted PVC survived: %+v", e.PVCEvents)
+	}
+	if hasSig(Diagnose(*e), "storage.pvc-pending") {
+		t.Error("a deleted PVC still produced a finding")
+	}
+}
+
+// A PVC that genuinely still exists must keep its events.
+func TestLivePVCEventsAreKept(t *testing.T) {
+	e := &Evidence{PVCEvents: map[string][]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"default"},
+	  "involvedObject":{"kind":"PersistentVolumeClaim","name":"real"},
+	  "type":"Warning","reason":"ProvisioningFailed",
+	  "message":"waiting for a volume to be created"}]}`, e)
+	parsePVCs(`{"items":[{"metadata":{"namespace":"default","name":"real"},"status":{"phase":"Pending"}}]}`, e)
+	filterStalePVCEvidence(e)
+	if len(e.PVCEvents) != 1 {
+		t.Fatalf("a live PVC's events were dropped: %+v", e.PVCEvents)
+	}
+	if !hasSig(Diagnose(*e), "storage.pvc-pending") {
+		t.Error("a genuinely pending PVC should still be reported")
+	}
+}

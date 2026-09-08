@@ -360,3 +360,38 @@ func TestGenerateCorrectAPIVersions(t *testing.T) {
 		}
 	}
 }
+
+// TestGenerateAcceptsKubectlAliases: someone who types `kubectl get pvc`
+// every day will type `gen pvc`. The full name alone is not enough.
+func TestGenerateAcceptsKubectlAliases(t *testing.T) {
+	cases := map[string]string{
+		"pvc": "PersistentVolumeClaim", "PVC": "PersistentVolumeClaim",
+		"deploy": "Deployment", "deployment": "Deployment", "Deployment": "Deployment",
+		"svc": "Service", "ns": "Namespace", "cm": "ConfigMap",
+		"sts": "StatefulSet", "ds": "DaemonSet", "ing": "Ingress",
+		"cj": "CronJob", "po": "Pod",
+	}
+	for alias, want := range cases {
+		t.Run(alias, func(t *testing.T) {
+			out, err := Generate(GenParams{Kind: alias, Name: "alias-test"})
+			if err != nil {
+				t.Fatalf("gen %s: %v", alias, err)
+			}
+			if !strings.Contains(out, "kind: "+want+"\n") {
+				t.Errorf("gen %s produced:\n%s\nwant kind: %s", alias, out, want)
+			}
+			if res := Verify([]byte(out)); !res.OK {
+				t.Errorf("gen %s does not verify: %+v", alias, res.Issues)
+			}
+		})
+	}
+}
+
+func TestCanonicalKindLeavesUnknownAlone(t *testing.T) {
+	if got := canonicalKind("RocketShip"); got != "RocketShip" {
+		t.Errorf("canonicalKind = %q, want the input back so the error names it", got)
+	}
+	if _, err := Generate(GenParams{Kind: "RocketShip", Name: "x"}); err == nil {
+		t.Error("an unknown kind should still error")
+	}
+}

@@ -11,18 +11,27 @@ import (
 )
 
 func newCheckCmd() *cobra.Command {
-	var targetsPath string
+	var (
+		targetsPath string
+		strict      bool
+	)
 	cmd := &cobra.Command{
 		Use:   "check",
 		Short: "Run host/k3s health checks on all target nodes",
+		Long: `Run host and Kubernetes-service health checks on every target node.
+
+Exit code: 0 when nothing failed, 2 when a check failed or a node was
+unreachable. Warnings are printed but do not change the exit code unless
+--strict is given: a swap warning should not fail a pipeline the same way a
+dead k3s does.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
 			}
-			anyFail := false
+			anyFail, anyWarn := false, false
 			for _, node := range targets.Nodes {
-				client, err := ssh.Dial(ssh.Node{Host: node.Host, Port: node.Port, User: node.User, Key: node.Key, Local: node.Local})
+				client, err := ssh.Dial(node.SSH())
 				if err != nil {
 					fmt.Fprintf(cmd.OutOrStdout(), "✗ %s: unreachable: %v\n", node.Name, err)
 					anyFail = true
@@ -46,18 +55,27 @@ func newCheckCmd() *cobra.Command {
 						if r.Remediation != "" {
 							fmt.Fprintf(w, " \t↳ fix:\t%s\n", r.Remediation)
 						}
+					}
+					switch r.Status {
+					case check.Fail:
 						anyFail = true
+					case check.Warn:
+						anyWarn = true
 					}
 				}
 				w.Flush()
 			}
-			if anyFail {
+			if anyWarn && !anyFail {
+				fmt.Fprintln(cmd.OutOrStdout(), "\nwarnings only — exit 0 (use --strict to fail on warnings)")
+			}
+			if anyFail || (strict && anyWarn) {
 				os.Exit(2)
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&targetsPath, "targets", "t", "targets.yaml", "path to targets YAML")
+	cmd.Flags().BoolVar(&strict, "strict", false, "exit 2 on warnings as well as failures")
 	return cmd
 }
 
