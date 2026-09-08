@@ -16,18 +16,49 @@ type Executor interface {
 	Run(cmd string) (string, int, error)
 }
 
-// Base is the kubectl invocation used on a k3s server node.
-const Base = `sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml`
+// The kubectl invocations for each supported distribution. Both name an
+// explicit --kubeconfig: a bare `kubectl` would run against whatever context
+// the SSH user's own ~/.kube/config points at, so a node whose k3s is briefly
+// down could report another cluster's state under this cluster's name.
+const (
+	k3sBase     = `sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml`
+	kubeadmBase = `sudo -n kubectl --kubeconfig /etc/kubernetes/admin.conf`
+)
 
-// Cmd builds a kubectl command that works on either distribution: the k3s
-// bundled binary, a kubeadm admin.conf, or a kubectl already configured on
-// PATH. Each candidate is tried in turn so one command serves every node.
+// DetectBase picks the kubectl invocation this node can actually use.
+//
+// It probes once rather than chaining the candidates with || on every call.
+// A chain cannot tell "this distribution is not installed" from "kubectl ran
+// and rejected your manifest": the first arm's failure would fall through and
+// the caller would be shown the *second* arm's "no such file" instead of the
+// validation error it actually needed.
+func DetectBase(exec Executor) string {
+	if _, code, err := exec.Run(`test -x /usr/local/bin/k3s || command -v k3s >/dev/null 2>&1`); err == nil && code == 0 {
+		return k3sBase
+	}
+	// `test -e`, not `sudo -n test -r`: a host may grant passwordless sudo for
+	// kubectl specifically and not for a generic `test`, and existence only
+	// needs traverse permission on /etc/kubernetes, which is world-executable.
+	if _, code, err := exec.Run(`test -e /etc/kubernetes/admin.conf`); err == nil && code == 0 {
+		return kubeadmBase
+	}
+	return k3sBase // nothing detected: k3s is the supported default, and its
+	// error message will say so plainly
+}
+
+// Cmd builds a kubectl command for the k3s layout only.
+//
+// Prefer Builder, which detects the node's distribution. This exists for
+// callers that have no executor to probe with, and for tests.
 func Cmd(args string) string {
-	return fmt.Sprintf(
-		`sudo -n k3s kubectl %s --kubeconfig /etc/rancher/k3s/k3s.yaml 2>/dev/null `+
-			`|| sudo -n kubectl %s --kubeconfig /etc/kubernetes/admin.conf 2>/dev/null `+
-			`|| kubectl %s 2>/dev/null`,
-		args, args, args)
+	return k3sBase + " " + args
+}
+
+// Builder returns a function that renders kubectl commands for this node,
+// having detected the distribution once.
+func Builder(exec Executor) func(args string) string {
+	base := DetectBase(exec)
+	return func(args string) string { return base + " " + args }
 }
 
 // nsFlag renders the namespace selector: empty means all namespaces.
@@ -79,7 +110,7 @@ type Event struct {
 // ListPods returns pods in ns ("" = all namespaces), newest problems first is
 // left to the caller; ordering here is namespace/name for stability.
 func ListPods(exec Executor, ns string) ([]Pod, error) {
-	out, code, err := exec.Run(Cmd("get pods " + nsFlag(ns) + " -o json"))
+	out, code, err := exec.Run(Builder(exec)("get pods "+nsFlag(ns)+" -o json") + " 2>/dev/null")
 	if err != nil {
 		return nil, err
 	}
@@ -173,7 +204,7 @@ func (p Pod) Healthy() bool {
 
 // ListNodes returns the cluster's nodes.
 func ListNodes(exec Executor) ([]Node, error) {
-	out, code, err := exec.Run(Cmd("get nodes -o json"))
+	out, code, err := exec.Run(Builder(exec)("get nodes -o json") + " 2>/dev/null")
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +265,7 @@ func ListNodes(exec Executor) ([]Node, error) {
 
 // ListEvents returns recent events, most recent first, warnings included.
 func ListEvents(exec Executor, ns string) ([]Event, error) {
-	out, code, err := exec.Run(Cmd("get events " + nsFlag(ns) + " -o json"))
+	out, code, err := exec.Run(Builder(exec)("get events "+nsFlag(ns)+" -o json") + " 2>/dev/null")
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +326,7 @@ func Logs(exec Executor, ns, pod string, tail int, previous bool) (string, error
 	if previous {
 		args += " --previous"
 	}
-	out, code, err := exec.Run(Cmd(args))
+	out, code, err := exec.Run(Builder(exec)(args))
 	if err != nil {
 		return "", err
 	}
@@ -310,11 +341,11 @@ func Logs(exec Executor, ns, pod string, tail int, previous bool) (string, error
 
 // Describe returns `kubectl describe` output for one object.
 func Describe(exec Executor, kind, ns, name string) (string, error) {
-	args := fmt.Sprintf("describe %s %s", kind, shellQuote(name))
+	args := fmt.Sprintf("describe %s %s", shellQuote(kind), shellQuote(name))
 	if ns != "" {
 		args += " -n " + shellQuote(ns)
 	}
-	out, code, err := exec.Run(Cmd(args))
+	out, code, err := exec.Run(Builder(exec)(args))
 	if err != nil {
 		return "", err
 	}

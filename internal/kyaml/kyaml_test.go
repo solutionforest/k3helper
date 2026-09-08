@@ -395,3 +395,154 @@ func TestCanonicalKindLeavesUnknownAlone(t *testing.T) {
 		t.Error("an unknown kind should still error")
 	}
 }
+
+// Services that legitimately have no ports must verify. spec.ports is optional
+// in the API; requiring it blocked correct manifests in CI.
+func TestVerifyAllowsServicesWithoutPorts(t *testing.T) {
+	valid := map[string]string{
+		"ExternalName": `apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  type: ExternalName
+  externalName: db.example.com
+`,
+		"headless peer DNS": `apiVersion: v1
+kind: Service
+metadata:
+  name: peers
+spec:
+  clusterIP: None
+  selector:
+    app: db
+`,
+	}
+	for name, manifest := range valid {
+		t.Run(name, func(t *testing.T) {
+			if res := Verify([]byte(manifest)); !res.OK {
+				t.Errorf("valid Service rejected: %+v", res.Issues)
+			}
+		})
+	}
+
+	// A normal ClusterIP Service still needs ports.
+	res := Verify([]byte("apiVersion: v1\nkind: Service\nmetadata:\n  name: web\nspec:\n  selector:\n    app: web\n"))
+	if res.OK {
+		t.Error("a ClusterIP Service with no ports should still be rejected")
+	}
+	// And an ExternalName Service without the name it points at is wrong.
+	res = Verify([]byte("apiVersion: v1\nkind: Service\nmetadata:\n  name: db\nspec:\n  type: ExternalName\n"))
+	if res.OK {
+		t.Error("ExternalName without spec.externalName should be rejected")
+	}
+}
+
+// A --- inside a block scalar is content, not a document separator. Splitting
+// on it reported bogus errors on a manifest kubectl accepts.
+func TestVerifyDoesNotSplitInsideBlockScalars(t *testing.T) {
+	manifest := `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: certs
+data:
+  bundle.pem: |
+    -----BEGIN CERTIFICATE-----
+    MIIB
+    -----END CERTIFICATE-----
+  notes: |
+    ---
+    not a document separator
+`
+	res := Verify([]byte(manifest))
+	if !res.OK {
+		t.Fatalf("block scalar content was treated as a document separator: %+v", res.Issues)
+	}
+	if len(res.Documents) != 1 {
+		t.Errorf("documents = %d, want 1", len(res.Documents))
+	}
+}
+
+// Real separators, including ones carrying a trailing comment, still split.
+func TestVerifySplitsOnRealSeparators(t *testing.T) {
+	manifest := `apiVersion: v1
+kind: Namespace
+metadata:
+  name: a
+---  # second document
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: b
+`
+	res := Verify([]byte(manifest))
+	if !res.OK {
+		t.Fatalf("unexpected issues: %+v", res.Issues)
+	}
+	if len(res.Documents) != 2 {
+		t.Fatalf("documents = %d, want 2", len(res.Documents))
+	}
+	if res.Documents[1].Name != "b" {
+		t.Errorf("second document = %q, want b", res.Documents[1].Name)
+	}
+}
+
+// A manifest authored on Windows separates documents with "---\r". Failing to
+// recognise that merged every document into the first, so `verify` reported OK
+// having validated only document 1.
+func TestVerifyHandlesCRLFSeparators(t *testing.T) {
+	crlf := "apiVersion: v1\r\nkind: Namespace\r\nmetadata:\r\n  name: a\r\n" +
+		"---\r\n" +
+		"apiVersion: v1\r\nkind: Namespace\r\nmetadata:\r\n  name: b\r\n"
+	res := Verify([]byte(crlf))
+	if !res.OK {
+		t.Fatalf("unexpected issues: %+v", res.Issues)
+	}
+	if len(res.Documents) != 2 {
+		t.Fatalf("documents = %d, want 2 — CRLF separators were not recognised", len(res.Documents))
+	}
+	if res.Documents[1].Name != "b" {
+		t.Errorf("second document = %q, want b", res.Documents[1].Name)
+	}
+}
+
+// And a fault in a later CRLF document must actually be reported.
+func TestVerifyCatchesErrorsInLaterCRLFDocuments(t *testing.T) {
+	crlf := "apiVersion: v1\r\nkind: Namespace\r\nmetadata:\r\n  name: ok\r\n" +
+		"---\r\n" +
+		"apiVersion: apps/v1\r\nkind: DaemonSet\r\nmetadata:\r\n  name: bad\r\n" +
+		"spec:\r\n  replicas: 1\r\n  selector:\r\n    matchLabels:\r\n      app: x\r\n" +
+		"  template:\r\n    spec:\r\n      containers:\r\n        - name: c\r\n          image: nginx\r\n"
+	res := Verify([]byte(crlf))
+	if res.OK {
+		t.Fatal("a DaemonSet with spec.replicas in document 2 was not reported")
+	}
+	found := false
+	for _, iss := range res.Issues {
+		if iss.Field == "spec.replicas" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("issues = %+v, want the document-2 spec.replicas problem", res.Issues)
+	}
+}
+
+// A file with no trailing newline, and one that is only a separator.
+func TestVerifyEdgeCaseDocumentStreams(t *testing.T) {
+	if res := Verify([]byte("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: a")); !res.OK {
+		t.Errorf("no trailing newline should still verify: %+v", res.Issues)
+	}
+	// A leading separator is legal YAML and introduces the first document.
+	res := Verify([]byte("---\napiVersion: v1\nkind: Namespace\nmetadata:\n  name: a\n"))
+	if !res.OK || len(res.Documents) != 1 {
+		t.Errorf("leading separator: OK=%v docs=%d issues=%+v", res.OK, len(res.Documents), res.Issues)
+	}
+	if res.Documents[0].Name != "a" {
+		t.Errorf("name = %q, want a", res.Documents[0].Name)
+	}
+	// A stream that is only separators has no documents at all.
+	if res := Verify([]byte("---\n---\n")); res.OK {
+		t.Error("a stream of only separators should not verify")
+	}
+}

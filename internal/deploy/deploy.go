@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/solutionforest/k3helper/internal/kube"
 	"github.com/solutionforest/k3helper/internal/kyaml"
 	"github.com/solutionforest/k3helper/internal/ssh"
 )
@@ -40,9 +41,10 @@ type Options struct {
 	Diff        bool          // capture a diff against live state before applying
 }
 
-// kubectlBase returns the kubectl invocation prefix for the executor type.
-func kubectlBase() string {
-	return kyaml.KubectlBase
+// kubectlFor detects the node's kubectl invocation once per deploy, so a
+// failure from the real command is reported rather than a fallback arm's.
+func kubectlFor(exec Executor) func(string) string {
+	return kube.Builder(exec)
 }
 
 // namespaceArg renders the -n flag for the kubectl invocations. Empty when no
@@ -76,6 +78,51 @@ func validNamespace(ns string) error {
 	return nil
 }
 
+// manifestNamespaces maps each resource the manifest declares to the namespace
+// it declares, keyed by lowercase kind and name ("deployment/web").
+//
+// The rollout wait needs this per resource, not one namespace for the whole
+// file: a manifest may place a Deployment in team-a and another in team-b, and
+// waiting for both in a single namespace reports a failure for a deploy that
+// actually succeeded.
+func manifestNamespaces(data []byte) map[string]string {
+	out := map[string]string{}
+	for _, d := range kyaml.Verify(data).Documents {
+		if d.Namespace == "" || d.Kind == "" || d.Name == "" {
+			continue
+		}
+		out[strings.ToLower(d.Kind)+"/"+d.Name] = d.Namespace
+	}
+	return out
+}
+
+// namespaceFor picks the namespace to wait in for one applied resource.
+// An explicit --namespace always wins; otherwise the manifest's own namespace
+// for that resource is used, and failing that kubectl's default.
+//
+// applied names look like "deployment.apps/web" or "service/web-svc".
+func namespaceFor(applied, override string, declared map[string]string) string {
+	if override != "" {
+		return override
+	}
+	kind, name, ok := strings.Cut(applied, "/")
+	if !ok {
+		return ""
+	}
+	if group := strings.IndexByte(kind, '.'); group >= 0 {
+		kind = kind[:group] // "deployment.apps" -> "deployment"
+	}
+	ns := declared[strings.ToLower(kind)+"/"+name]
+	// This value came from the manifest, not from a validated flag. The API
+	// server would reject anything that is not an RFC-1123 label, so reaching
+	// a shell with one is not possible today — but validate rather than rely
+	// on that.
+	if validNamespace(ns) != nil {
+		return ""
+	}
+	return ns
+}
+
 // conflictingNamespaces returns documents whose explicit metadata.namespace
 // disagrees with the requested override. Silently redirecting those is how
 // resources end up in the wrong namespace, so Deploy refuses instead.
@@ -99,7 +146,7 @@ func conflictingNamespaces(data []byte, ns string) []string {
 // file on the target before kubectl runs, and removed afterwards.
 func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 	res := &Result{}
-	kb := kubectlBase()
+	kubectlCmd := kubectlFor(exec)
 
 	if err := validNamespace(opts.Namespace); err != nil {
 		return res, err
@@ -124,7 +171,7 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 	defer exec.RemoveFile(remote)
 
 	// 1. server-side dry-run validation
-	dry := fmt.Sprintf(`%s apply --dry-run=server%s -f '%s' 2>&1`, kb, ns, remote)
+	dry := kubectlCmd(fmt.Sprintf(`apply --dry-run=server%s -f '%s'`, ns, remote)) + " 2>&1"
 	out, code, err := exec.Run(dry)
 	if err != nil {
 		return res, fmt.Errorf("kubectl failed: %w", err)
@@ -136,7 +183,7 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 
 	// 2. optional diff against live state, before anything is changed
 	if opts.Diff {
-		diff, err := diffAgainstLive(exec, kb, ns, remote)
+		diff, err := diffAgainstLive(exec, kubectlCmd, ns, remote)
 		if err != nil {
 			return res, err
 		}
@@ -148,7 +195,7 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 	}
 
 	// 3. real apply
-	apply := fmt.Sprintf(`%s apply%s -f '%s' 2>&1`, kb, ns, remote)
+	apply := kubectlCmd(fmt.Sprintf(`apply%s -f '%s'`, ns, remote)) + " 2>&1"
 	out, code, err = exec.Run(apply)
 	if err != nil {
 		return res, fmt.Errorf("kubectl failed: %w", err)
@@ -163,8 +210,14 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 	if timeout <= 0 {
 		timeout = 120 * time.Second
 	}
+	// A manifest may name its own namespace while --namespace was not given,
+	// and different documents may name different ones. Resolve per resource:
+	// waiting in the wrong namespace reports a failure for a deploy that
+	// actually succeeded.
+	declared := manifestNamespaces(data)
 	for _, name := range res.Applied {
-		if err := waitRollout(exec, kb, ns, name, timeout); err != nil {
+		waitNS := namespaceArg(namespaceFor(name, opts.Namespace, declared))
+		if err := waitRollout(exec, kubectlCmd, waitNS, name, timeout); err != nil {
 			res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", name, err))
 		} else {
 			res.RolledOut = append(res.RolledOut, name)
@@ -178,8 +231,8 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 // kubectl diff uses exit codes as data: 0 means no differences, 1 means there
 // are differences, and anything above that is a real failure. Treating 1 as an
 // error would make every changed manifest look broken.
-func diffAgainstLive(exec Executor, kb, ns, remote string) (string, error) {
-	cmd := fmt.Sprintf(`%s diff%s -f '%s' 2>&1`, kb, ns, remote)
+func diffAgainstLive(exec Executor, kubectlCmd func(string) string, ns, remote string) (string, error) {
+	cmd := kubectlCmd(fmt.Sprintf(`diff%s -f '%s'`, ns, remote)) + " 2>&1"
 	out, code, err := exec.Run(cmd)
 	if err != nil {
 		return "", fmt.Errorf("kubectl diff: %w", err)
@@ -221,10 +274,14 @@ func parseApplied(out string) []string {
 }
 
 // waitRollout waits for a workload or generic resource to be ready.
-func waitRollout(exec Executor, kb, ns, name string, timeout time.Duration) error {
-	// deployment/statefulset/daemonset support rollout status; others just exist
-	if strings.HasPrefix(name, "deployment.") || strings.HasPrefix(name, "statefulset.") {
-		cmd := fmt.Sprintf(`%s rollout status%s '%s' --timeout=%s 2>&1`, kb, ns, name, formatDuration(timeout))
+func waitRollout(exec Executor, kubectlCmd func(string) string, ns, name string, timeout time.Duration) error {
+	// These three support `kubectl rollout status`; anything else only has to
+	// exist. DaemonSet was named in this comment but missing from the
+	// condition, so a DaemonSet whose pods never started was reported as
+	// rolled out purely because the object had been created.
+	if strings.HasPrefix(name, "deployment.") || strings.HasPrefix(name, "statefulset.") ||
+		strings.HasPrefix(name, "daemonset.") {
+		cmd := kubectlCmd(fmt.Sprintf(`rollout status%s '%s' --timeout=%s`, ns, name, formatDuration(timeout))) + " 2>&1"
 		out, code, err := exec.Run(cmd)
 		if err != nil {
 			return err
@@ -235,7 +292,7 @@ func waitRollout(exec Executor, kb, ns, name string, timeout time.Duration) erro
 		return nil
 	}
 	// generic: verify resource exists
-	cmd := fmt.Sprintf(`%s get%s '%s' -o name 2>&1`, kb, ns, name)
+	cmd := kubectlCmd(fmt.Sprintf(`get%s '%s' -o name`, ns, name)) + " 2>&1"
 	_, code, err := exec.Run(cmd)
 	if err != nil || code != 0 {
 		return fmt.Errorf("resource missing after apply")

@@ -23,6 +23,15 @@ type Gatherer struct {
 // Collect assembles an Evidence bundle. Never fails: collection problems
 // are recorded as evidence (e.g. broken kubeconfig is itself a diagnosis input).
 func (g Gatherer) Collect() Evidence {
+	// Detect the node's kubectl once: chaining candidates per call would hide
+	// the real error behind the fallback arm's.
+	base := kube.Builder(g.Server)
+	// JSON queries must not carry stderr: kubectl prints deprecation warnings
+	// there ("v1 Endpoints is deprecated in v1.33+"), and ssh merges stderr
+	// into stdout, so the warning would prefix the JSON and every parse would
+	// fail on a perfectly healthy cluster.
+	kubectl := func(args string) string { return base(args) + " 2>/dev/null" }
+
 	e := Evidence{
 		PodEvents:        map[string][]string{},
 		PodStatuses:      map[string]string{},
@@ -38,24 +47,56 @@ func (g Gatherer) Collect() Evidence {
 
 	// --- cluster layer via kubectl ---
 	nodesJSON, code, err := g.Server.Run(kubectl(`get nodes -o json`))
-	if err != nil || code != 0 || strings.TrimSpace(nodesJSON) == "" {
-		e.KubeconfigError = fmt.Sprintf("kubectl get nodes failed (exit %d): %s", code, firstLine(nodesJSON))
+	if err != nil || code != 0 || !looksLikeJSON(nodesJSON) {
+		// Re-run with stderr attached purely to report *why*; the first call
+		// keeps stderr off so a warning cannot masquerade as a failure.
+		detail, _, _ := g.Server.Run(base(`get nodes -o json`) + " 2>&1")
+		detail = firstLine(strings.TrimSpace(detail))
+		if detail == "" || looksLikeJSON(detail) {
+			detail = "no output"
+		}
+		e.KubeconfigError = fmt.Sprintf("kubectl get nodes failed (exit %d): %s", code, detail)
 	} else {
-		g.collectCluster(&e, nodesJSON)
+		g.collectCluster(&e, kubectl, nodesJSON)
 	}
+
+	// These do not depend on `get nodes` having worked. Certificate expiry and
+	// lost etcd quorum are among the reasons the API server stops answering,
+	// so gating them on a healthy API server would make them unreachable in
+	// exactly the situations they exist to diagnose.
+	g.collectCerts(&e)
+	g.collectEtcd(&e, kubectl)
+	g.collectCoreDNS(&e, kubectl)
 
 	// --- host layer via SSH ---
 	for name, exec := range g.Hosts {
 		// probe the correct unit for the node's role: agents run "k3s-agent",
 		// servers run "k3s". Pick the unit that actually exists on this node
 		// (piping is-active would mask the exit code, so branch on unit presence).
-		out, _, err := exec.Run(`if systemctl list-unit-files k3s-agent.service 2>/dev/null | grep -q k3s-agent; then sudo -n systemctl is-active k3s-agent; else sudo -n systemctl is-active k3s; fi`)
-		if err == nil && strings.TrimSpace(out) != "" {
-			// "active" (exit 0) or "inactive"/"failed"/"activating" (exit 3)
-			// are all valid evidence; empty output = unit truly absent
-			e.K3sService[name] = strings.TrimSpace(out)
-		} else {
-			e.K3sService[name] = "" // not installed
+		// `systemctl is-active` prints "inactive" for a unit that was never
+		// installed, so a not-installed node used to be diagnosed as "restart
+		// k3s". Ask which unit exists first, and report "" when none does.
+		//
+		// is-active needs no privileges; the old `sudo -n` meant that on a
+		// host without passwordless sudo the *error text* became the recorded
+		// state, which is neither "active" nor "" and so read as a fault.
+		out, _, err := exec.Run(
+			`if systemctl list-unit-files k3s-agent.service --no-legend 2>/dev/null | grep -q k3s-agent; then ` +
+				`systemctl is-active k3s-agent 2>/dev/null; ` +
+				`elif systemctl list-unit-files k3s.service --no-legend 2>/dev/null | grep -q k3s; then ` +
+				`systemctl is-active k3s 2>/dev/null; ` +
+				`else echo __absent__; fi`)
+		state := strings.TrimSpace(out)
+		switch {
+		case err != nil, state == "", state == "__absent__":
+			e.K3sService[name] = "" // not installed, or could not be determined
+		case isServiceState(state):
+			e.K3sService[name] = state
+		default:
+			// Unrecognised output (a sudo prompt, a permission error): record
+			// nothing rather than inventing a fault.
+			e.probeFailed("k3s-service:"+name, state)
+			e.K3sService[name] = ""
 		}
 		if m, ok := hostMetric(exec); ok {
 			e.HostMetrics[name] = m
@@ -70,6 +111,17 @@ func (g Gatherer) Collect() Evidence {
 	return e
 }
 
+// isServiceState reports whether out is something `systemctl is-active`
+// actually prints, as opposed to an error from the shell.
+func isServiceState(out string) bool {
+	switch out {
+	case "active", "inactive", "failed", "activating", "deactivating",
+		"reloading", "unknown", "maintenance":
+		return true
+	}
+	return false
+}
+
 // runtimeState reports the container runtime unit's state. k3s embeds
 // containerd inside its own unit, so an absent containerd.service is normal
 // there and reported as "" (no evidence) rather than a fault.
@@ -77,7 +129,7 @@ func runtimeState(exec ssh.Executor) (string, bool) {
 	out, _, err := exec.Run(
 		`for u in containerd cri-o docker; do ` +
 			`if systemctl list-unit-files $u.service --no-legend 2>/dev/null | grep -q $u; then ` +
-			`echo "$u=$(sudo -n systemctl is-active $u 2>/dev/null)"; break; fi; done`)
+			`echo "$u=$(systemctl is-active $u 2>/dev/null)"; break; fi; done`)
 	if err != nil {
 		return "", false
 	}
@@ -107,7 +159,7 @@ func clockSkew(exec ssh.Executor, now time.Time) (time.Duration, bool) {
 	return skew, true
 }
 
-func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
+func (g Gatherer) collectCluster(e *Evidence, kubectl func(string) string, nodesJSON string) {
 	nodes, err := parseNodes(nodesJSON)
 	if err != nil {
 		e.KubeconfigError = "unparseable node list: " + err.Error()
@@ -129,43 +181,54 @@ func (g Gatherer) collectCluster(e *Evidence, nodesJSON string) {
 
 	// pod statuses + events
 	if pods, code, err := g.Server.Run(kubectl(`get pods -A -o json`)); err == nil && code == 0 {
-		parsePods(pods, e)
+		if !parsePods(pods, e) {
+			e.probeFailed("pods", "output could not be parsed")
+		}
+	} else {
+		e.probeFailed("pods", fmt.Sprintf("kubectl get pods failed (exit %d)", code))
 	}
 	// events linger ~1h after pod deletion; events for dead pods are stale
 	// evidence that would fire signatures on a healthy cluster.
 	if evs, code, err := g.Server.Run(kubectl(`get events -A -o json`)); err == nil && code == 0 {
-		parseEvents(evs, e)
+		if !parseEvents(evs, e) {
+			e.probeFailed("events", "output could not be parsed")
+		}
+	} else {
+		e.probeFailed("events", fmt.Sprintf("kubectl get events failed (exit %d)", code))
 	}
 	filterStalePodEvidence(e)
 	if pvcs, code, err := g.Server.Run(kubectl(`get pvc -A -o json`)); err == nil && code == 0 {
-		parsePVCs(pvcs, e)
-		filterStalePVCEvidence(e)
+		if parsePVCs(pvcs, e) {
+			filterStalePVCEvidence(e)
+		} else {
+			e.probeFailed("pvcs", "output could not be parsed")
+		}
+	} else {
+		e.probeFailed("pvcs", fmt.Sprintf("kubectl get pvc failed (exit %d)", code))
 	}
 	// endpoints back every Service; a Service with none is a silent outage
 	// that no pod-level signature reports.
 	if eps, code, err := g.Server.Run(kubectl(`get endpoints -A -o json`)); err == nil && code == 0 {
-		parseEndpoints(eps, e)
+		if !parseEndpoints(eps, e, g.serviceSelectors(e, kubectl)) && len(e.ProbeErrors["services"]) == 0 {
+			e.probeFailed("endpoints", "output could not be parsed")
+		}
+	} else {
+		e.probeFailed("endpoints", fmt.Sprintf("kubectl get endpoints failed (exit %d)", code))
 	}
-	g.collectCoreDNS(e)
-	g.collectCerts(e)
-	g.collectEtcd(e)
-}
-
-// kubectl builds a server-side kubectl command that works on k3s or kubeadm.
-func kubectl(args string) string {
-	return kube.Cmd(args)
 }
 
 // collectCoreDNS records whether cluster DNS has ready replicas. Everything
 // in the cluster resolves through it, so it is worth its own signature
 // rather than being buried in a generic "pod not ready" finding.
-func (g Gatherer) collectCoreDNS(e *Evidence) {
+func (g Gatherer) collectCoreDNS(e *Evidence, kubectl func(string) string) {
 	out, code, err := g.Server.Run(kubectl(`get deployment coredns -n kube-system -o jsonpath={.status.readyReplicas}/{.spec.replicas}`))
 	if err != nil || code != 0 {
+		e.probeFailed("coredns", fmt.Sprintf("kubectl get deployment coredns failed (exit %d)", code))
 		return
 	}
 	ready, desired, ok := parseReadyRatio(out)
 	if !ok {
+		e.probeFailed("coredns", "unparseable ready/desired ratio")
 		return
 	}
 	e.CoreDNS = &ReadyRatio{Ready: ready, Desired: desired}
@@ -177,16 +240,28 @@ func (g Gatherer) collectCoreDNS(e *Evidence) {
 func (g Gatherer) collectCerts(e *Evidence) {
 	// `k3s certificate check` prints lines like:
 	//   Checking certificate CN=k3s-serving, expires 2027-01-05
+	// Only k3s ships this command. Probing for it on a kubeadm node would
+	// record a permanent "could not gather" on an otherwise healthy cluster.
+	if _, code, err := g.Server.Run(`command -v k3s >/dev/null 2>&1`); err != nil || code != 0 {
+		return
+	}
 	out, code, err := g.Server.Run(`sudo -n k3s certificate check 2>&1`)
 	if err != nil || code != 0 {
+		// k3s is present but the check did not run — usually no passwordless
+		// sudo. Record it so "no certificate finding" is not mistaken for
+		// "certificates fine".
+		e.probeFailed("certificates", "`k3s certificate check` did not run on this node")
 		return
 	}
 	e.CertExpiryDays, e.CertSubject = parseCertExpiry(out, time.Now())
+	if e.CertSubject == "" {
+		e.probeFailed("certificates", "no expiry dates found in `k3s certificate check` output")
+	}
 }
 
 // collectEtcd checks etcd quorum when the cluster runs embedded etcd. On a
 // single-server k3s (sqlite backend) there is no etcd and this is skipped.
-func (g Gatherer) collectEtcd(e *Evidence) {
+func (g Gatherer) collectEtcd(e *Evidence, kubectl func(string) string) {
 	out, code, err := g.Server.Run(kubectl(`get nodes -l node-role.kubernetes.io/etcd=true -o json`))
 	if err != nil || code != 0 {
 		return
@@ -217,6 +292,10 @@ func hostMetric(exec ssh.Executor) (HostMetric, bool) {
 		return m, false
 	}
 	m.DiskUsedPercent = pct
+	// -1 means "not measured". Leaving the zero value here made an unreadable
+	// `free` look like a node with no memory left, firing MemoryPressure on a
+	// healthy host.
+	m.AvailMemMB = -1
 	outMem, codeMem, errMem := exec.Run(`free -m | awk '/^Mem:/{print $7}'`)
 	if errMem == nil && codeMem == 0 {
 		if mb, err := strconv.Atoi(strings.TrimSpace(outMem)); err == nil {
@@ -233,6 +312,31 @@ func hostMetric(exec ssh.Executor) (HostMetric, bool) {
 		}
 	}
 	return m, true
+}
+
+// looksLikeJSON guards against a kubectl arm that printed an error to stdout:
+// parsing that as a node list would report an empty, healthy-looking cluster.
+func looksLikeJSON(s string) bool {
+	t := strings.TrimSpace(s)
+	return strings.HasPrefix(t, "{") || strings.HasPrefix(t, "[")
+}
+
+// serviceSelectors returns namespace/name of Services that actually select
+// pods. A headless or selector-less Service legitimately has no endpoints and
+// must not be reported as broken.
+func (g Gatherer) serviceSelectors(e *Evidence, kubectl func(string) string) map[string]bool {
+	out := map[string]bool{}
+	svcs, code, err := g.Server.Run(kubectl(`get services -A -o json`))
+	if err != nil || code != 0 {
+		// Unknown: parseEndpoints stays silent rather than guessing — but say
+		// so, or a Service with no backends goes unreported and unexplained.
+		e.probeFailed("services", fmt.Sprintf("kubectl get services failed (exit %d)", code))
+		return nil
+	}
+	for _, key := range parseSelectingServices(svcs) {
+		out[key] = true
+	}
+	return out
 }
 
 func firstLine(s string) string {
@@ -256,14 +360,20 @@ func filterStalePVCEvidence(e *Evidence) {
 	}
 }
 
-// filterStalePodEvidence removes event evidence for pods that no longer exist
+// filterStalePodEvidence removes event evidence that no longer describes the
+// cluster: events for pods that have been deleted, and events for pods that
+// have since become healthy.
+//
+// Events outlive the condition they describe by about an hour. Without this, a
+// pod that was briefly unschedulable during cluster startup keeps producing a
+// "pods unschedulable" finding long after it is running normally.
 // (events linger ~1h after deletion). LivePods is populated by parsePods.
 func filterStalePodEvidence(e *Evidence) {
 	if e.livePods == nil {
 		return // pod list unavailable; can't judge staleness
 	}
 	for key := range e.PodEvents {
-		if !e.livePods[key] {
+		if !e.livePods[key] || e.settledPods[key] {
 			delete(e.PodEvents, key)
 		}
 	}

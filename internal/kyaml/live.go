@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/solutionforest/k3helper/internal/kube"
 )
 
 func randomSuffix() (string, error) {
@@ -25,6 +27,10 @@ type Target interface {
 }
 
 // KubectlBase is the kubectl invocation used on a k3s server node.
+//
+// Deprecated: prefer kube.Builder, which detects the node's distribution.
+// (kube.Cmd is k3s-only too.) Kept because the integration tests build cleanup
+// commands with it against the k3s sandbox.
 const KubectlBase = `sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml`
 
 // VerifyLive is validation layer 3 against a real API server: it uploads the
@@ -45,7 +51,8 @@ func VerifyLive(t Target, data []byte, name string) (*Result, error) {
 	}
 	defer t.RemoveFile(remote)
 
-	out, code, err := t.Run(fmt.Sprintf(`%s apply --dry-run=server -f '%s' 2>&1`, KubectlBase, remote))
+	kubectl := kube.Builder(t)
+	out, code, err := t.Run(kubectl(fmt.Sprintf(`apply --dry-run=server -f '%s'`, remote)) + " 2>&1")
 	if err != nil {
 		return res, fmt.Errorf("kubectl: %w", err)
 	}

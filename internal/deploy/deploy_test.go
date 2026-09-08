@@ -386,3 +386,117 @@ func TestDeployWithoutDiffFlagSkipsDiff(t *testing.T) {
 		t.Errorf("Diff = %q, want empty when --diff was not requested", res.Diff)
 	}
 }
+
+// A manifest may declare its own namespace while --namespace is not given.
+// Waiting for the rollout without -n polled the default namespace and reported
+// a failure for a deploy that had actually succeeded.
+func TestDeployWaitsInTheManifestsOwnNamespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	manifest := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\n  namespace: prod\n" +
+		"spec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: web\n" +
+		"  template:\n    metadata:\n      labels:\n        app: web\n" +
+		"    spec:\n      containers:\n        - name: c\n          image: nginx:1.25\n"
+	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := func(args string) string {
+		return "sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml " + args + " 2>&1"
+	}
+	exec := newFakeExec(check.MapExec{
+		base("apply --dry-run=server -f '<remote>'"): {Out: "deployment.apps/web created (server dry run)\n", Code: 0},
+		base("apply -f '<remote>'"):                  {Out: "deployment.apps/web created\n", Code: 0},
+		// the wait must carry -n 'prod', taken from the manifest
+		base("rollout status -n 'prod' 'deployment.apps/web' --timeout=5s"): {
+			Out: "deployment \"web\" successfully rolled out\n", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, path, Options{WaitTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.RolledOut) != 1 {
+		t.Errorf("rolledOut = %v, errors = %v; the wait probably ran without -n", res.RolledOut, res.Errors)
+	}
+}
+
+// The comment said daemonset; the condition omitted it, so a DaemonSet whose
+// pods never started was reported as rolled out because the object existed.
+func TestDaemonSetUsesRolloutStatus(t *testing.T) {
+	base := func(args string) string {
+		return "sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml " + args + " 2>&1"
+	}
+	exec := newFakeExec(check.MapExec{
+		base("apply --dry-run=server -f '<remote>'"): {Out: "daemonset.apps/agent created (server dry run)\n", Code: 0},
+		base("apply -f '<remote>'"):                  {Out: "daemonset.apps/agent created\n", Code: 0},
+		base("rollout status 'daemonset.apps/agent' --timeout=5s"): {
+			Out: "error: daemon set \"agent\" rollout stuck\n", Code: 1,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{WaitTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Errors) != 1 {
+		t.Errorf("a stuck DaemonSet should be reported, got errors=%v rolledOut=%v", res.Errors, res.RolledOut)
+	}
+}
+
+// A manifest may place resources in different namespaces. Waiting for all of
+// them in one namespace reported a failure for a deploy that succeeded.
+func TestDeployWaitsPerResourceNamespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "multi.yaml")
+	doc := func(name, ns string) string {
+		return "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: " + name +
+			"\n  namespace: " + ns + "\nspec:\n  replicas: 1\n  selector:\n    matchLabels:\n      app: " + name +
+			"\n  template:\n    metadata:\n      labels:\n        app: " + name +
+			"\n    spec:\n      containers:\n        - name: c\n          image: nginx:1.25\n"
+	}
+	if err := os.WriteFile(path, []byte(doc("a", "team-a")+"---\n"+doc("b", "team-b")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := func(args string) string {
+		return "sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml " + args + " 2>&1"
+	}
+	exec := newFakeExec(check.MapExec{
+		base("apply --dry-run=server -f '<remote>'"): {
+			Out: "deployment.apps/a created (server dry run)\ndeployment.apps/b created (server dry run)\n", Code: 0,
+		},
+		base("apply -f '<remote>'"): {
+			Out: "deployment.apps/a created\ndeployment.apps/b created\n", Code: 0,
+		},
+		// each wait must carry its own document's namespace
+		base("rollout status -n 'team-a' 'deployment.apps/a' --timeout=5s"): {
+			Out: "deployment \"a\" successfully rolled out\n", Code: 0,
+		},
+		base("rollout status -n 'team-b' 'deployment.apps/b' --timeout=5s"): {
+			Out: "deployment \"b\" successfully rolled out\n", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, path, Options{WaitTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.RolledOut) != 2 {
+		t.Errorf("rolledOut = %v, errors = %v; each resource should be waited for in its own namespace",
+			res.RolledOut, res.Errors)
+	}
+}
+
+func TestNamespaceForResolution(t *testing.T) {
+	declared := map[string]string{"deployment/web": "prod", "service/web-svc": "prod"}
+	cases := []struct{ applied, override, want string }{
+		// --namespace always wins
+		{"deployment.apps/web", "staging", "staging"},
+		// group suffix is stripped when matching the manifest
+		{"deployment.apps/web", "", "prod"},
+		{"service/web-svc", "", "prod"},
+		// a resource the manifest did not place gets kubectl's default
+		{"configmap/other", "", ""},
+		{"malformed", "", ""},
+	}
+	for _, tc := range cases {
+		if got := namespaceFor(tc.applied, tc.override, declared); got != tc.want {
+			t.Errorf("namespaceFor(%q, %q) = %q, want %q", tc.applied, tc.override, got, tc.want)
+		}
+	}
+}

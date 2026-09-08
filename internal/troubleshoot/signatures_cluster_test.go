@@ -277,7 +277,8 @@ func TestParseEndpoints(t *testing.T) {
 	  {"metadata":{"namespace":"default","name":"kubernetes"},"subsets":[]}
 	]}`
 	e := &Evidence{}
-	parseEndpoints(data, e)
+	selecting := map[string]bool{"prod/web": true, "prod/api": true, "prod/cache": true}
+	parseEndpoints(data, e, selecting)
 
 	want := []string{"prod/api", "prod/cache"}
 	if len(e.EmptyEndpoints) != len(want) {
@@ -294,7 +295,8 @@ func TestParseEndpoints(t *testing.T) {
 // has pod-backed addresses; flagging it would fire on every healthy cluster.
 func TestParseEndpointsSkipsKubernetesService(t *testing.T) {
 	e := &Evidence{}
-	parseEndpoints(`{"items":[{"metadata":{"namespace":"default","name":"kubernetes"},"subsets":[]}]}`, e)
+	parseEndpoints(`{"items":[{"metadata":{"namespace":"default","name":"kubernetes"},"subsets":[]}]}`, e,
+		map[string]bool{"default/kubernetes": true})
 	if len(e.EmptyEndpoints) != 0 {
 		t.Errorf("default/kubernetes should be ignored, got %v", e.EmptyEndpoints)
 	}
@@ -477,5 +479,382 @@ func TestLivePVCEventsAreKept(t *testing.T) {
 	}
 	if !hasSig(Diagnose(*e), "storage.pvc-pending") {
 		t.Error("a genuinely pending PVC should still be reported")
+	}
+}
+
+// A Service with no selector, a headless Service, and an ExternalName Service
+// all legitimately have no endpoints. Flagging them reported a fault on every
+// healthy cluster that runs a StatefulSet.
+func TestParseEndpointsIgnoresServicesThatSelectNothing(t *testing.T) {
+	services := `{"items":[
+	  {"metadata":{"namespace":"prod","name":"web"},"spec":{"selector":{"app":"web"},"clusterIP":"10.0.0.1"}},
+	  {"metadata":{"namespace":"prod","name":"peers"},"spec":{"selector":{"app":"db"},"clusterIP":"None"}},
+	  {"metadata":{"namespace":"prod","name":"ext"},"spec":{"type":"ExternalName"}},
+	  {"metadata":{"namespace":"prod","name":"manual"},"spec":{"clusterIP":"10.0.0.9"}}
+	]}`
+	selecting := map[string]bool{}
+	for _, k := range parseSelectingServices(services) {
+		selecting[k] = true
+	}
+	if len(selecting) != 1 || !selecting["prod/web"] {
+		t.Fatalf("selecting = %v, want only prod/web", selecting)
+	}
+
+	endpoints := `{"items":[
+	  {"metadata":{"namespace":"prod","name":"web"},"subsets":[]},
+	  {"metadata":{"namespace":"prod","name":"peers"},"subsets":[]},
+	  {"metadata":{"namespace":"prod","name":"ext"},"subsets":[]},
+	  {"metadata":{"namespace":"prod","name":"manual"},"subsets":[]}
+	]}`
+	e := &Evidence{}
+	parseEndpoints(endpoints, e, selecting)
+	if len(e.EmptyEndpoints) != 1 || e.EmptyEndpoints[0] != "prod/web" {
+		t.Errorf("EmptyEndpoints = %v, want only the Service that selects pods", e.EmptyEndpoints)
+	}
+}
+
+// With the Service list unavailable we cannot tell which Services should have
+// endpoints, so nothing is reported rather than guessing.
+func TestParseEndpointsSilentWithoutServiceList(t *testing.T) {
+	e := &Evidence{}
+	parseEndpoints(`{"items":[{"metadata":{"namespace":"prod","name":"web"},"subsets":[]}]}`, e, nil)
+	if len(e.EmptyEndpoints) != 0 {
+		t.Errorf("EmptyEndpoints = %v, want none without a Service list", e.EmptyEndpoints)
+	}
+}
+
+// --- regressions found by adversarial review ---
+
+// A stopped k3s is the *cause* of an unreachable API server. It must outrank
+// "kubeconfig invalid", or the user is sent to check a kubeconfig that is fine.
+func TestStoppedServiceOutranksKubeconfigSymptom(t *testing.T) {
+	e := Evidence{
+		KubeconfigError: "kubectl get nodes failed (exit 1): connection refused",
+		K3sService:      map[string]string{"server": "inactive"},
+	}
+	d := Diagnose(e)
+	if len(d) < 2 {
+		t.Fatalf("expected both findings, got %+v", d)
+	}
+	if d[0].SignatureID != "node.notready-k3s-down" {
+		t.Errorf("top = %s (%d%%), want node.notready-k3s-down above the kubeconfig symptom; full: %+v",
+			d[0].SignatureID, d[0].Confidence, d)
+	}
+}
+
+// Expired certificates and lost etcd quorum are reasons the API server stops
+// answering, so they must also outrank the kubeconfig symptom.
+func TestRealCausesOutrankKubeconfigSymptom(t *testing.T) {
+	for name, e := range map[string]Evidence{
+		"expired certs": {
+			KubeconfigError: "kubectl get nodes failed (exit 1): ",
+			CertSubject:     "client.crt", CertExpiryDays: -2,
+		},
+		"etcd below quorum": {
+			KubeconfigError: "kubectl get nodes failed (exit 1): ",
+			Etcd:            &ReadyRatio{Ready: 1, Desired: 3},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := Diagnose(e)
+			if len(d) == 0 {
+				t.Fatal("no findings")
+			}
+			if d[0].SignatureID == "cluster.kubeconfig" {
+				t.Errorf("the symptom outranked the cause: %+v", d)
+			}
+		})
+	}
+}
+
+// k3s embeds containerd and never starts the unit, so a leftover stopped
+// containerd.service from an earlier kubeadm install is not a fault.
+func TestRuntimeDownIgnoresEmbeddedRuntimeOnHealthyK3sNode(t *testing.T) {
+	e := Evidence{
+		K3sService:       map[string]string{"srv": "active"},
+		ContainerRuntime: map[string]string{"srv": "containerd=inactive"},
+	}
+	if d := Diagnose(e); len(d) != 0 {
+		t.Errorf("healthy k3s node with a stray stopped containerd produced %+v", d)
+	}
+	// But a dead runtime on a node whose Kubernetes service is also unhappy
+	// is still worth reporting.
+	e.K3sService["srv"] = "failed"
+	if !hasSig(Diagnose(e), "node.runtime-down") {
+		t.Error("a dead runtime alongside a dead kubelet should still fire")
+	}
+}
+
+// Empty endpoints are a consequence of pod faults. Ranking them above the pod
+// sends the user to debug a selector that is perfectly correct.
+func TestEmptyEndpointsRanksBelowItsCause(t *testing.T) {
+	e := Evidence{
+		EmptyEndpoints: []string{"prod/web"},
+		PodStatuses:    map[string]string{"prod/web-1": "CrashLoopBackOff"},
+	}
+	d := Diagnose(e)
+	if len(d) < 2 {
+		t.Fatalf("expected both findings, got %+v", d)
+	}
+	if d[0].SignatureID != "pod.crashloop" {
+		t.Errorf("top = %s, want pod.crashloop above network.empty-endpoints; full: %+v", d[0].SignatureID, d)
+	}
+}
+
+// With no pod-level explanation, a Service with no endpoints really may have a
+// wrong selector, and should rank higher than in the correlated case.
+func TestEmptyEndpointsRanksHigherWhenUnexplained(t *testing.T) {
+	alone := Diagnose(Evidence{EmptyEndpoints: []string{"prod/web"}})
+	withCause := Diagnose(Evidence{
+		EmptyEndpoints: []string{"prod/web"},
+		PodStatuses:    map[string]string{"prod/web-1": "CrashLoopBackOff"},
+	})
+	var a, b int
+	for _, d := range alone {
+		if d.SignatureID == "network.empty-endpoints" {
+			a = d.Confidence
+		}
+	}
+	for _, d := range withCause {
+		if d.SignatureID == "network.empty-endpoints" {
+			b = d.Confidence
+		}
+	}
+	if a <= b {
+		t.Errorf("unexplained empty endpoints (%d) should outrank explained (%d)", a, b)
+	}
+}
+
+// A partial gather must never read as a clean bill of health.
+func TestPartialEvidenceIsReported(t *testing.T) {
+	var e Evidence
+	e.probeFailed("pods", "kubectl get pods failed (exit 1)")
+	d := Diagnose(e)
+	if !hasSig(d, "cluster.partial-evidence") {
+		t.Fatalf("a failed probe produced no finding: %+v", d)
+	}
+	// It must not drown out a real finding.
+	e.PodStatuses = map[string]string{"a": "CrashLoopBackOff"}
+	d = Diagnose(e)
+	if d[0].SignatureID != "pod.crashloop" {
+		t.Errorf("top = %s, want the real finding above the incompleteness notice", d[0].SignatureID)
+	}
+}
+
+// An unparseable pod list must not wipe the evidence gathered from events:
+// livePods stays nil so the staleness filter cannot delete everything.
+func TestUnparseablePodListDoesNotEraseEvidence(t *testing.T) {
+	e := &Evidence{
+		PodEvents:       map[string][]string{"prod/web": {"Failed to pull image \"x\": not found"}},
+		PodStatuses:     map[string]string{"prod/web": "ImagePullBackOff"},
+		ContainerStates: map[string]string{},
+	}
+	if parsePods("this is not json", e) {
+		t.Fatal("parsePods claimed success on garbage")
+	}
+	filterStalePodEvidence(e)
+	if len(e.PodStatuses) == 0 || len(e.PodEvents) == 0 {
+		t.Fatal("a failed pod list erased real findings — the cluster would read as healthy")
+	}
+	if !hasSig(Diagnose(*e), "pod.imagepull") {
+		t.Error("the finding was lost")
+	}
+}
+
+// `systemctl is-active` prints "inactive" for a unit that was never installed,
+// and sudo's error text is not a service state at all. Neither is a fault.
+func TestServiceStateRecognition(t *testing.T) {
+	for _, good := range []string{"active", "inactive", "failed", "activating"} {
+		if !isServiceState(good) {
+			t.Errorf("%q should be recognised as a service state", good)
+		}
+	}
+	for _, bad := range []string{"sudo: a password is required", "", "bash: systemctl: command not found"} {
+		if isServiceState(bad) {
+			t.Errorf("%q must not be treated as a service state", bad)
+		}
+	}
+}
+
+// Events outlive the condition they describe by about an hour. A pod that was
+// briefly unschedulable while the cluster was starting keeps that event long
+// after it is running normally — reporting it as a current fault made a
+// healthy cluster look broken.
+func TestEventsForRecoveredPodsAreDropped(t *testing.T) {
+	e := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"kube-system"},
+	  "involvedObject":{"kind":"Pod","name":"coredns-1"},"type":"Warning","reason":"FailedScheduling",
+	  "message":"0/1 nodes are available: 1 node(s) had untolerated taint(s)."}]}`, e)
+	if len(e.PodEvents) != 1 {
+		t.Fatalf("event not recorded: %+v", e.PodEvents)
+	}
+
+	// The pod exists and is now running with every container ready.
+	parsePods(`{"items":[{"metadata":{"namespace":"kube-system","name":"coredns-1"},
+	  "status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0,"state":{}}]}}]}`, e)
+	filterStalePodEvidence(e)
+
+	if len(e.PodEvents) != 0 {
+		t.Errorf("events for a recovered pod survived: %+v", e.PodEvents)
+	}
+	if d := Diagnose(*e); len(d) != 0 {
+		t.Errorf("a recovered pod produced findings: %+v", d)
+	}
+}
+
+// A pod that is still unhealthy keeps its events.
+func TestEventsForStillBrokenPodsAreKept(t *testing.T) {
+	e := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"prod"},
+	  "involvedObject":{"kind":"Pod","name":"web-1"},"type":"Warning","reason":"FailedScheduling",
+	  "message":"0/3 nodes are available: 3 Insufficient cpu."}]}`, e)
+	// Present, but not ready.
+	parsePods(`{"items":[{"metadata":{"namespace":"prod","name":"web-1"},
+	  "status":{"phase":"Pending","containerStatuses":[{"ready":false,"restartCount":0,"state":{}}]}}]}`, e)
+	filterStalePodEvidence(e)
+
+	if len(e.PodEvents) != 1 {
+		t.Fatalf("a still-unscheduled pod lost its events: %+v", e.PodEvents)
+	}
+	if !hasSig(Diagnose(*e), "pod.pending-sched") {
+		t.Error("the finding was lost")
+	}
+}
+
+// A pod flapping on a failing liveness probe is momentarily Ready between
+// restarts. Treating it as settled would discard the very events that show the
+// instability, before it reaches CrashLoopBackOff.
+func TestFlappingPodKeepsItsEvents(t *testing.T) {
+	e := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"prod"},
+	  "involvedObject":{"kind":"Pod","name":"web-1"},"type":"Warning","reason":"Unhealthy",
+	  "message":"Liveness probe failed: HTTP probe failed with statuscode: 500"}]}`, e)
+
+	// Ready right now, but it has restarted 7 times.
+	parsePods(`{"items":[{"metadata":{"namespace":"prod","name":"web-1"},
+	  "status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":7,"state":{}}]}}]}`, e)
+	filterStalePodEvidence(e)
+
+	if len(e.PodEvents) != 1 {
+		t.Errorf("a restarting pod lost its events: %+v", e.PodEvents)
+	}
+
+	// A pod that is ready and has never restarted really has settled.
+	e2 := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parseEvents(`{"items":[{"metadata":{"namespace":"prod"},
+	  "involvedObject":{"kind":"Pod","name":"calm-1"},"type":"Warning","reason":"FailedScheduling",
+	  "message":"0/3 nodes are available: 3 Insufficient cpu."}]}`, e2)
+	parsePods(`{"items":[{"metadata":{"namespace":"prod","name":"calm-1"},
+	  "status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0,"state":{}}]}}]}`, e2)
+	filterStalePodEvidence(e2)
+	if len(e2.PodEvents) != 0 {
+		t.Errorf("a genuinely recovered pod kept stale events: %+v", e2.PodEvents)
+	}
+}
+
+// A NotReady node whose service is running was gathered but never diagnosed —
+// doctor reported "no issues detected" on the most common serious fault there
+// is.
+func TestNotReadyNodeWithHealthyServiceIsDiagnosed(t *testing.T) {
+	e := Evidence{
+		NodeNotReady: []string{"agent1"},
+		K3sService:   map[string]string{"server": "active", "agent1": "active"},
+	}
+	d := Diagnose(e)
+	if !hasSig(d, "node.notready") {
+		t.Fatalf("a NotReady node with a running service produced no finding: %+v", d)
+	}
+	if !strings.Contains(d[0].Remediation, "describe node") {
+		t.Errorf("remediation should point at the node's conditions: %s", d[0].Remediation)
+	}
+}
+
+// When the service is what is down, that signature owns the fault — reporting
+// both would send the user to two places for one problem.
+func TestNotReadyDefersToAStoppedService(t *testing.T) {
+	e := Evidence{
+		NodeNotReady: []string{"agent1"},
+		K3sService:   map[string]string{"agent1": "inactive"},
+	}
+	d := Diagnose(e)
+	if hasSig(d, "node.notready") {
+		t.Errorf("both signatures fired for one fault: %+v", d)
+	}
+	if !hasSig(d, "node.notready-k3s-down") {
+		t.Errorf("the stopped service was not reported: %+v", d)
+	}
+}
+
+// A pod that runs but never passes readiness serves no traffic and has no
+// waiting or terminated reason, so nothing reported it.
+func TestNeverReadyPodIsDiagnosed(t *testing.T) {
+	e := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parsePods(`{"items":[{"metadata":{"namespace":"prod","name":"web-1"},
+	  "status":{"phase":"Running","containerStatuses":[{"ready":false,"restartCount":0,"state":{}}]}}]}`, e)
+	if len(e.NotReadyPods) != 1 {
+		t.Fatalf("NotReadyPods = %v, want the running-but-unready pod", e.NotReadyPods)
+	}
+	if !hasSig(Diagnose(*e), "pod.not-ready") {
+		t.Errorf("no finding for a pod that never becomes ready: %+v", Diagnose(*e))
+	}
+	// A fully ready pod must not be flagged.
+	e2 := &Evidence{PodEvents: map[string][]string{}, PodStatuses: map[string]string{}, ContainerStates: map[string]string{}}
+	parsePods(`{"items":[{"metadata":{"namespace":"prod","name":"ok-1"},
+	  "status":{"phase":"Running","containerStatuses":[{"ready":true,"restartCount":0,"state":{}}]}}]}`, e2)
+	if len(e2.NotReadyPods) != 0 {
+		t.Errorf("a ready pod was flagged: %v", e2.NotReadyPods)
+	}
+}
+
+// An unreadable `free` left AvailMemMB at zero, which read as a node with no
+// memory left and fired MemoryPressure on a healthy host.
+func TestUnmeasuredMemoryDoesNotFireMemoryPressure(t *testing.T) {
+	e := Evidence{HostMetrics: map[string]HostMetric{
+		"n1": {DiskUsedPercent: 40, AvailMemMB: -1}, // `free` unavailable
+	}}
+	if hasSig(Diagnose(e), "node.memorypressure") {
+		t.Error("an unmeasured memory reading fired MemoryPressure")
+	}
+	// A real low reading still fires.
+	e.HostMetrics["n1"] = HostMetric{DiskUsedPercent: 40, AvailMemMB: 50}
+	if !hasSig(Diagnose(e), "node.memorypressure") {
+		t.Error("a genuinely low memory reading was not reported")
+	}
+}
+
+// CoreDNS being down is nearly always a consequence; rank it under a visible
+// host-level cause so the user fixes the cause.
+func TestCoreDNSRanksUnderItsHostCause(t *testing.T) {
+	e := Evidence{
+		CoreDNS:    &ReadyRatio{Ready: 0, Desired: 2},
+		K3sService: map[string]string{"agent1": "failed"},
+	}
+	d := Diagnose(e)
+	if len(d) < 2 {
+		t.Fatalf("expected both findings: %+v", d)
+	}
+	if d[0].SignatureID == "network.coredns" {
+		t.Errorf("CoreDNS outranked the host fault that caused it: %+v", d)
+	}
+	// With no host cause visible, CoreDNS is the top finding.
+	alone := Diagnose(Evidence{CoreDNS: &ReadyRatio{Ready: 0, Desired: 2}})
+	if len(alone) == 0 || alone[0].SignatureID != "network.coredns" {
+		t.Errorf("unexplained CoreDNS outage should lead: %+v", alone)
+	}
+}
+
+// Empty endpoints caused by pods that never become ready must rank under that
+// cause, not send the user to debug a correct selector.
+func TestEmptyEndpointsRanksUnderNotReadyPods(t *testing.T) {
+	e := Evidence{
+		EmptyEndpoints: []string{"prod/web"},
+		NotReadyPods:   []string{"prod/web-1"},
+	}
+	d := Diagnose(e)
+	if len(d) < 2 {
+		t.Fatalf("expected both findings: %+v", d)
+	}
+	if d[0].SignatureID != "pod.not-ready" {
+		t.Errorf("top = %s, want pod.not-ready above the Service symptom: %+v", d[0].SignatureID, d)
 	}
 }

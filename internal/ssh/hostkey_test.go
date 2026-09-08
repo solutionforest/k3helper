@@ -3,6 +3,7 @@ package ssh
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"net"
 	"os"
 	"path/filepath"
@@ -195,4 +196,79 @@ func asHostKeyError(err error, target **HostKeyError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// A host recorded only under a different key algorithm (an old ssh-rsa entry
+// while the server now offers ed25519) is not a changed key. Reporting it as
+// interception told the user to delete a perfectly good record.
+func TestDifferentAlgorithmIsNotAChangedKey(t *testing.T) {
+	path := useTempKnownHosts(t)
+
+	rsaKey := testRSAKey(t)
+	line := knownhosts.Line([]string{knownhosts.Normalize("host.example:22")}, rsaKey)
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cb, err := hostKeyCallback(HostKeyVerify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cb("host.example:22", &net.TCPAddr{}, testKey(t)) // ed25519
+	if err == nil {
+		t.Fatal("an unrecorded algorithm should still not connect silently")
+	}
+	var hkErr *HostKeyError
+	if !asHostKeyError(err, &hkErr) {
+		t.Fatalf("err = %T, want *HostKeyError", err)
+	}
+	if hkErr.Changed {
+		t.Error("a different algorithm was reported as a CHANGED key — a false tampering alarm")
+	}
+
+	if !hkErr.KnownOtherAlgorithm {
+		t.Error("should be reported as known-under-another-algorithm")
+	}
+	if !strings.Contains(hkErr.Error(), "not under the key type it offered") {
+		t.Errorf("message should explain the situation:\n%s", hkErr.Error())
+	}
+
+	// Trust-on-first-use must NOT extend to a host that is already recorded:
+	// an interceptor could simply offer a key type the record happens to lack.
+	cb, err = hostKeyCallback(HostKeyAcceptNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cb("host.example:22", &net.TCPAddr{}, testKey(t)); err == nil {
+		t.Error("accept-new silently trusted a new key type for an already-known host")
+	}
+	after, _ := os.ReadFile(path)
+	if strings.Count(string(after), "\n") != 1 {
+		t.Errorf("known_hosts was appended to: %q", string(after))
+	}
+}
+
+// Trust-on-first-use still applies to a host that is genuinely unknown.
+func TestAcceptNewStillTrustsCompletelyUnknownHosts(t *testing.T) {
+	useTempKnownHosts(t)
+	cb, err := hostKeyCallback(HostKeyAcceptNew)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cb("brand-new:22", &net.TCPAddr{}, testKey(t)); err != nil {
+		t.Errorf("an unknown host should still be trusted on first use: %v", err)
+	}
+}
+
+func testRSAKey(t *testing.T) gossh.PublicKey {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := gossh.NewPublicKey(&k.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pub
 }

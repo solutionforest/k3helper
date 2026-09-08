@@ -1,6 +1,7 @@
 package check
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -137,5 +138,23 @@ func TestK3sServiceCheckDistinguishesStoppedFromMissing(t *testing.T) {
 	}
 	if !strings.Contains(missing.Remediation, "get.k3s.io") {
 		t.Errorf("an uninstalled k3s should offer to install: %s", missing.Remediation)
+	}
+}
+
+// check and the TUI must use the distro-aware ServiceCheck. Wiring the
+// k3s-only predecessor told the operator of a healthy kubeadm node to install
+// a second Kubernetes distribution.
+func TestCheckWiringUsesServiceCheck(t *testing.T) {
+	for _, path := range []string{"../cli/check_cmd.go", "../tui/tui.go"} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if strings.Contains(string(src), "K3sServiceCheck{") {
+			t.Errorf("%s still wires the k3s-only K3sServiceCheck; use ServiceCheck", path)
+		}
+		if !strings.Contains(string(src), "ServiceCheck{") {
+			t.Errorf("%s does not run a service check at all", path)
+		}
 	}
 }

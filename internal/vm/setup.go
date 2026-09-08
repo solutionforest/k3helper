@@ -54,9 +54,12 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 
 	// 1. install k3s on server
 	progressf("[server] installing k3s server (%s channel)...", opts.channel())
+	// The token is single-quoted: this string is piped straight into a root
+	// shell, so an unquoted token containing a space, ; or $( ) would break
+	// the command or run as one.
 	tokenArg := ""
 	if opts.Token != "" {
-		tokenArg = fmt.Sprintf(" K3S_TOKEN=%s", opts.Token)
+		tokenArg = " K3S_TOKEN=" + shellQuote(opts.Token)
 	}
 	cmd := fmt.Sprintf(
 		`curl -sfL %s | %sINSTALL_K3S_CHANNEL=%s%s sh -s - server%s`,
@@ -84,7 +87,7 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 		progressf("[%s] installing k3s agent...", a.Node.Host)
 		joinCmd := fmt.Sprintf(
 			`curl -sfL %s | %sK3S_URL=https://%s:6443 K3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - agent%s`,
-			opts.installURL(), a.Client.SudoPrefix(), ip, token, opts.channel(), withSpace(opts.AgentExtraArgs),
+			opts.installURL(), a.Client.SudoPrefix(), ip, shellQuote(token), opts.channel(), withSpace(opts.AgentExtraArgs),
 		)
 		if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 			return fmt.Errorf("agent %s install failed (exit %d): %w", a.Node.Host, code, err)
@@ -95,6 +98,11 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 	expected := 1 + len(agents)
 	progressf("waiting for %d node(s) to become ready...", expected)
 	return waitReady(server, expected, 180*time.Second)
+}
+
+// shellQuote wraps a value in single quotes, escaping any it contains.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func withSpace(s string) string {

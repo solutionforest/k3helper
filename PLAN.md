@@ -147,7 +147,7 @@ titles, so rewording a finding cannot silently break the suite.
 
 Each is `make fault-<name>`, with `make fault-list` and `make fault-clean`.
 
-Verified 2026-09-08: **10 passed, 0 failed.**
+Verified 2026-09-09: **10 passed, 0 failed.**
 
 > This layer earns its keep. It found that `pod.pending-sched` never matched a
 > cordoned node — the remediation said "kubectl uncordon" while no matcher
@@ -155,6 +155,40 @@ Verified 2026-09-08: **10 passed, 0 failed.**
 > could never fire because the real message carries a live count. It also found
 > that deleted PVCs kept reporting "stuck Pending" for an hour, because the
 > stale-event filter written for pods was never extended to PVCs.
+
+### Layer 3b — Independent review
+Two model-driven reviews (one adversarial, hunting specifically for false
+negatives and misdiagnosis) audited the diagnostic paths and found defects the
+fault matrix could not, because they require states the sandbox does not
+reproduce: a kubeadm node, an API server that is down, a partially-authorised
+kubeconfig, an interrupted gather. Findings and fixes are recorded in the
+commit history. The classes worth remembering:
+
+- **Symptom outranking cause.** "kubeconfig invalid" scored 85 while the
+  stopped k3s that caused it scored 45, so every API-server outage sent the
+  user to check a kubeconfig that was fine.
+- **Evidence gated on the thing it diagnoses.** Certificate-expiry and etcd
+  checks only ran when `kubectl get nodes` succeeded — i.e. never when they
+  mattered.
+- **Silence read as health.** Probe failures were swallowed, so a partial
+  gather printed "no issues detected".
+- **Fallbacks that hide the answer.** Chaining kubectl candidates with `||`
+  meant a validation error from the real command was replaced by the next
+  candidate's "no such file".
+- **Stale evidence.** Events outlive their subject by about an hour, so a pod
+  that was briefly unschedulable at startup kept producing a finding after it
+  recovered.
+- **Gathered but never diagnosed.** NotReady nodes were collected and only
+  ever used as a correlation bonus, so a NotReady node whose service was still
+  running — the commonest serious fault in a cluster — reported nothing at all.
+- **Zero values read as measurements.** An unreadable `free` left "0 MB
+  available" in the evidence, firing MemoryPressure on a healthy host.
+
+Three rounds were needed: the first fixes introduced their own defects (a
+`||` fallback chain that replaced kubectl's real error with the next
+candidate's, a CRLF regression in the document splitter), which the second
+round found. Reviewing the fixes mattered as much as reviewing the original
+code.
 
 ### Layer 4 — E2E (`test/e2e.sh`, via `make e2e`)
 The whole product against three fresh VMs:
@@ -178,7 +212,7 @@ The whole product against three fresh VMs:
 Modes: `make e2e` (fresh sandbox, ~12 min), `make e2e-fast` (`--keep`),
 `make e2e-quick` (`--keep --quick`, skips the sweep).
 
-Verified 2026-09-08: **66 passed, 0 failed.**
+Verified 2026-09-09: **67 passed, 0 failed.**
 
 ### Layer 5 — CI
 GitHub Actions on every push: gofmt, `go vet`, `go vet -tags=integration`

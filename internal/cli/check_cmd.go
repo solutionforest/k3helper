@@ -42,7 +42,7 @@ dead k3s does.`,
 					check.MemoryCheck{},
 					check.SwapCheck{},
 					check.CgroupCheck{},
-					check.K3sServiceCheck{Role: node.Role},
+					check.ServiceCheck{Role: node.Role},
 				)
 				results := runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 				client.Close()

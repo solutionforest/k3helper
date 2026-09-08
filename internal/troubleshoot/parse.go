@@ -43,10 +43,13 @@ func parseNodes(data string) ([]nodeInfo, error) {
 	return out, nil
 }
 
-func parsePods(data string, e *Evidence) {
-	if e.livePods == nil {
-		e.livePods = map[string]bool{}
-	}
+// parsePods records pod evidence and reports whether the list parsed.
+//
+// livePods is populated only on success. Setting it before unmarshalling meant
+// a truncated or non-JSON response left it non-nil but empty, and the stale
+// filter then deleted every genuine pod finding — turning a broken cluster
+// into "no issues detected".
+func parsePods(data string, e *Evidence) bool {
 	var raw struct {
 		Items []struct {
 			Metadata struct {
@@ -57,7 +60,9 @@ func parsePods(data string, e *Evidence) {
 				Phase             string `json:"phase"`
 				Reason            string `json:"reason"`
 				ContainerStatuses []struct {
-					State struct {
+					Ready        bool `json:"ready"`
+					RestartCount int  `json:"restartCount"`
+					State        struct {
 						Waiting *struct {
 							Reason string `json:"reason"`
 						} `json:"waiting"`
@@ -77,11 +82,42 @@ func parsePods(data string, e *Evidence) {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return
+		return false
+	}
+	if e.livePods == nil {
+		e.livePods = map[string]bool{}
+	}
+	if e.settledPods == nil {
+		e.settledPods = map[string]bool{}
 	}
 	for _, it := range raw.Items {
 		key := it.Metadata.Namespace + "/" + it.Metadata.Name
 		e.livePods[key] = true
+		// A pod that is running with every container ready and has never
+		// restarted has recovered from whatever its old events describe.
+		//
+		// Restarts matter: a pod flapping on a failing liveness probe is
+		// momentarily Ready between restarts, and discarding its events then
+		// would hide an instability that has not yet reached CrashLoopBackOff.
+		ready, restarts, total := 0, 0, len(it.Status.ContainerStatuses)
+		for _, cs := range it.Status.ContainerStatuses {
+			if cs.Ready {
+				ready++
+			}
+			restarts += cs.RestartCount
+		}
+		switch it.Status.Phase {
+		case "Running":
+			e.settledPods[key] = total > 0 && ready == total && restarts == 0
+			// Running but never passing its readiness probe is an outage that
+			// no waiting/terminated reason describes, so it needs recording
+			// separately or it goes entirely unreported.
+			if total > 0 && ready < total {
+				e.NotReadyPods = append(e.NotReadyPods, key)
+			}
+		case "Succeeded":
+			e.settledPods[key] = true
+		}
 		reason := it.Status.Reason
 		if reason == "" {
 			for _, cs := range it.Status.ContainerStatuses {
@@ -104,6 +140,7 @@ func parsePods(data string, e *Evidence) {
 			e.PodStatuses[key] = reason
 		}
 	}
+	return true
 }
 
 // parseReadyRatio reads kubectl jsonpath output of the form "2/2". An empty
@@ -183,9 +220,47 @@ func parseCertExpiry(out string, now time.Time) (int, string) {
 	return soonest, subject
 }
 
+// parseSelectingServices returns namespace/name of Services that select pods.
+// A Service with no selector (ExternalName, or one with hand-managed
+// Endpoints) and a headless Service used only for peer DNS legitimately have
+// no ready addresses.
+func parseSelectingServices(data string) []string {
+	var raw struct {
+		Items []struct {
+			Metadata struct {
+				Namespace string `json:"namespace"`
+				Name      string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Selector  map[string]string `json:"selector"`
+				ClusterIP string            `json:"clusterIP"`
+				Type      string            `json:"type"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return nil
+	}
+	var out []string
+	for _, it := range raw.Items {
+		if len(it.Spec.Selector) == 0 || it.Spec.Type == "ExternalName" || it.Spec.ClusterIP == "None" {
+			continue
+		}
+		out = append(out, it.Metadata.Namespace+"/"+it.Metadata.Name)
+	}
+	return out
+}
+
 // parseEndpoints records Services whose endpoint object has no ready
 // addresses — the Service exists and resolves, but nothing serves it.
-func parseEndpoints(data string, e *Evidence) {
+//
+// selecting limits this to Services that actually select pods. When it is nil
+// the Service list was unavailable, and nothing is reported rather than
+// flagging every headless Service in the cluster.
+func parseEndpoints(data string, e *Evidence, selecting map[string]bool) bool {
+	if selecting == nil {
+		return false
+	}
 	var raw struct {
 		Items []struct {
 			Metadata struct {
@@ -200,23 +275,28 @@ func parseEndpoints(data string, e *Evidence) {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return
+		return false
 	}
 	for _, it := range raw.Items {
+		key := it.Metadata.Namespace + "/" + it.Metadata.Name
 		// These are control-plane endpoints managed outside the Service
 		// mechanism; they legitimately have no pod-backed addresses.
 		if it.Metadata.Namespace == "default" && it.Metadata.Name == "kubernetes" {
 			continue
+		}
+		if !selecting[key] {
+			continue // no selector, headless, or ExternalName
 		}
 		ready := 0
 		for _, s := range it.Subsets {
 			ready += len(s.Addresses)
 		}
 		if ready == 0 {
-			e.EmptyEndpoints = append(e.EmptyEndpoints, it.Metadata.Namespace+"/"+it.Metadata.Name)
+			e.EmptyEndpoints = append(e.EmptyEndpoints, key)
 		}
 	}
 	sort.Strings(e.EmptyEndpoints)
+	return true
 }
 
 func isProblemReason(r string) bool {
@@ -227,7 +307,7 @@ func isProblemReason(r string) bool {
 	return false
 }
 
-func parseEvents(data string, e *Evidence) {
+func parseEvents(data string, e *Evidence) bool {
 	var raw struct {
 		Items []struct {
 			ObjectMeta struct {
@@ -244,7 +324,7 @@ func parseEvents(data string, e *Evidence) {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return
+		return false
 	}
 	for _, it := range raw.Items {
 		if it.Type != "Warning" {
@@ -258,12 +338,14 @@ func parseEvents(data string, e *Evidence) {
 			e.PVCEvents[key] = append(e.PVCEvents[key], it.Message)
 		}
 	}
+	return true
 }
 
-func parsePVCs(data string, e *Evidence) {
-	if e.livePVCs == nil {
-		e.livePVCs = map[string]bool{}
-	}
+// parsePVCs records PVC evidence and reports whether the list parsed.
+//
+// livePVCs is populated only on success, for the same reason as livePods: a
+// non-nil but empty map makes the staleness filter delete every real finding.
+func parsePVCs(data string, e *Evidence) bool {
 	var raw struct {
 		Items []struct {
 			Metadata struct {
@@ -276,7 +358,10 @@ func parsePVCs(data string, e *Evidence) {
 		} `json:"items"`
 	}
 	if err := json.Unmarshal([]byte(data), &raw); err != nil {
-		return
+		return false
+	}
+	if e.livePVCs == nil {
+		e.livePVCs = map[string]bool{}
 	}
 	for _, it := range raw.Items {
 		key := it.Metadata.Namespace + "/" + it.Metadata.Name
@@ -287,4 +372,5 @@ func parsePVCs(data string, e *Evidence) {
 			}
 		}
 	}
+	return true
 }

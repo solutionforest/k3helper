@@ -49,11 +49,25 @@ var appendMu sync.Mutex
 type HostKeyError struct {
 	Host        string
 	Fingerprint string
-	Changed     bool
-	err         error
+	// Changed means a key of this same algorithm is recorded and differs.
+	Changed bool
+	// KnownOtherAlgorithm means the host is recorded, but only under key
+	// algorithms other than the one it offered.
+	KnownOtherAlgorithm bool
+	err                 error
 }
 
 func (e *HostKeyError) Error() string {
+	if e.KnownOtherAlgorithm {
+		return fmt.Sprintf(
+			"host %s is known, but not under the key type it offered (%s).\n"+
+				"This is usually a benign upgrade — an old record holds only an older key type.\n"+
+				"Confirm the fingerprint out of band, then add the new key:\n"+
+				"  ssh-keyscan -H %s >> ~/.ssh/known_hosts\n"+
+				"It is not trusted automatically, because an interceptor could offer\n"+
+				"any key type the record happens to lack.",
+			e.Host, e.Fingerprint, hostOnly(e.Host))
+	}
 	if e.Changed {
 		return fmt.Sprintf(
 			"host key for %s has CHANGED (now %s).\n"+
@@ -80,6 +94,24 @@ func hostOnly(hostport string) string {
 	return hostport
 }
 
+// sameTypeRecorded reports whether known_hosts holds a key of the same
+// algorithm as the one the server offered.
+//
+// knownhosts reports "host known, key does not match" for two very different
+// situations: the recorded key for this algorithm genuinely changed, or the
+// host is only recorded under a different algorithm (an old ssh-rsa entry
+// while the server now offers ed25519). Only the first is worth alarming
+// about; treating the second as tampering tells the user to delete a good
+// record over a benign upgrade.
+func sameTypeRecorded(want []knownhosts.KnownKey, offered gossh.PublicKey) bool {
+	for _, k := range want {
+		if k.Key != nil && k.Key.Type() == offered.Type() {
+			return true
+		}
+	}
+	return false
+}
+
 // hostKeyCallback builds the verification callback for a mode.
 func hostKeyCallback(mode HostKeyMode) (gossh.HostKeyCallback, error) {
 	if mode == HostKeyInsecure {
@@ -104,8 +136,9 @@ func hostKeyCallback(mode HostKeyMode) (gossh.HostKeyCallback, error) {
 			return nil
 		}
 		var keyErr *knownhosts.KeyError
-		if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
-			// The host is recorded with a different key: never auto-accept.
+		if errors.As(err, &keyErr) && len(keyErr.Want) > 0 && sameTypeRecorded(keyErr.Want, key) {
+			// A key of this algorithm is recorded and does not match: never
+			// auto-accept, this is the case that may be an attack.
 			return &HostKeyError{
 				Host:        hostname,
 				Fingerprint: gossh.FingerprintSHA256(key),
@@ -114,17 +147,24 @@ func hostKeyCallback(mode HostKeyMode) (gossh.HostKeyCallback, error) {
 			}
 		}
 		if errors.As(err, &keyErr) {
-			// Unknown host.
-			if mode == HostKeyAcceptNew {
+			// Unknown host, or known only under a different key algorithm.
+			//
+			// Trust-on-first-use applies only to a host we have never seen.
+			// If known_hosts already has *any* key for this host, an offer
+			// under an algorithm we have not recorded must not be accepted
+			// automatically: nothing stops an interceptor from picking an
+			// algorithm the record happens to lack.
+			if mode == HostKeyAcceptNew && len(keyErr.Want) == 0 {
 				if aerr := appendKnownHost(hostname, key); aerr != nil {
 					return fmt.Errorf("trust %s on first use: %w", hostname, aerr)
 				}
 				return nil
 			}
 			return &HostKeyError{
-				Host:        hostname,
-				Fingerprint: gossh.FingerprintSHA256(key),
-				err:         err,
+				Host:                hostname,
+				Fingerprint:         gossh.FingerprintSHA256(key),
+				KnownOtherAlgorithm: len(keyErr.Want) > 0,
+				err:                 err,
 			}
 		}
 		return err

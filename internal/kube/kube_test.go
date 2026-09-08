@@ -274,3 +274,59 @@ func TestShortAge(t *testing.T) {
 		}
 	}
 }
+
+// DetectBase must not depend on sudo rights for a generic `test`: a host may
+// grant passwordless sudo for kubectl alone, and falling through to the k3s
+// default on a kubeadm node produces a baffling "no such file" error.
+func TestDetectBaseProbes(t *testing.T) {
+	cases := []struct {
+		name string
+		ok   map[string]bool // command substring -> succeeds
+		want string
+	}{
+		{"k3s installed", map[string]bool{"command -v k3s": true}, k3sBase},
+		{"kubeadm admin.conf present", map[string]bool{"/etc/kubernetes/admin.conf": true}, kubeadmBase},
+		{"neither: default to k3s", map[string]bool{}, k3sBase},
+		// k3s wins when both are somehow present
+		{"both", map[string]bool{"command -v k3s": true, "/etc/kubernetes/admin.conf": true}, k3sBase},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DetectBase(probeExec(tc.ok))
+			if got != tc.want {
+				t.Errorf("DetectBase = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// The kubeadm probe must not use sudo, so a scoped sudoers policy cannot
+// misroute a kubeadm node to the k3s base.
+func TestDetectBaseKubeadmProbeDoesNotUseSudo(t *testing.T) {
+	var seen []string
+	e := execFunc(func(cmd string) (string, int, error) {
+		seen = append(seen, cmd)
+		return "", 1, nil
+	})
+	DetectBase(e)
+	for _, cmd := range seen {
+		if strings.Contains(cmd, "admin.conf") && strings.Contains(cmd, "sudo") {
+			t.Errorf("the kubeadm probe uses sudo: %q", cmd)
+		}
+	}
+}
+
+type execFunc func(string) (string, int, error)
+
+func (f execFunc) Run(cmd string) (string, int, error) { return f(cmd) }
+
+func probeExec(ok map[string]bool) Executor {
+	return execFunc(func(cmd string) (string, int, error) {
+		for substr, succeed := range ok {
+			if succeed && strings.Contains(cmd, substr) {
+				return "", 0, nil
+			}
+		}
+		return "", 1, nil
+	})
+}

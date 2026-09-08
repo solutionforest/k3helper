@@ -167,7 +167,7 @@ func doChecks(targets *config.Targets) tea.Cmd {
 				check.MemoryCheck{},
 				check.SwapCheck{},
 				check.CgroupCheck{},
-				check.K3sServiceCheck{Role: node.Role},
+				check.ServiceCheck{Role: node.Role},
 			)
 			results[node.Name] = runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 			client.Close()

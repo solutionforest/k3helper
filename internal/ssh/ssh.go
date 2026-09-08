@@ -65,13 +65,13 @@ func Dial(n Node) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	addr := fmt.Sprintf("%s:%d", n.Host, n.Port)
 	cfg := &gossh.ClientConfig{
 		User:            n.User,
 		Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
 		HostKeyCallback: callback,
 		Timeout:         10 * time.Second,
 	}
-	addr := fmt.Sprintf("%s:%d", n.Host, n.Port)
 	conn, err := gossh.Dial("tcp", addr, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("ssh dial %s@%s: %w", n.User, addr, err)

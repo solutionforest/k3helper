@@ -39,24 +39,68 @@ type rawDoc struct {
 }
 
 // splitDocs separates a multi-document YAML stream.
+//
+// It walks lines rather than splitting on the substring "\n---", which also
+// cut manifests whose block scalar contained a line starting with --- and
+// reported bogus errors on a manifest kubectl accepts.
 func splitDocs(data []byte) ([]rawDoc, error) {
 	var docs []rawDoc
-	line := 1
-	for _, part := range strings.Split(string(data), "\n---") {
-		startLine := line
-		line += strings.Count(part, "\n") + 1 // +1 for the "\n---" separator itself
-		// skip leading blank lines but keep the line counter honest
-		lead := len(part) - len(strings.TrimLeft(part, "\n"))
-		trimmed := strings.TrimRight(strings.TrimLeft(part, "\n"), " \n")
-		if trimmed == "" || allComments(trimmed) {
+	var cur []string
+	start := 1
+
+	flush := func() {
+		text := strings.TrimRight(strings.Join(cur, "\n"), " \n")
+		// Advance the recorded start past any blank lines the document opened
+		// with, so an issue points at real content.
+		lead := 0
+		for lead < len(cur) && strings.TrimSpace(cur[lead]) == "" {
+			lead++
+		}
+		if text != "" && !allComments(text) {
+			docs = append(docs, rawDoc{text: text, line: start + lead})
+		}
+		cur = nil
+	}
+
+	for i, line := range strings.Split(string(data), "\n") {
+		if isDocSeparator(line) {
+			flush()
+			start = i + 2 // the document begins on the line after the separator
 			continue
 		}
-		docs = append(docs, rawDoc{text: trimmed, line: startLine + lead})
+		if cur == nil {
+			// first line of a new document
+			if len(docs) == 0 && start == 1 {
+				start = i + 1
+			}
+		}
+		cur = append(cur, line)
 	}
+	flush()
+
 	if len(docs) == 0 {
 		return nil, fmt.Errorf("no YAML documents found")
 	}
 	return docs, nil
+}
+
+// isDocSeparator reports whether a line is a YAML document separator: --- on
+// its own, optionally followed by whitespace or a comment.
+//
+// \r is trimmed too: a manifest authored on Windows ends its separator line
+// with "---\r", and failing to recognise that merged every document into the
+// first, so only document 1 was ever validated.
+func isDocSeparator(line string) bool {
+	t := strings.TrimRight(line, " \t\r")
+	if t == "---" {
+		return true
+	}
+	rest, ok := strings.CutPrefix(t, "---")
+	if !ok {
+		return false
+	}
+	rest = strings.TrimLeft(rest, " \t")
+	return strings.HasPrefix(rest, "#")
 }
 
 func allComments(s string) bool {
@@ -162,8 +206,23 @@ func validateKind(kind string, obj map[string]interface{}) []Issue {
 
 	case "Service":
 		if needSpec() {
-			if _, ok := spec["ports"]; !ok {
-				bad("spec.ports", "Service requires spec.ports")
+			// spec.ports is optional in the API: an ExternalName Service must
+			// not have ports, and a headless Service used for StatefulSet peer
+			// DNS routinely has none. Only require them where they are the
+			// point of the object.
+			_, hasPorts := spec["ports"]
+			typ, _ := spec["type"].(string)
+			clusterIP, _ := spec["clusterIP"].(string)
+			externalName, _ := spec["externalName"].(string)
+			switch {
+			case typ == "ExternalName":
+				if externalName == "" {
+					bad("spec.externalName", "an ExternalName Service requires spec.externalName")
+				}
+			case clusterIP == "None":
+				// headless: ports optional
+			case !hasPorts:
+				bad("spec.ports", "Service requires spec.ports (unless headless or ExternalName)")
 			}
 		}
 

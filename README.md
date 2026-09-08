@@ -176,6 +176,11 @@ Exit code: `0` when nothing failed, `2` when a check failed or a node was
 unreachable. **Warnings do not change the exit code** — a swap warning should
 not fail a pipeline the same way a dead k3s does. `--strict` escalates them.
 
+The service check adapts to the node: `k3s`/`k3s-agent` on a k3s host,
+`kubelet` + `containerd` on a kubeadm one, detected from the unit files that
+are actually installed. A node with neither is told to install one, not to
+restart something that was never there.
+
 ### 4. Generate & verify YAML
 
 ```bash
@@ -287,12 +292,29 @@ Doctor gathers evidence across every layer — VM host (`df`, `free`, cgroups, s
 
 | Layer | Signatures |
 |---|---|
-| Workload | ImagePullBackOff · CrashLoopBackOff · OOMKilled · unschedulable (resources/taints) · evicted |
-| Node | k3s/kubelet service down + NotReady · container runtime down · DiskPressure · MemoryPressure · clock skew · image-cache bloat · unreachable over SSH |
-| Cluster | embedded-etcd quorum lost or at risk · TLS certificates expiring · kubeconfig/auth broken |
+| Workload | ImagePullBackOff · CrashLoopBackOff · OOMKilled · unschedulable (resources/taints/cordon) · running but never ready · evicted |
+| Node | service down · NotReady with a running service · container runtime down · DiskPressure · MemoryPressure · clock skew · image-cache bloat · unreachable over SSH |
+| Cluster | embedded-etcd quorum lost or at risk · TLS certificates expiring · kubeconfig/auth broken · evidence that could not be gathered |
 | Network / storage | CoreDNS has no ready replicas · Services with no ready endpoints · PVC stuck Pending |
 
-Ranking is by confidence, so a cause that explains the others floats to the top — a total CoreDNS outage outranks the individual Services it takes down. Signatures that need evidence k3s doesn't have stay silent rather than guessing: a sqlite-backed single-server cluster has no etcd, so the quorum signature never fires there.
+Ranking is by confidence, so a cause floats above the symptoms it produces: a
+stopped k3s outranks "kubeconfig invalid", a CoreDNS outage outranks the
+Services it takes down, and a crashlooping pod outranks its Service having no
+endpoints.
+
+Signatures stay silent rather than guessing when the evidence they need is
+absent — a sqlite-backed single-server cluster has no etcd, so the quorum
+signature never fires there. And what could **not** be gathered is reported
+rather than quietly narrowing the diagnosis:
+
+```
+! could not gather pvcs: kubectl get pvc failed (exit 1)
+```
+
+`doctor --json` emits the same information as `probe_errors`, for scripts. An
+incomplete gather alone does not fail the exit code — a kubeconfig scoped away
+from one resource should not turn every run red — but it is always stated, so
+"no issues detected" never silently means "did not look".
 
 A node it cannot reach is reported, never skipped — partial inspection must not read as a clean bill of health:
 
@@ -552,7 +574,16 @@ Current, and worth knowing before pointing this at production:
 - **`doctor` reads the cluster through the first server node.** If that node is
   down, cluster-layer evidence is unavailable even when other servers are up.
 - **Certificate expiry is read via `k3s certificate check`**, so it is not
-  collected on kubeadm clusters.
+  collected on kubeadm clusters. `doctor` says so rather than implying the
+  certificates are fine.
+- **etcd quorum is read through the API server**, so it cannot be assessed when
+  the API server is the thing that is down. In that case `doctor` reports the
+  stopped service or expired certificates it *can* see.
+- **Clock skew is measured against the machine running k3helper**, so a laptop
+  with a wrong clock will accuse every node.
+- **A cluster member missing from the targets file is invisible.** Host
+  evidence comes from the file, not from `kubectl get nodes`, so a node nobody
+  listed contributes nothing and is not reported as unreachable.
 
 ## Roadmap
 

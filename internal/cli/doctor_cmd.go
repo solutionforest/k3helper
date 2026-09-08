@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -70,24 +71,40 @@ func newDoctorCmd() *cobra.Command {
 					Healthy     bool                           `json:"healthy"`
 					Unreachable []troubleshoot.UnreachableNode `json:"unreachable,omitempty"`
 					Kubeconfig  string                         `json:"kubeconfig_error,omitempty"`
+					ProbeErrors map[string]string              `json:"probe_errors,omitempty"`
 					Diagnoses   []troubleshoot.Diagnosis       `json:"diagnoses"`
 				}{
 					Healthy:     len(diagnoses) == 0,
 					Unreachable: evidence.Unreachable,
 					Kubeconfig:  evidence.KubeconfigError,
+					ProbeErrors: evidence.ProbeErrors,
 					Diagnoses:   diagnoses,
 				}
 				if err := enc.Encode(report); err != nil {
 					return err
 				}
-				if len(diagnoses) > 0 {
-					os.Exit(2)
+				for _, d := range diagnoses {
+					if d.SignatureID != "cluster.partial-evidence" {
+						os.Exit(2)
+					}
 				}
 				return nil
 			}
 
 			for _, u := range evidence.Unreachable {
 				fmt.Fprintf(out, "✗ node %s unreachable: %s\n", u.Name, u.Reason)
+			}
+			// Name what could not be gathered: "Some evidence is missing" is
+			// no use without saying which.
+			if len(evidence.ProbeErrors) > 0 {
+				names := make([]string, 0, len(evidence.ProbeErrors))
+				for k := range evidence.ProbeErrors {
+					names = append(names, k)
+				}
+				sort.Strings(names)
+				for _, k := range names {
+					fmt.Fprintf(out, "! could not gather %s: %s\n", k, evidence.ProbeErrors[k])
+				}
 			}
 			w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 			if evidence.KubeconfigError != "" {
@@ -104,6 +121,18 @@ func newDoctorCmd() *cobra.Command {
 				fmt.Fprintf(w, " \tfix:\t%s\n", wrapText(d.Remediation, " \t      "))
 			}
 			w.Flush()
+			// Incomplete evidence on its own is a caveat, not a fault: exiting
+			// non-zero for it alone would turn every RBAC-scoped kubeconfig
+			// into a red CI run.
+			onlyPartial := true
+			for _, d := range diagnoses {
+				if d.SignatureID != "cluster.partial-evidence" {
+					onlyPartial = false
+				}
+			}
+			if onlyPartial {
+				return nil
+			}
 			os.Exit(2)
 			return nil
 		},

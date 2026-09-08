@@ -30,6 +30,9 @@ type Evidence struct {
 	NodeConditions map[string][]string
 	// NodeNotReady: nodes reporting NotReady
 	NodeNotReady []string
+	// NotReadyPods: namespace/pod of pods that are Running but have containers
+	// that never became ready.
+	NotReadyPods []string
 	// K3sService: node → systemd state ("active", "failed", "inactive", ""=not found)
 	K3sService map[string]string
 	// HostMetrics: node → {disk used %, availMemMB}
@@ -59,9 +62,17 @@ type Evidence struct {
 	// ClockSkew: node → absolute clock offset from the machine running
 	// k3helper.
 	ClockSkew map[string]time.Duration
+	// ProbeErrors: what could not be collected, and why. An absent finding is
+	// only good news if we actually looked, so these are reported rather than
+	// silently narrowing the diagnosis.
+	ProbeErrors map[string]string
 
 	// livePVCs: namespace/pvc keys of PVCs that currently exist.
 	livePVCs map[string]bool
+	// settledPods: pods that are currently running-and-ready or completed.
+	// Their older events describe conditions they have since recovered from —
+	// a scheduling complaint from cluster startup is history, not a fault.
+	settledPods map[string]bool
 	// livePods: namespace/pod keys of pods that currently exist.
 	// Populated by parsePods; used to drop stale evidence for deleted pods.
 	// Unexported: internal to the gather/parse pipeline.
@@ -80,6 +91,14 @@ type HostMetric struct {
 type UnreachableNode struct {
 	Name   string
 	Reason string
+}
+
+// probeFailed records that a piece of evidence could not be gathered.
+func (e *Evidence) probeFailed(name, reason string) {
+	if e.ProbeErrors == nil {
+		e.ProbeErrors = map[string]string{}
+	}
+	e.ProbeErrors[name] = reason
 }
 
 // ReadyRatio is a ready-out-of-desired count for a replicated component.
@@ -118,6 +137,19 @@ func Diagnose(e Evidence) []Diagnosis {
 
 var registry = []Signature{
 	{
+		ID:    "cluster.partial-evidence",
+		Title: "Some evidence could not be gathered — this diagnosis is incomplete",
+		Match: func(e Evidence) int {
+			if len(e.ProbeErrors) == 0 {
+				return 0
+			}
+			// Deliberately low: this does not compete with a real finding, it
+			// exists so "nothing found" is never mistaken for "nothing wrong".
+			return 30
+		},
+		Remediation: "One or more probes failed, so faults they would have caught cannot be ruled out. Check that the kubeconfig the server node uses has list access to pods, events, PVCs, endpoints and services, and that the API server is responsive.",
+	},
+	{
 		ID:    "node.unreachable",
 		Title: "Node unreachable over SSH (no evidence could be gathered)",
 		Match: func(e Evidence) int {
@@ -131,15 +163,60 @@ var registry = []Signature{
 		Remediation: "Confirm the node is powered on and reachable (`ping`), that sshd is running, and that the host/port/user/key in the targets file are correct. Until it responds, no host-level diagnosis is possible for that node.",
 	},
 	{
+		ID:    "node.notready",
+		Title: "Node is NotReady while its Kubernetes service is running",
+		Match: func(e Evidence) int {
+			// Only the nodes whose service is up: a stopped service is
+			// node.notready-k3s-down's job, and reporting both would send the
+			// user to two places for one fault.
+			n := 0
+			for _, node := range e.NodeNotReady {
+				if state, seen := e.K3sService[node]; !seen || state == "active" {
+					n++
+				}
+			}
+			if n == 0 {
+				return 0
+			}
+			// A NotReady node stops taking work and gets its pods evicted; it
+			// is the most common serious fault in a cluster and was previously
+			// gathered but never diagnosed.
+			return min(90, 70+n*10)
+		},
+		Remediation: "The service is up but the node is not Ready, so the kubelet is unhealthy rather than absent. Check `kubectl describe node <name>` for the failing condition, then on the node: `sudo journalctl -u k3s-agent -n 100 --no-pager` (or `-u kubelet`). Common causes: the container runtime is wedged, the CNI is not configured, disk or memory pressure, or the node cannot reach the API server.",
+	},
+	{
+		ID:    "pod.not-ready",
+		Title: "Pods running but never becoming ready",
+		Match: func(e Evidence) int {
+			n := len(e.NotReadyPods)
+			if n == 0 {
+				return 0
+			}
+			// A pod that runs but never passes readiness serves no traffic,
+			// yet has no waiting or terminated reason to report.
+			return min(80, 45+n*10)
+		},
+		Remediation: "The container is running but its readiness probe never passes, so it receives no traffic. Check the probe and the app: `kubectl describe pod <pod>` for the probe failure, then `kubectl logs <pod>`. Common causes: the probe path or port is wrong, the app takes longer to start than initialDelaySeconds allows, or it is waiting on a dependency.",
+	},
+	{
 		ID:    "node.runtime-down",
 		Title: "Container runtime is not running",
 		Match: func(e Evidence) int {
 			n := 0
-			for _, state := range e.ContainerRuntime {
+			for node, state := range e.ContainerRuntime {
 				_, status, ok := strings.Cut(state, "=")
-				if ok && status != "" && status != "active" {
-					n++
+				if !ok || status == "" || status == "active" {
+					continue
 				}
+				// k3s embeds its own containerd and never starts the unit, so
+				// a leftover stopped containerd.service from a previous
+				// kubeadm install is not a fault. Only count a dead runtime on
+				// a node whose Kubernetes service is itself unhappy.
+				if k3s, seen := e.K3sService[node]; seen && k3s == "active" {
+					continue
+				}
+				n++
 			}
 			if n == 0 {
 				return 0
@@ -241,7 +318,25 @@ var registry = []Signature{
 				return 0
 			}
 			if e.CoreDNS.Ready == 0 {
-				// nothing in the cluster can resolve a Service name
+				// Nothing in the cluster can resolve a Service name. But when
+				// a host-level fault is visible, that fault is why CoreDNS is
+				// down — rank under it so the user fixes the cause.
+				// 40 keeps it visible but below the causes it follows from
+				// (a stopped service scores 45 for a single node).
+				const consequence = 40
+				for _, state := range e.K3sService {
+					if state != "active" && state != "" {
+						return consequence
+					}
+				}
+				for _, conds := range e.NodeConditions {
+					if contains(conds, "DiskPressure") || contains(conds, "MemoryPressure") {
+						return consequence
+					}
+				}
+				if len(e.NodeNotReady) > 0 || len(e.Unreachable) > 0 {
+					return consequence
+				}
 				return 95
 			}
 			if e.CoreDNS.Ready < e.CoreDNS.Desired {
@@ -259,9 +354,20 @@ var registry = []Signature{
 			if n == 0 {
 				return 0
 			}
-			// A Service resolves fine and still black-holes every request, so
-			// this is worth surfacing even for a single occurrence.
-			return min(85, 50+n*15)
+			// Empty endpoints are usually a *consequence*: the backing pods
+			// are crashlooping or unschedulable. Rank below those causes so
+			// the user is sent to the pod, not to selector debugging.
+			base := min(60, 25+n*10)
+			if len(e.NotReadyPods) > 0 {
+				return base // pods exist but are not ready; that is the cause
+			}
+			for _, st := range e.PodStatuses {
+				if st != "" {
+					return base // a pod-level cause is visible; stay under it
+				}
+			}
+			// Nothing else explains it: the selector really may be wrong.
+			return min(75, 40+n*10)
 		},
 		Remediation: "The Service selector matches no ready pod. Compare them: `kubectl get svc <svc> -o wide` and `kubectl get pods -l <selector>`. Usual causes: a selector that does not match the pod labels, pods failing their readiness probe, or all backing pods being down — check the pod-level findings above first.",
 	},
@@ -367,8 +473,17 @@ var registry = []Signature{
 					n++
 				}
 			}
-			if len(e.NodeNotReady) > 0 && n > 0 {
+			if n == 0 {
+				return 0
+			}
+			if len(e.NodeNotReady) > 0 {
 				n++ // correlation bonus
+			}
+			// When the API server is also unreachable we cannot see NotReady
+			// at all, so the correlation bonus can never arrive — yet a
+			// stopped service is precisely the likely cause. Score it as one.
+			if e.KubeconfigError != "" {
+				return 90
 			}
 			return min(95, n*45)
 		},
@@ -385,7 +500,8 @@ var registry = []Signature{
 				}
 			}
 			for _, m := range e.HostMetrics {
-				if m.AvailMemMB < 200 {
+				// -1 means the reading failed; only a real measurement counts.
+				if m.AvailMemMB >= 0 && m.AvailMemMB < 200 {
 					n++
 				}
 			}
@@ -413,10 +529,25 @@ var registry = []Signature{
 		ID:    "cluster.kubeconfig",
 		Title: "kubeconfig invalid or expired credentials",
 		Match: func(e Evidence) int {
-			if e.KubeconfigError != "" {
-				return 85
+			if e.KubeconfigError == "" {
+				return 0
 			}
-			return 0
+			// An unreachable API server is a symptom with many causes. When a
+			// host-level cause is visible — k3s stopped, certs expired, etcd
+			// without quorum — that cause must rank above this, or the user is
+			// sent to check a kubeconfig that is perfectly fine.
+			for _, state := range e.K3sService {
+				if state != "active" && state != "" {
+					return 40
+				}
+			}
+			if e.CertSubject != "" && e.CertExpiryDays <= 0 {
+				return 40
+			}
+			if e.Etcd != nil && e.Etcd.Desired > 0 && e.Etcd.Ready < e.Etcd.Desired/2+1 {
+				return 40
+			}
+			return 85
 		},
 		Remediation: "Verify KUBECONFIG path and token validity. On k3s: copy /etc/rancher/k3s/k3s.yaml from the server, or run `k3helper vm setup --kubeconfig` to re-fetch.",
 	},
