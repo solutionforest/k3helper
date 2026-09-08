@@ -6,7 +6,6 @@ import (
 	"os"
 	"text/tabwriter"
 
-	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/kyaml"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/spf13/cobra"
@@ -28,7 +27,7 @@ func newVerifyCmd() *cobra.Command {
 			// rejections and CRD schemas that offline rules cannot.
 			var server *ssh.Client
 			if serverDry {
-				targets, err := config.LoadTargets(targetsPath)
+				targets, err := loadTargets(targetsPath)
 				if err != nil {
 					return err
 				}

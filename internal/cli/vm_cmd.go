@@ -30,7 +30,7 @@ func newVMSetupCmd() *cobra.Command {
 		Use:   "setup",
 		Short: "Install k3s server + agents on all nodes in targets file",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			targets, err := config.LoadTargets(targetsPath)
+			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
 			}

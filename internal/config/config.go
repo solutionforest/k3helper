@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"sigs.k8s.io/yaml"
 )
@@ -20,26 +21,108 @@ type Node struct {
 	Local bool   `json:"local"`
 }
 
-// Targets is the top-level targets file describing a cluster.
+// Targets is one cluster: a name and the machines that make it up.
 type Targets struct {
 	Cluster string `json:"cluster"`
 	Nodes   []Node `json:"nodes"`
 }
 
-// LoadTargets reads and validates a targets YAML file.
-func LoadTargets(path string) (*Targets, error) {
+// File is a targets file. It accepts two shapes:
+//
+//	cluster: prod          # single cluster, the original format
+//	nodes: [...]
+//
+//	clusters:              # several clusters in one file
+//	  - cluster: prod
+//	    nodes: [...]
+//	  - cluster: staging
+//	    nodes: [...]
+//	current: prod          # optional; defaults to the first
+//
+// Both are supported permanently — a one-cluster file should not have to
+// grow a list to keep working.
+type File struct {
+	// single-cluster form
+	Cluster string `json:"cluster,omitempty"`
+	Nodes   []Node `json:"nodes,omitempty"`
+	// multi-cluster form
+	Clusters []Targets `json:"clusters,omitempty"`
+	Current  string    `json:"current,omitempty"`
+}
+
+// Load reads a targets file in either shape and validates every cluster in it.
+func Load(path string) (*File, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read targets: %w", err)
 	}
-	t := &Targets{}
-	if err := yaml.Unmarshal(data, t); err != nil {
+	f := &File{}
+	if err := yaml.Unmarshal(data, f); err != nil {
 		return nil, fmt.Errorf("parse targets %s: %w", path, err)
 	}
-	if err := t.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid targets %s: %w", path, err)
+	if len(f.Clusters) > 0 && (f.Cluster != "" || len(f.Nodes) > 0) {
+		return nil, fmt.Errorf("invalid targets %s: use either top-level cluster/nodes or a clusters list, not both", path)
 	}
-	return t, nil
+	if len(f.Clusters) == 0 {
+		f.Clusters = []Targets{{Cluster: f.Cluster, Nodes: f.Nodes}}
+		f.Cluster, f.Nodes = "", nil
+	}
+	seen := map[string]bool{}
+	for i := range f.Clusters {
+		if err := f.Clusters[i].Validate(); err != nil {
+			return nil, fmt.Errorf("invalid targets %s: %w", path, err)
+		}
+		if seen[f.Clusters[i].Cluster] {
+			return nil, fmt.Errorf("invalid targets %s: duplicate cluster %q", path, f.Clusters[i].Cluster)
+		}
+		seen[f.Clusters[i].Cluster] = true
+	}
+	if f.Current != "" && !seen[f.Current] {
+		return nil, fmt.Errorf("invalid targets %s: current: %q is not one of the defined clusters (%s)",
+			path, f.Current, strings.Join(f.Names(), ", "))
+	}
+	return f, nil
+}
+
+// Names lists the cluster names in file order.
+func (f *File) Names() []string {
+	out := make([]string, 0, len(f.Clusters))
+	for _, c := range f.Clusters {
+		out = append(out, c.Cluster)
+	}
+	return out
+}
+
+// Select returns the named cluster. An empty name returns `current` when set,
+// otherwise the first cluster — so single-cluster files need no ceremony.
+func (f *File) Select(name string) (*Targets, error) {
+	if name == "" {
+		name = f.Current
+	}
+	if name == "" {
+		return &f.Clusters[0], nil
+	}
+	for i := range f.Clusters {
+		if f.Clusters[i].Cluster == name {
+			return &f.Clusters[i], nil
+		}
+	}
+	return nil, fmt.Errorf("no cluster %q in targets (have: %s)", name, strings.Join(f.Names(), ", "))
+}
+
+// LoadTargets reads a targets file and returns the selected cluster. It is the
+// single-cluster entry point every command uses.
+func LoadTargets(path string) (*Targets, error) {
+	return LoadTargetsContext(path, "")
+}
+
+// LoadTargetsContext reads a targets file and returns the named cluster.
+func LoadTargetsContext(path, context string) (*Targets, error) {
+	f, err := Load(path)
+	if err != nil {
+		return nil, err
+	}
+	return f.Select(context)
 }
 
 // Validate checks required fields and role values.

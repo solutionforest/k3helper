@@ -27,6 +27,9 @@ type Result struct {
 	Applied   []string // kind/name of applied resources
 	RolledOut []string // resources that reached desired state
 	Errors    []string
+	// Diff is the unified diff against live cluster state, populated when
+	// Options.Diff is set. Empty means the manifest changes nothing.
+	Diff string
 }
 
 // Options controls the deploy flow.
@@ -34,6 +37,7 @@ type Options struct {
 	Namespace   string        // "" = whatever the manifest says
 	WaitTimeout time.Duration // per-resource rollout wait
 	DryRun      bool          // server dry-run only, no changes
+	Diff        bool          // capture a diff against live state before applying
 }
 
 // kubectlBase returns the kubectl invocation prefix for the executor type.
@@ -129,11 +133,21 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 		return res, fmt.Errorf("dry-run validation failed:\n%s", out)
 	}
 	res.Applied = parseApplied(out)
+
+	// 2. optional diff against live state, before anything is changed
+	if opts.Diff {
+		diff, err := diffAgainstLive(exec, kb, ns, remote)
+		if err != nil {
+			return res, err
+		}
+		res.Diff = diff
+	}
+
 	if opts.DryRun {
 		return res, nil
 	}
 
-	// 2. real apply
+	// 3. real apply
 	apply := fmt.Sprintf(`%s apply%s -f '%s' 2>&1`, kb, ns, remote)
 	out, code, err = exec.Run(apply)
 	if err != nil {
@@ -144,7 +158,7 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 	}
 	res.Applied = parseApplied(out)
 
-	// 3. wait for rollout
+	// 4. wait for rollout
 	timeout := opts.WaitTimeout
 	if timeout <= 0 {
 		timeout = 120 * time.Second
@@ -157,6 +171,27 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 		}
 	}
 	return res, nil
+}
+
+// diffAgainstLive returns `kubectl diff` output for the manifest.
+//
+// kubectl diff uses exit codes as data: 0 means no differences, 1 means there
+// are differences, and anything above that is a real failure. Treating 1 as an
+// error would make every changed manifest look broken.
+func diffAgainstLive(exec Executor, kb, ns, remote string) (string, error) {
+	cmd := fmt.Sprintf(`%s diff%s -f '%s' 2>&1`, kb, ns, remote)
+	out, code, err := exec.Run(cmd)
+	if err != nil {
+		return "", fmt.Errorf("kubectl diff: %w", err)
+	}
+	switch code {
+	case 0:
+		return "", nil // identical to live state
+	case 1:
+		return out, nil
+	default:
+		return "", fmt.Errorf("kubectl diff failed (exit %d):\n%s", code, strings.TrimSpace(out))
+	}
 }
 
 // parseApplied extracts "deployment.apps/web created" style lines

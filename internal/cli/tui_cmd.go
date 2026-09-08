@@ -2,7 +2,6 @@ package cli
 
 import (
 	"github.com/charmbracelet/lipgloss"
-	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/tui"
 	"github.com/spf13/cobra"
 )
@@ -13,7 +12,7 @@ func newTUICmd() *cobra.Command {
 		Use:   "tui",
 		Short: "Launch the interactive dashboard",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			targets, err := config.LoadTargets(targetsPath)
+			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
 			}

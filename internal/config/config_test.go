@@ -172,3 +172,163 @@ func indexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// --- multi-cluster targets files ---
+
+// The original single-cluster format must keep working unchanged.
+func TestLoadSingleClusterFormatStillWorks(t *testing.T) {
+	path := writeTemp(t, `
+cluster: solo
+nodes:
+  - name: n1
+    role: server
+    host: 10.0.0.1
+    user: ubuntu
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(f.Clusters) != 1 || f.Clusters[0].Cluster != "solo" {
+		t.Fatalf("clusters = %+v, want one named solo", f.Clusters)
+	}
+	targets, err := LoadTargets(path)
+	if err != nil || targets.Cluster != "solo" {
+		t.Errorf("LoadTargets = %+v, %v", targets, err)
+	}
+}
+
+func TestLoadMultiClusterFormat(t *testing.T) {
+	path := writeTemp(t, `
+clusters:
+  - cluster: prod
+    nodes:
+      - name: p1
+        role: server
+        host: 10.0.0.1
+        user: ubuntu
+  - cluster: staging
+    nodes:
+      - name: s1
+        role: server
+        host: 10.0.1.1
+        user: ubuntu
+current: staging
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := f.Names(); len(got) != 2 || got[0] != "prod" || got[1] != "staging" {
+		t.Errorf("Names() = %v, want [prod staging] in file order", got)
+	}
+
+	// no explicit context -> `current`
+	sel, err := f.Select("")
+	if err != nil || sel.Cluster != "staging" {
+		t.Errorf("Select(\"\") = %v, %v; want the `current` cluster", sel, err)
+	}
+	// explicit context wins over `current`
+	sel, err = f.Select("prod")
+	if err != nil || sel.Cluster != "prod" {
+		t.Errorf("Select(prod) = %v, %v", sel, err)
+	}
+	if sel.Nodes[0].Host != "10.0.0.1" {
+		t.Errorf("selected the wrong cluster's nodes: %+v", sel.Nodes)
+	}
+}
+
+// Without `current`, the first cluster is used so the flag stays optional.
+func TestSelectDefaultsToFirstCluster(t *testing.T) {
+	path := writeTemp(t, `
+clusters:
+  - cluster: a
+    nodes: [{name: n, role: server, host: h, user: u}]
+  - cluster: b
+    nodes: [{name: n, role: server, host: h, user: u}]
+`)
+	f, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, err := f.Select("")
+	if err != nil || sel.Cluster != "a" {
+		t.Errorf("Select(\"\") = %v, %v; want the first cluster", sel, err)
+	}
+}
+
+func TestSelectUnknownContextListsChoices(t *testing.T) {
+	path := writeTemp(t, `
+clusters:
+  - cluster: prod
+    nodes: [{name: n, role: server, host: h, user: u}]
+  - cluster: staging
+    nodes: [{name: n, role: server, host: h, user: u}]
+`)
+	f, _ := Load(path)
+	_, err := f.Select("nope")
+	if err == nil {
+		t.Fatal("expected an error for an unknown context")
+	}
+	// The message must tell the operator what they can pick.
+	for _, want := range []string{"nope", "prod", "staging"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestMultiClusterFileErrors(t *testing.T) {
+	cases := []struct {
+		name, content, wantErr string
+	}{
+		{
+			"both formats at once",
+			"cluster: a\nnodes: [{name: n, role: server, host: h, user: u}]\nclusters:\n  - cluster: b\n    nodes: [{name: n, role: server, host: h, user: u}]\n",
+			"not both",
+		},
+		{
+			"duplicate cluster names",
+			"clusters:\n  - cluster: a\n    nodes: [{name: n, role: server, host: h, user: u}]\n  - cluster: a\n    nodes: [{name: n, role: server, host: h, user: u}]\n",
+			"duplicate cluster",
+		},
+		{
+			"current names a cluster that is not defined",
+			"clusters:\n  - cluster: a\n    nodes: [{name: n, role: server, host: h, user: u}]\ncurrent: ghost\n",
+			"not one of the defined clusters",
+		},
+		{
+			"a cluster in the list is itself invalid",
+			"clusters:\n  - cluster: a\n    nodes: [{name: n, role: worker, host: h, user: u}]\n",
+			"role must be",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.content))
+			if err == nil {
+				t.Fatalf("expected an error containing %q", tc.wantErr)
+			}
+			if !contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadTargetsContextSelects(t *testing.T) {
+	path := writeTemp(t, `
+clusters:
+  - cluster: prod
+    nodes: [{name: p, role: server, host: 10.0.0.1, user: u}]
+  - cluster: staging
+    nodes: [{name: s, role: server, host: 10.0.1.1, user: u}]
+`)
+	targets, err := LoadTargetsContext(path, "staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targets.Cluster != "staging" || targets.Nodes[0].Host != "10.0.1.1" {
+		t.Errorf("got %+v, want the staging cluster", targets)
+	}
+}

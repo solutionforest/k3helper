@@ -1,10 +1,22 @@
 package cli
 
 import (
+	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/spf13/cobra"
 )
 
 var version = "0.1.0"
+
+// contextName is the --context value: which cluster to use from a
+// multi-cluster targets file. Empty means the file's `current`, or its only
+// cluster.
+var contextName string
+
+// loadTargets resolves the targets file honouring --context. Every command
+// goes through this so the flag cannot be silently ignored by one of them.
+func loadTargets(path string) (*config.Targets, error) {
+	return config.LoadTargetsContext(path, contextName)
+}
 
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
@@ -18,10 +30,15 @@ func NewRootCmd() *cobra.Command {
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
   doctor      troubleshoot: find issues + remediation
+  ctx         list clusters defined in the targets file
   tui         launch the interactive dashboard`,
 		SilenceUsage: true,
 	}
+	// --context selects a cluster from a multi-cluster targets file. It is
+	// persistent so every subcommand honours it without repeating the flag.
+	root.PersistentFlags().StringVar(&contextName, "context", "", "cluster to use from a multi-cluster targets file")
 	root.AddCommand(newVersionCmd())
+	root.AddCommand(newCtxCmd())
 	root.AddCommand(newVerifyCmd())
 	root.AddCommand(newGenCmd())
 	root.AddCommand(newCheckCmd())

@@ -6,7 +6,6 @@ import (
 	"text/tabwriter"
 
 	"github.com/solutionforest/k3helper/internal/check"
-	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/spf13/cobra"
 )
@@ -17,7 +16,7 @@ func newCheckCmd() *cobra.Command {
 		Use:   "check",
 		Short: "Run host/k3s health checks on all target nodes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			targets, err := config.LoadTargets(targetsPath)
+			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
 			}

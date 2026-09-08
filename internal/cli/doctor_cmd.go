@@ -6,7 +6,6 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/solutionforest/k3helper/internal/troubleshoot"
 	"github.com/spf13/cobra"
@@ -18,7 +17,7 @@ func newDoctorCmd() *cobra.Command {
 		Use:   "doctor",
 		Short: "Troubleshoot: gather evidence across host + k3s + cluster, rank root causes with fixes",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			targets, err := config.LoadTargets(targetsPath)
+			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
 			}

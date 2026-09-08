@@ -11,6 +11,7 @@ k3helper is a portable k3s/kubernetes helper with a TUI.
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
   doctor      troubleshoot: find issues + remediation
+  ctx         list clusters defined in the targets file
   tui         launch the interactive dashboard
 ```
 
@@ -183,6 +184,45 @@ namespace "prod"; remove metadata.namespace or drop the flag
 ```
 
 The namespace must already exist — `deploy` never creates cluster state the manifest didn't ask for.
+
+`--diff` shows what would change against live cluster state before anything is applied:
+
+```bash
+k3helper deploy -f web.yaml -t targets.yaml --diff --dry-run
+```
+```diff
+@@ -29,7 +29,7 @@
+       containers:
+-      - image: nginx:1.24-alpine
++      - image: nginx:1.25-alpine
+```
+
+Pair it with `--dry-run` to look without touching anything. When the manifest already matches the cluster you get `= no changes against live cluster state`.
+
+### Multiple clusters
+
+One targets file can describe several clusters:
+
+```yaml
+clusters:
+  - cluster: prod
+    nodes: [...]
+  - cluster: staging
+    nodes: [...]
+current: prod        # optional; defaults to the first
+```
+
+```bash
+k3helper ctx -t targets.yaml            # list them
+k3helper doctor -t targets.yaml --context staging
+```
+```
+   CLUSTER  NODES  SERVER
+*  prod     3      10.0.0.10
+   staging  1      10.0.1.10
+```
+
+`--context` works on every subcommand. The single-cluster format (`cluster:` and `nodes:` at the top level) keeps working unchanged — a one-cluster file never has to grow a list.
 
 ### 6. Find issues fast
 
@@ -382,6 +422,8 @@ make bundle          # offline paste bundle (see the browser-console section)
 
 The E2E script proves the whole loop: fresh VMs → check detects missing k3s → bootstrap → all green → gen/verify/deploy → doctor healthy → **inject faults (k3s stop, OOMKill) → doctor catches each → recover**.
 
+CI runs gofmt, `go vet` (including under the `integration` build tag, so those files cannot rot unnoticed), race-enabled unit tests, and a cross-compile on every push. The sandbox E2E needs OrbStack VMs, which GitHub-hosted runners cannot provide, so that job targets a self-hosted macOS runner and is skipped elsewhere rather than reported as passing.
+
 Integration tests (`-tags=integration`) read node addresses from `test/sandbox/targets.sandbox.yaml` rather than hardcoding them, because OrbStack assigns new IPs each time the VMs are recreated. Point them at another cluster with `K3HELPER_TARGETS=/path/to/targets.yaml`. With no sandbox running they skip rather than fail.
 
 > Note: sandbox VMs require [OrbStack](https://orbstack.dev) on macOS. Plain Docker containers share the macOS kernel and break kubelet PLEG (pods killed falsely), so real lightweight VMs are used.
@@ -426,10 +468,8 @@ Current, and worth knowing before pointing this at production:
 - [ ] Rewrite the fetched kubeconfig's server address to the node's reachable IP
 - [ ] `vm setup`: wait for the expected node count, not just the registered ones
 - [ ] k8s (kubeadm) host-layer adapter: `kubelet`/`containerd` units, `/etc/kubernetes/admin.conf`
-- [ ] More failure signatures (cert expiry, etcd quorum, CoreDNS, service endpoints)
+- [ ] More failure signatures (kubelet/containerd health, image GC, clock skew)
 - [ ] Fault-injection matrix as `make fault-<name>` targets (disk full, bad token, ImagePull, PVC pending, cordon)
-- [ ] Deploy diff view, multi-cluster contexts
-- [ ] GitHub Actions CI running unit + sandbox E2E
 
 ## License
 

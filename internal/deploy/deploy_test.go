@@ -275,3 +275,114 @@ func writeManifest(t *testing.T) string {
 	}
 	return path
 }
+
+// --- diff against live state ---
+
+// kubectl diff signals "there are differences" with exit 1. Treating that as
+// a failure would make every changed manifest look broken.
+func TestDeployDiffExitOneIsNotAnError(t *testing.T) {
+	const diff = `diff -u -N /tmp/LIVE/web /tmp/MERGED/web
+--- /tmp/LIVE/web
++++ /tmp/MERGED/web
+@@ -5,7 +5,7 @@
+   replicas: 1
+-  image: nginx:1.24
++  image: nginx:1.25`
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web configured (server dry run)\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml diff -f '<remote>' 2>&1": {
+			Out: diff, Code: 1,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{Diff: true, DryRun: true})
+	if err != nil {
+		t.Fatalf("exit 1 from kubectl diff must not be an error: %v", err)
+	}
+	if !strings.Contains(res.Diff, "nginx:1.25") {
+		t.Errorf("diff not captured: %q", res.Diff)
+	}
+}
+
+// Exit 0 means the manifest matches live state exactly.
+func TestDeployDiffNoChanges(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web unchanged (server dry run)\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml diff -f '<remote>' 2>&1": {
+			Out: "", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{Diff: true, DryRun: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Diff != "" {
+		t.Errorf("Diff = %q, want empty when live state matches", res.Diff)
+	}
+}
+
+// Anything above exit 1 is a genuine failure and must surface.
+func TestDeployDiffRealFailureSurfaces(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web configured (server dry run)\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml diff -f '<remote>' 2>&1": {
+			Out: "error: unable to reach the server", Code: 2,
+		},
+	})
+	_, err := Deploy(exec, writeManifest(t), Options{Diff: true, DryRun: true})
+	if err == nil {
+		t.Fatal("expected an error for a genuine kubectl diff failure")
+	}
+	if !strings.Contains(err.Error(), "kubectl diff failed") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// The diff must be taken before anything is applied, and must honour -n.
+func TestDeployDiffRunsBeforeApplyAndHonoursNamespace(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -n 'staging' -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web configured (server dry run)\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml diff -n 'staging' -f '<remote>' 2>&1": {
+			Out: "some diff", Code: 1,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -n 'staging' -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web configured\n", Code: 0,
+		},
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml rollout status -n 'staging' 'deployment.apps/web' --timeout=5s 2>&1": {
+			Out: "deployment \"web\" successfully rolled out\n", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{Diff: true, Namespace: "staging", WaitTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Diff != "some diff" {
+		t.Errorf("Diff = %q", res.Diff)
+	}
+	if len(res.RolledOut) != 1 {
+		t.Errorf("deploy should still proceed after the diff: %+v", res)
+	}
+}
+
+// Without --diff, no diff command runs at all.
+func TestDeployWithoutDiffFlagSkipsDiff(t *testing.T) {
+	exec := newFakeExec(check.MapExec{
+		"sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply --dry-run=server -f '<remote>' 2>&1": {
+			Out: "deployment.apps/web configured (server dry run)\n", Code: 0,
+		},
+	})
+	res, err := Deploy(exec, writeManifest(t), Options{DryRun: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Diff != "" {
+		t.Errorf("Diff = %q, want empty when --diff was not requested", res.Diff)
+	}
+}
