@@ -77,7 +77,7 @@ func Node(name string) (ssh.Node, error) {
 	}
 	for _, n := range targets.Nodes {
 		if n.Name == name {
-			return ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key}, nil
+			return ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key, Local: n.Local}, nil
 		}
 	}
 	return ssh.Node{}, fmt.Errorf("no node %q in sandbox targets", name)
@@ -91,7 +91,7 @@ func Agents() ([]ssh.Node, error) {
 	}
 	var out []ssh.Node
 	for _, n := range targets.Agents() {
-		out = append(out, ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key})
+		out = append(out, ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key, Local: n.Local})
 	}
 	return out, nil
 }

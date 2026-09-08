@@ -23,7 +23,7 @@ func newCheckCmd() *cobra.Command {
 			}
 			anyFail := false
 			for _, node := range targets.Nodes {
-				client, err := ssh.Dial(ssh.Node{Host: node.Host, Port: node.Port, User: node.User, Key: node.Key})
+				client, err := ssh.Dial(ssh.Node{Host: node.Host, Port: node.Port, User: node.User, Key: node.Key, Local: node.Local})
 				if err != nil {
 					fmt.Fprintf(cmd.OutOrStdout(), "✗ %s: unreachable: %v\n", node.Name, err)
 					anyFail = true

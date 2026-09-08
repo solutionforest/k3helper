@@ -107,5 +107,5 @@ func newVMSetupCmd() *cobra.Command {
 var agentExtraArgs string
 
 func toSSHNode(n config.Node) ssh.Node {
-	return ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key}
+	return ssh.Node{Host: n.Host, Port: n.Port, User: n.User, Key: n.Key, Local: n.Local}
 }

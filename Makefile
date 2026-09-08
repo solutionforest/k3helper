@@ -1,6 +1,12 @@
 BINARY     := k3helper
 VERSION    := 0.1.0
-LDFLAGS    := -ldflags "-X github.com/solutionforest/k3helper/internal/cli.version=$(VERSION)"
+VERPKG     := github.com/solutionforest/k3helper/internal/cli.version
+LDFLAGS    := -ldflags "-X $(VERPKG)=$(VERSION)"
+# -s -w strips the symbol table and DWARF: ~25% smaller downloads, and Go
+# panics keep their function names because the runtime carries its own tables.
+RELFLAGS   := -ldflags "-s -w -X $(VERPKG)=$(VERSION)"
+PLATFORMS  := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
+DIST       := dist
 TARGETS    := test/sandbox/targets.sandbox.yaml
 SSH_KEY    := test/sandbox/ssh/id_ed25519
 SSH_OPTS   := -i $(SSH_KEY) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes
@@ -10,7 +16,7 @@ SSH_OPTS   := -i $(SSH_KEY) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/d
 
 .PHONY: help build build-all test test-integration clean e2e \
         sandbox-up sandbox-down sandbox-reset sandbox-verify sandbox-ssh \
-        bootstrap check doctor fault-clean
+        bootstrap check doctor fault-clean release release-upload bundle
 
 help:
 	@echo "Build:"
@@ -20,7 +26,11 @@ help:
 	@echo "  make test-integration integration tests (needs sandbox)"
 	@echo "  make e2e              full lifecycle E2E (resets sandbox, ~10-15 min)"
 	@echo "  make e2e-fast         E2E reusing running sandbox (~6 min)"
-	@echo "  make clean            remove bin/"
+	@echo "  make clean            remove bin/ and dist/"
+	@echo "Distribution:"
+	@echo "  make release          stripped binaries + checksums.txt in dist/"
+	@echo "  make release-upload   create/refresh the v$(VERSION) GitHub release and upload dist/"
+	@echo "  make bundle           offline paste bundle for air-gapped web-console installs"
 	@echo "Sandbox (3 Ubuntu 24.04 OrbStack VMs):"
 	@echo "  make sandbox-up       create VMs + install SSH + write targets"
 	@echo "  make sandbox-down     delete VMs"
@@ -55,8 +65,31 @@ e2e:
 e2e-fast:
 	./test/e2e.sh --keep
 
+# Release artifacts consumed by install.sh: one binary per platform plus a
+# checksums.txt the installer verifies the download against.
+release:
+	@rm -rf $(DIST) && mkdir -p $(DIST)
+	@for platform in $(PLATFORMS); do \
+	  os=$${platform%/*}; arch=$${platform#*/}; \
+	  GOOS=$$os GOARCH=$$arch go build $(RELFLAGS) -o $(DIST)/$(BINARY)-$$os-$$arch ./cmd/k3helper || exit 1; \
+	  echo "✓ $(DIST)/$(BINARY)-$$os-$$arch"; \
+	done
+	@cd $(DIST) && (command -v sha256sum >/dev/null && sha256sum $(BINARY)-* || shasum -a 256 $(BINARY)-*) > checksums.txt
+	@cp install.sh $(DIST)/install.sh
+	@echo "✓ $(DIST)/checksums.txt"
+
+release-upload: release
+	@gh release view v$(VERSION) >/dev/null 2>&1 \
+	  || gh release create v$(VERSION) --title "v$(VERSION)" --notes "k3helper v$(VERSION)"
+	gh release upload v$(VERSION) $(DIST)/$(BINARY)-* $(DIST)/checksums.txt $(DIST)/install.sh --clobber
+	@echo "✓ uploaded to https://github.com/solutionforest/k3helper/releases/tag/v$(VERSION)"
+
+# For servers with no outbound internet: PLATFORM=, COMPRESS=, CHUNK_LINES=
+bundle:
+	@VERSION=$(VERSION) scripts/bundle.sh
+
 clean:
-	rm -rf bin
+	rm -rf bin $(DIST)
 
 sandbox-up:
 	@test/sandbox/setup-orbstack.sh

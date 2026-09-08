@@ -3,6 +3,7 @@ test/sandbox/ssh/*.pub
 *.swp
 .DS_Store
 bin/
+dist/
 
 # Fetched kubeconfigs embed cluster client certificates and keys.
 *kubeconfig*.yaml

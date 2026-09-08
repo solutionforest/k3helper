@@ -58,8 +58,8 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 		tokenArg = fmt.Sprintf(" K3S_TOKEN=%s", opts.Token)
 	}
 	cmd := fmt.Sprintf(
-		`curl -sfL %s | sudo INSTALL_K3S_CHANNEL=%s%s sh -s - server%s`,
-		opts.installURL(), opts.channel(), tokenArg, withSpace(opts.ServerExtraArgs),
+		`curl -sfL %s | %sINSTALL_K3S_CHANNEL=%s%s sh -s - server%s`,
+		opts.installURL(), server.SudoPrefix(), opts.channel(), tokenArg, withSpace(opts.ServerExtraArgs),
 	)
 	if code, err := streamSudo(server, cmd, opts.Progress); err != nil || code != 0 {
 		return fmt.Errorf("server install failed (exit %d): %w", code, err)
@@ -82,8 +82,8 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 	for _, a := range agents {
 		progressf("[%s] installing k3s agent...", a.Node.Host)
 		joinCmd := fmt.Sprintf(
-			`curl -sfL %s | sudo K3S_URL=https://%s:6443 K3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - agent%s`,
-			opts.installURL(), ip, token, opts.channel(), withSpace(opts.AgentExtraArgs),
+			`curl -sfL %s | %sK3S_URL=https://%s:6443 K3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - agent%s`,
+			opts.installURL(), a.Client.SudoPrefix(), ip, token, opts.channel(), withSpace(opts.AgentExtraArgs),
 		)
 		if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 			return fmt.Errorf("agent %s install failed (exit %d): %w", a.Node.Host, code, err)

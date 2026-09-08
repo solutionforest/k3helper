@@ -99,6 +99,60 @@ func TestLoadTargetsErrors(t *testing.T) {
 	}
 }
 
+func TestLoadTargetsLocalNode(t *testing.T) {
+	// The browser-console layout: k3helper runs on the server itself and only
+	// SSHes outward to the agents.
+	path := writeTemp(t, `
+cluster: prod
+nodes:
+  - name: server
+    role: server
+    local: true
+  - name: agent1
+    role: agent
+    host: 10.0.0.11
+    user: root
+    key: /root/.ssh/k3helper
+`)
+	targets, err := LoadTargets(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	srv, err := targets.Server()
+	if err != nil {
+		t.Fatalf("Server(): %v", err)
+	}
+	if !srv.Local {
+		t.Error("server node lost local: true")
+	}
+	if srv.Host != "localhost" {
+		t.Errorf("host = %q, want localhost default for display", srv.Host)
+	}
+	if targets.Agents()[0].Local {
+		t.Error("agent should not be local")
+	}
+}
+
+func TestLoadTargetsRejectsTwoLocalNodes(t *testing.T) {
+	path := writeTemp(t, `
+cluster: c
+nodes:
+  - name: server
+    role: server
+    local: true
+  - name: agent1
+    role: agent
+    local: true
+`)
+	_, err := LoadTargets(path)
+	if err == nil {
+		t.Fatal("expected error for two local nodes")
+	}
+	if !contains(err.Error(), "only one node can be local") {
+		t.Errorf("error = %q", err.Error())
+	}
+}
+
 func TestLoadTargetsMissingFile(t *testing.T) {
 	_, err := LoadTargets("/nonexistent/targets.yaml")
 	if err == nil {

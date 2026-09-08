@@ -18,6 +18,10 @@ type Node struct {
 	Port int
 	User string
 	Key  string
+	// Local marks the machine k3helper itself is running on. Commands are
+	// executed through /bin/sh instead of an SSH connection, so no sshd,
+	// key or loopback network access is required.
+	Local bool
 }
 
 // Executor is the minimal command-execution surface (satisfied by *Client).
@@ -25,14 +29,20 @@ type Executor interface {
 	Run(cmd string) (string, int, error)
 }
 
-// Client wraps an SSH connection to one node.
+// Client wraps an SSH connection to one node, or local /bin/sh execution
+// when the node is marked Local.
 type Client struct {
-	conn *gossh.Client
-	node Node
+	conn  *gossh.Client
+	node  Node
+	local bool
 }
 
-// Dial connects to the node using private-key auth.
+// Dial connects to the node using private-key auth. For a Local node it
+// returns a client that shells out on this machine without connecting.
 func Dial(n Node) (*Client, error) {
+	if n.Local {
+		return &Client{node: n, local: true}, nil
+	}
 	if n.Port == 0 {
 		n.Port = 22
 	}
@@ -62,6 +72,9 @@ func Dial(n Node) (*Client, error) {
 
 // Run executes a command and returns stdout+stderr combined and the exit code.
 func (c *Client) Run(cmd string) (string, int, error) {
+	if c.local {
+		return runLocal(cmd)
+	}
 	sess, err := c.conn.NewSession()
 	if err != nil {
 		return "", -1, fmt.Errorf("new session: %w", err)
@@ -80,11 +93,24 @@ func (c *Client) Run(cmd string) (string, int, error) {
 
 // SudoRun executes a command with sudo (non-interactive; sandbox hosts have passwordless sudo).
 func (c *Client) SudoRun(cmd string) (string, int, error) {
-	return c.Run("sudo -n " + cmd)
+	return c.Run(c.SudoPrefix() + cmd)
+}
+
+// SudoPrefix returns the prefix needed to run a command as root on this node.
+// It is empty when we are already root on a local node — minimal images
+// reachable only through a browser console often have no sudo binary at all.
+func (c *Client) SudoPrefix() string {
+	if c.local && os.Geteuid() == 0 {
+		return ""
+	}
+	return "sudo -n "
 }
 
 // Stream executes a command, streaming combined output to w. Returns exit code.
 func (c *Client) Stream(cmd string, w io.Writer) (int, error) {
+	if c.local {
+		return streamLocal(cmd, w)
+	}
 	sess, err := c.conn.NewSession()
 	if err != nil {
 		return -1, fmt.Errorf("new session: %w", err)
@@ -107,6 +133,9 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 	if err := validRemotePath(remotePath); err != nil {
 		return err
 	}
+	if c.local {
+		return writeFileLocal(remotePath, data, mode)
+	}
 	sess, err := c.conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("new session: %w", err)
@@ -126,6 +155,9 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 func (c *Client) RemoveFile(remotePath string) error {
 	if err := validRemotePath(remotePath); err != nil {
 		return err
+	}
+	if c.local {
+		return removeFileLocal(remotePath)
 	}
 	out, code, err := c.Run(fmt.Sprintf("rm -f '%s'", remotePath))
 	if err != nil {
@@ -149,8 +181,11 @@ func validRemotePath(p string) error {
 	return nil
 }
 
-// Close closes the connection.
+// Close closes the connection (no-op for a local client).
 func (c *Client) Close() error {
+	if c.local {
+		return nil
+	}
 	if c.conn != nil {
 		return c.conn.Close()
 	}

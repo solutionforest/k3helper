@@ -8,13 +8,16 @@ import (
 )
 
 // Node is a single SSH-reachable machine that hosts (or will host) k3s.
+// A node with local: true is the machine k3helper itself runs on; it needs
+// no host, user or key because commands are executed directly.
 type Node struct {
-	Name string `json:"name"`
-	Role string `json:"role"` // "server" or "agent"
-	Host string `json:"host"`
-	Port int    `json:"port"`
-	User string `json:"user"`
-	Key  string `json:"key"` // path to private key
+	Name  string `json:"name"`
+	Role  string `json:"role"` // "server" or "agent"
+	Host  string `json:"host"`
+	Port  int    `json:"port"`
+	User  string `json:"user"`
+	Key   string `json:"key"` // path to private key
+	Local bool   `json:"local"`
 }
 
 // Targets is the top-level targets file describing a cluster.
@@ -49,6 +52,7 @@ func (t *Targets) Validate() error {
 	}
 	seen := map[string]bool{}
 	servers := 0
+	locals := 0
 	for i, n := range t.Nodes {
 		if n.Name == "" {
 			return fmt.Errorf("node[%d]: name is required", i)
@@ -57,11 +61,20 @@ func (t *Targets) Validate() error {
 			return fmt.Errorf("node[%d]: duplicate name %q", i, n.Name)
 		}
 		seen[n.Name] = true
-		if n.Host == "" {
-			return fmt.Errorf("node %q: host is required", n.Name)
-		}
-		if n.User == "" {
-			return fmt.Errorf("node %q: user is required", n.Name)
+		if n.Local {
+			locals++
+			// host is never dialled for a local node, but it is printed in
+			// check/doctor output, so give it something readable.
+			if n.Host == "" {
+				t.Nodes[i].Host = "localhost"
+			}
+		} else {
+			if n.Host == "" {
+				return fmt.Errorf("node %q: host is required (or set local: true)", n.Name)
+			}
+			if n.User == "" {
+				return fmt.Errorf("node %q: user is required (or set local: true)", n.Name)
+			}
 		}
 		if n.Role != "server" && n.Role != "agent" {
 			return fmt.Errorf("node %q: role must be \"server\" or \"agent\", got %q", n.Name, n.Role)
@@ -75,6 +88,9 @@ func (t *Targets) Validate() error {
 	}
 	if servers == 0 {
 		return fmt.Errorf("at least one server node is required")
+	}
+	if locals > 1 {
+		return fmt.Errorf("only one node can be local: true (k3helper runs on exactly one machine)")
 	}
 	return nil
 }

@@ -88,7 +88,7 @@ func doChecks(targets *config.Targets) tea.Cmd {
 	return func() tea.Msg {
 		results := map[string][]check.Result{}
 		for _, node := range targets.Nodes {
-			client, err := ssh.Dial(ssh.Node{Host: node.Host, Port: node.Port, User: node.User, Key: node.Key})
+			client, err := ssh.Dial(ssh.Node{Host: node.Host, Port: node.Port, User: node.User, Key: node.Key, Local: node.Local})
 			if err != nil {
 				results[node.Name] = []check.Result{{
 					ID: "ssh.connect", Category: "host", Name: "SSH connectivity",
