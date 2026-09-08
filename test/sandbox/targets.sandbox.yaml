@@ -1,0 +1,20 @@
+cluster: sandbox
+nodes:
+  - name: server
+    role: server
+    host: 192.168.139.82
+    port: 22
+    user: sandbox
+    key: test/sandbox/ssh/id_ed25519
+  - name: agent1
+    role: agent
+    host: 192.168.139.208
+    port: 22
+    user: sandbox
+    key: test/sandbox/ssh/id_ed25519
+  - name: agent2
+    role: agent
+    host: 192.168.139.96
+    port: 22
+    user: sandbox
+    key: test/sandbox/ssh/id_ed25519

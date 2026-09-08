@@ -1,0 +1,54 @@
+name: k3helper-sandbox
+
+services:
+  server:
+    build:
+      context: .
+      args:
+        UBUNTU_VERSION: "24.04"
+    image: k3helper-sandbox-vm
+    hostname: sandbox-server
+    container_name: sandbox-server
+    privileged: true
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    ports:
+      - "2221:22"
+    networks: [sandbox]
+    environment:
+      - container=docker
+
+  agent1:
+    image: k3helper-sandbox-vm
+    hostname: sandbox-agent1
+    container_name: sandbox-agent1
+    privileged: true
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    ports:
+      - "2222:22"
+    networks: [sandbox]
+    environment:
+      - container=docker
+    depends_on: [server]
+
+  agent2:
+    image: k3helper-sandbox-vm
+    hostname: sandbox-agent2
+    container_name: sandbox-agent2
+    privileged: true
+    cgroup: host
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    ports:
+      - "2223:22"
+    networks: [sandbox]
+    environment:
+      - container=docker
+    depends_on: [server]
+
+networks:
+  sandbox:
+    driver: bridge

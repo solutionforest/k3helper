@@ -1,0 +1,6 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken
+spec:
+  replicas: [this is not: valid yaml

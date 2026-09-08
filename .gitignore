@@ -1,0 +1,6 @@
+test/sandbox/ssh/id_ed25519
+test/sandbox/ssh/*.pub
+*.swp
+.DS_Store
+bin/
+sandbox-kubeconfig.yaml
