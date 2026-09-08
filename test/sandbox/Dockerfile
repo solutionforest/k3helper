@@ -16,12 +16,16 @@ RUN useradd -m -s /bin/bash -G sudo sandbox \
   && echo "sandbox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/sandbox
 
 # SSH: allow key + password auth, start sshd via systemd
-COPY sshd_config.d/*.conf /etc/sshd_config.d/
+COPY sshd_config.d/*.conf /etc/ssh/sshd_config.d/
 COPY ssh/authorized_keys /home/sandbox/.ssh/authorized_keys
 RUN chmod 700 /home/sandbox/.ssh \
   && chmod 600 /home/sandbox/.ssh/authorized_keys \
   && chown -R sandbox:sandbox /home/sandbox/.ssh \
   && mkdir -p /run/sshd
+
+# k3s needs these at runtime; installing them here keeps bootstrap offline-ish
+# and makes container start-up deterministic.
+RUN systemctl enable ssh
 
 # systemd expects to be PID 1
 STOPSIGNAL SIGRTMIN+3

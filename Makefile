@@ -100,20 +100,35 @@ bundle:
 clean:
 	rm -rf bin $(DIST)
 
-sandbox-up:
-	@test/sandbox/setup-orbstack.sh
-	@$(MAKE) --no-print-directory _write-targets sandbox-verify
+# The sandbox has two drivers, both of which run k3s successfully:
+#   orbstack — three Linux VMs; the default on macOS, and what a developer
+#              working on the host will usually already have.
+#   docker   — three privileged systemd containers; what CI uses, and the
+#              only option on a runner that cannot nest virtualisation.
+#
+# Override with SANDBOX_DRIVER=docker|orbstack.
+SANDBOX_DRIVER ?= $(shell \
+  if [ "$$(uname -s)" = "Darwin" ] && command -v orb >/dev/null 2>&1; then echo orbstack; \
+  elif command -v docker >/dev/null 2>&1; then echo docker; \
+  else echo orbstack; fi)
 
-_write-targets:
-	@S=$$(orb -m sandbox-server hostname -I | awk '{print $$1}'); \
-	A1=$$(orb -m sandbox-agent1 hostname -I | awk '{print $$1}'); \
-	A2=$$(orb -m sandbox-agent2 hostname -I | awk '{print $$1}'); \
-	printf 'cluster: sandbox\nnodes:\n  - name: server\n    role: server\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n  - name: agent1\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n  - name: agent2\n    role: agent\n    host: %s\n    port: 22\n    user: sandbox\n    key: test/sandbox/ssh/id_ed25519\n    insecure_host_key: true\n' $$S $$A1 $$A2 > $(TARGETS)
+sandbox-up:
+	@echo "sandbox driver: $(SANDBOX_DRIVER)"
+ifeq ($(SANDBOX_DRIVER),docker)
+	@test/sandbox/setup-docker.sh
+else
+	@test/sandbox/setup-orbstack.sh
+endif
+	@$(MAKE) --no-print-directory sandbox-verify
 
 sandbox-down:
+ifeq ($(SANDBOX_DRIVER),docker)
+	-docker compose -f test/sandbox/docker-compose.yml down -v --remove-orphans 2>/dev/null
+else
 	-orb delete sandbox-server --force 2>/dev/null
 	-orb delete sandbox-agent1 --force 2>/dev/null
 	-orb delete sandbox-agent2 --force 2>/dev/null
+endif
 
 sandbox-reset: sandbox-down sandbox-up
 

@@ -13,8 +13,6 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    ports:
-      - "2221:22"
     networks: [sandbox]
     environment:
       - container=docker
@@ -27,8 +25,6 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    ports:
-      - "2222:22"
     networks: [sandbox]
     environment:
       - container=docker
@@ -42,8 +38,6 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    ports:
-      - "2223:22"
     networks: [sandbox]
     environment:
       - container=docker

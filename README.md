@@ -494,7 +494,25 @@ sweep for a fast loop.
 
 The E2E script proves the whole loop: fresh VMs → check detects missing k3s → bootstrap → all green → gen/verify/deploy → doctor healthy → **inject faults (k3s stop, OOMKill) → doctor catches each → recover**.
 
-CI runs gofmt, `go vet` (including under the `integration` build tag, so those files cannot rot unnoticed), race-enabled unit tests, and a cross-compile on every push. The sandbox E2E needs OrbStack VMs, which GitHub-hosted runners cannot provide, so that job targets a self-hosted macOS runner and is skipped elsewhere rather than reported as passing.
+The sandbox has two drivers, selected automatically and overridable with
+`SANDBOX_DRIVER`:
+
+| Driver | Hosts | Where |
+|---|---|---|
+| `orbstack` | three Linux VMs | macOS default; what the E2E results above were produced on |
+| `docker` | three privileged systemd containers | Linux, and anywhere VMs are unavailable |
+
+The container driver provisions hosts correctly and k3s installs and reaches
+Ready on them, but it is **not yet proven end to end**: on the author's machine
+(Docker inside an OrbStack Linux VM) CoreDNS is repeatedly SIGTERMed because
+kubelet's probes cannot reach pod IPs through flannel. Whether a native Linux
+runner behaves the same is untested. The CI E2E job therefore runs on
+`workflow_dispatch` only — run it by hand to find out, rather than blocking
+every push on an unverified job. Promote it to `push` once it passes.
+
+CI on every push: gofmt, `go vet` (including under the `integration` build tag,
+so those files cannot rot unnoticed), race-enabled unit tests, and a
+cross-compile.
 
 Integration tests (`-tags=integration`) read node addresses from `test/sandbox/targets.sandbox.yaml` rather than hardcoding them, because OrbStack assigns new IPs each time the VMs are recreated. Point them at another cluster with `K3HELPER_TARGETS=/path/to/targets.yaml`. With no sandbox running they skip rather than fail.
 
@@ -541,7 +559,8 @@ Current, and worth knowing before pointing this at production:
 - [ ] HA control plane: multiple servers, `--cluster-init`, embedded etcd setup
 - [ ] Port-forward manager and multi-pod log tailing in the TUI
 - [ ] `doctor --watch` for continuous monitoring
-- [ ] Sandbox on Linux CI (k3s-in-docker) so the E2E can run on GitHub runners
+- [ ] Get the container sandbox passing the E2E so CI can run it on every push
+- [ ] HA control plane: multiple servers, `--cluster-init`, embedded etcd
 
 ## License
 

@@ -193,10 +193,14 @@ elsewhere rather than reported as passing.
 
 `test/sandbox/`: three OrbStack Linux VMs that behave like SSH-reachable hosts.
 
-> Docker containers were tried first and abandoned: they share the macOS
-> kernel, and kubelet's PLEG kills pods spuriously under it. Real lightweight
-> VMs avoid that. On a Linux CI runner the constraint does not apply, which is
-> what makes a k3s-in-docker port viable there.
+> Two drivers exist. `setup-orbstack.sh` creates VMs and is what the recorded
+> results were produced on. `setup-docker.sh` creates three privileged systemd
+> containers for hosts that cannot nest virtualisation.
+>
+> The container driver provisions correctly and k3s reaches Ready, but is not
+> yet proven end to end: CoreDNS is repeatedly SIGTERMed because kubelet probes
+> cannot reach pod IPs through flannel. That is why the CI E2E job is
+> dispatch-only rather than running on every push.
 
 - `setup-orbstack.sh` creates the VMs, installs sshd, provisions the `sandbox`
   user with passwordless sudo, and writes `targets.sandbox.yaml` with live IPs.

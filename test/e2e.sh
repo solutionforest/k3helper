@@ -57,11 +57,13 @@ K=bin/k3helper
 # ── 0. sandbox ────────────────────────────────────────────────────────────────
 if [ "$KEEP" = 0 ]; then
   step "0. Reset sandbox (3 fresh Ubuntu 24.04 VMs)"
+  # go through make so the OrbStack/Docker driver choice is made in one place
   make sandbox-down >/dev/null 2>&1
-  if ! test/sandbox/setup-orbstack.sh > /tmp/e2e-sandbox.log 2>&1; then
-    echo "sandbox setup failed:"; tail -8 /tmp/e2e-sandbox.log; exit 1
+  if ! make sandbox-up > /tmp/e2e-sandbox.log 2>&1; then
+    echo "sandbox setup failed:"; tail -12 /tmp/e2e-sandbox.log; exit 1
   fi
-  grep -q "sandbox ready" /tmp/e2e-sandbox.log && ok "3 VMs up, SSH verified"
+  grep -q "sandbox ready" /tmp/e2e-sandbox.log && ok "3 sandbox hosts up, SSH verified" \
+    || bad "sandbox did not report ready"
 fi
 
 read_host() { grep -A5 "name: $1\$" "$TARGETS" | grep 'host:' | head -1 | awk '{print $2}'; }
@@ -260,7 +262,16 @@ step "10. Multi-cluster contexts"
 OUT=$($K ctx -t "$WORK/multi.yaml" 2>&1)
 assert_contains "ctx lists both clusters" "$OUT" "elsewhere"
 assert_matches "and marks the current one" "$OUT" '\* +sandbox'
-$K doctor -t "$WORK/multi.yaml" >/dev/null 2>&1; assert_exit "default context targets the healthy sandbox" 0 $?
+# Assert which cluster the default context resolved to, not that it is
+# healthy: this step runs while earlier steps' resources are still being torn
+# down, and cluster health is asserted properly in step 11.
+DOC=$($K doctor -t "$WORK/multi.yaml" --json 2>&1) || true
+assert_not_contains "default context reached the sandbox, not the unreachable cluster" "$DOC" "node.unreachable"
+# With the *server* unreachable there is no kubectl to gather through, so
+# doctor fails to connect rather than emitting a per-node finding. Asserting
+# the address proves the context actually switched clusters.
+DOC=$($K doctor -t "$WORK/multi.yaml" --context elsewhere 2>&1) || true
+assert_contains "--context elsewhere targets the other cluster's server" "$DOC" "10.255.255.1"
 OUT=$($K check -t "$WORK/multi.yaml" --context nope 2>&1)
 assert_contains "an unknown context lists the real ones" "$OUT" "have: sandbox, elsewhere"
 
