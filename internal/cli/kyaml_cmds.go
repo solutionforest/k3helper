@@ -117,6 +117,12 @@ func newGenCmd() *cobra.Command {
 		replicas  int
 		port      int
 		outPath   string
+
+		pullSecret   string
+		registryHost string
+		registryUser string
+		registryPass string
+		registryMail string
 	)
 	cmd := &cobra.Command{
 		Use:   "gen <kind> <name>",
@@ -124,12 +130,17 @@ func newGenCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, err := kyaml.Generate(kyaml.GenParams{
-				Kind:      args[0],
-				Name:      args[1],
-				Namespace: namespace,
-				Image:     image,
-				Replicas:  replicas,
-				Port:      port,
+				Kind:             args[0],
+				Name:             args[1],
+				Namespace:        namespace,
+				Image:            image,
+				Replicas:         replicas,
+				Port:             port,
+				ImagePullSecret:  pullSecret,
+				Registry:         registryHost,
+				RegistryUser:     registryUser,
+				RegistryPassword: registryPass,
+				RegistryEmail:    registryMail,
 			})
 			if err != nil {
 				return err
@@ -150,5 +161,12 @@ func newGenCmd() *cobra.Command {
 	cmd.Flags().IntVarP(&replicas, "replicas", "r", 1, "replica count")
 	cmd.Flags().IntVarP(&port, "port", "p", 80, "port")
 	cmd.Flags().StringVarP(&outPath, "out", "o", "", "write to file instead of stdout")
+	cmd.Flags().StringVar(&pullSecret, "image-pull-secret", "",
+		"name of a pull secret to reference from the generated pod spec")
+	cmd.Flags().StringVar(&registryHost, "docker-registry", "",
+		"generate a registry pull secret for this host (with `gen secret <name>`)")
+	cmd.Flags().StringVar(&registryUser, "registry-user", "", "username for --docker-registry")
+	cmd.Flags().StringVar(&registryPass, "registry-password", "", "password for --docker-registry")
+	cmd.Flags().StringVar(&registryMail, "registry-email", "", "email for --docker-registry (optional; some registries want one)")
 	return cmd
 }

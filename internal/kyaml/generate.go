@@ -1,6 +1,8 @@
 package kyaml
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -18,7 +20,22 @@ type GenParams struct {
 	Port       int
 	TargetPort int // for services; defaults to Port
 	Labels     map[string]string
+
+	// ImagePullSecret names a Secret to add to every generated pod spec, for
+	// images that come from a registry the cluster needs credentials for.
+	ImagePullSecret string
+
+	// Registry turns a generated Secret into a
+	// kubernetes.io/dockerconfigjson pull secret rather than an Opaque one.
+	Registry         string
+	RegistryUser     string
+	RegistryPassword string
+	RegistryEmail    string
 }
+
+// isPullSecret reports whether the Secret being generated is a registry pull
+// secret.
+func (p GenParams) isPullSecret() bool { return p.Registry != "" }
 
 // object is a manifest under construction. Building a map and marshalling it
 // guarantees well-formed YAML: nothing here does indentation arithmetic.
@@ -91,6 +108,20 @@ func specFor(p GenParams) (object, error) {
 		return object{"data": object{"key": "value"}}, nil
 
 	case "Secret":
+		if p.isPullSecret() {
+			doc, err := dockerConfigJSON(p)
+			if err != nil {
+				return nil, err
+			}
+			// stringData, not data: the API server base64-encodes it, and the
+			// manifest stays readable to whoever has to review it. The
+			// credential is in there either way — base64 is not encryption,
+			// which is why this belongs in a file you apply and delete.
+			return object{
+				"type":       "kubernetes.io/dockerconfigjson",
+				"stringData": object{".dockerconfigjson": doc},
+			}, nil
+		}
 		return object{
 			"type":       "Opaque",
 			"stringData": object{"key": "value"},
@@ -107,7 +138,7 @@ func specFor(p GenParams) (object, error) {
 		}}, nil
 
 	case "Pod":
-		return object{"spec": podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "")}, nil
+		return object{"spec": podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "", p.ImagePullSecret)}, nil
 
 	case "PersistentVolumeClaim":
 		return object{"spec": object{
@@ -119,7 +150,7 @@ func specFor(p GenParams) (object, error) {
 		return object{"spec": object{
 			"replicas": p.Replicas,
 			"selector": object{"matchLabels": labels},
-			"template": podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "")),
+			"template": podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "", p.ImagePullSecret)),
 		}}, nil
 
 	case "StatefulSet":
@@ -127,7 +158,7 @@ func specFor(p GenParams) (object, error) {
 			"replicas":    p.Replicas,
 			"serviceName": p.Name,
 			"selector":    object{"matchLabels": labels},
-			"template":    podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "")),
+			"template":    podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "", p.ImagePullSecret)),
 		}}, nil
 
 	case "DaemonSet":
@@ -135,7 +166,7 @@ func specFor(p GenParams) (object, error) {
 		// spec.replicas as an unknown field.
 		return object{"spec": object{
 			"selector": object{"matchLabels": labels},
-			"template": podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "")),
+			"template": podTemplate(labels, podSpec(p.Name, imageOr(p.Image, "nginx:latest"), p.TargetPort, "", p.ImagePullSecret)),
 		}}, nil
 
 	case "Job":
@@ -210,7 +241,7 @@ func imageOr(img, def string) string {
 
 // podSpec builds a pod spec with one container. restartPolicy is omitted when
 // empty (deployments and friends only accept the default "Always").
-func podSpec(name, image string, port int, restartPolicy string) object {
+func podSpec(name, image string, port int, restartPolicy, pullSecret string) object {
 	container := object{"name": name, "image": image}
 	if port > 0 {
 		container["ports"] = []interface{}{object{"containerPort": port}}
@@ -219,7 +250,37 @@ func podSpec(name, image string, port int, restartPolicy string) object {
 	if restartPolicy != "" {
 		spec["restartPolicy"] = restartPolicy
 	}
+	if pullSecret != "" {
+		spec["imagePullSecrets"] = []interface{}{object{"name": pullSecret}}
+	}
 	return spec
+}
+
+// dockerConfigJSON renders the .dockerconfigjson body of a pull secret.
+//
+// The auth field is base64 of "user:password", which is what every registry
+// client expects and what makes this a credential to handle carefully rather
+// than a config file.
+func dockerConfigJSON(p GenParams) (string, error) {
+	if p.RegistryUser == "" || p.RegistryPassword == "" {
+		return "", fmt.Errorf("a pull secret for %s needs a username and a password", p.Registry)
+	}
+	entry := map[string]string{
+		"username": p.RegistryUser,
+		"password": p.RegistryPassword,
+		"auth": base64.StdEncoding.EncodeToString(
+			[]byte(p.RegistryUser + ":" + p.RegistryPassword)),
+	}
+	if p.RegistryEmail != "" {
+		entry["email"] = p.RegistryEmail
+	}
+	out, err := json.Marshal(map[string]interface{}{
+		"auths": map[string]interface{}{p.Registry: entry},
+	})
+	if err != nil {
+		return "", fmt.Errorf("render dockerconfigjson: %w", err)
+	}
+	return string(out), nil
 }
 
 func podTemplate(labels object, spec object) object {
@@ -232,7 +293,7 @@ func podTemplate(labels object, spec object) object {
 // jobPodTemplate is a run-to-completion pod template. Jobs require a
 // restartPolicy of Never or OnFailure; the "Always" default is rejected.
 func jobPodTemplate(p GenParams, labels object) object {
-	spec := podSpec(p.Name, imageOr(p.Image, "busybox:latest"), 0, "Never")
+	spec := podSpec(p.Name, imageOr(p.Image, "busybox:latest"), 0, "Never", p.ImagePullSecret)
 	containers := spec["containers"].([]interface{})
 	containers[0].(object)["command"] = []interface{}{"sh", "-c", "echo done"}
 	return podTemplate(labels, spec)
