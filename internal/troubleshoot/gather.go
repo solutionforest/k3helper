@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/solutionforest/k3helper/internal/check"
 	"github.com/solutionforest/k3helper/internal/kube"
 	"github.com/solutionforest/k3helper/internal/ssh"
 )
@@ -77,32 +78,34 @@ func (g Gatherer) Collect() Evidence {
 	// --- host layer via SSH ---
 	for name, exec := range g.Hosts {
 		// probe the correct unit for the node's role: agents run "k3s-agent",
-		// servers run "k3s". Pick the unit that actually exists on this node
-		// (piping is-active would mask the exit code, so branch on unit presence).
+		// servers run "k3s". Pick the unit that actually exists on this node.
 		// `systemctl is-active` prints "inactive" for a unit that was never
 		// installed, so a not-installed node used to be diagnosed as "restart
 		// k3s". Ask which unit exists first, and report "" when none does.
 		//
-		// is-active needs no privileges; the old `sudo -n` meant that on a
-		// host without passwordless sudo the *error text* became the recorded
-		// state, which is neither "active" nor "" and so read as a fault.
-		out, _, err := exec.Run(
-			`if systemctl list-unit-files k3s-agent.service --no-legend 2>/dev/null | grep -q k3s-agent; then ` +
-				`systemctl is-active k3s-agent 2>/dev/null; ` +
-				`elif systemctl list-unit-files k3s.service --no-legend 2>/dev/null | grep -q k3s; then ` +
-				`systemctl is-active k3s 2>/dev/null; ` +
-				`else echo __absent__; fi`)
-		state := strings.TrimSpace(out)
-		switch {
-		case err != nil, state == "", state == "__absent__":
-			e.K3sService[name] = "" // not installed, or could not be determined
-		case isServiceState(state):
-			e.K3sService[name] = state
-		default:
-			// Unrecognised output (a sudo prompt, a permission error): record
-			// nothing rather than inventing a fault.
-			e.probeFailed("k3s-service:"+name, state)
+		// Presence is read from the filesystem and the state is asked with and
+		// without sudo, because neither query works everywhere: a host without
+		// passwordless sudo answers only the unprivileged one, and a login
+		// that cannot reach the systemd bus answers only the privileged one.
+		// Getting this wrong is not cosmetic — it reported "k3s is not
+		// installed" for a node whose k3s was up, and hid a stopped agent.
+		unit := ""
+		for _, candidate := range []string{"k3s-agent", "k3s"} {
+			if check.UnitPresent(exec, candidate) {
+				unit = candidate
+				break
+			}
+		}
+		if unit == "" {
+			e.K3sService[name] = "" // not installed
+		} else if s, problem := check.ServiceState(exec, unit); s == "" {
+			// Could not be determined: record nothing rather than inventing a
+			// fault, but say that a probe failed so the diagnosis is not
+			// mistaken for a clean bill of health.
+			e.probeFailed("k3s-service:"+name, problem)
 			e.K3sService[name] = ""
+		} else {
+			e.K3sService[name] = s
 		}
 		if m, ok := hostMetric(exec); ok {
 			e.HostMetrics[name] = m
@@ -128,31 +131,23 @@ func (g Gatherer) Collect() Evidence {
 
 // isServiceState reports whether out is something `systemctl is-active`
 // actually prints, as opposed to an error from the shell.
-func isServiceState(out string) bool {
-	switch out {
-	case "active", "inactive", "failed", "activating", "deactivating",
-		"reloading", "unknown", "maintenance":
-		return true
-	}
-	return false
-}
+func isServiceState(out string) bool { return check.IsServiceState(out) }
 
 // runtimeState reports the container runtime unit's state. k3s embeds
 // containerd inside its own unit, so an absent containerd.service is normal
 // there and reported as "" (no evidence) rather than a fault.
 func runtimeState(exec ssh.Executor) (string, bool) {
-	out, _, err := exec.Run(
-		`for u in containerd cri-o docker; do ` +
-			`if systemctl list-unit-files $u.service --no-legend 2>/dev/null | grep -q $u; then ` +
-			`echo "$u=$(systemctl is-active $u 2>/dev/null)"; break; fi; done`)
-	if err != nil {
-		return "", false
+	for _, unit := range []string{"containerd", "cri-o", "docker"} {
+		if !check.UnitPresent(exec, unit) {
+			continue
+		}
+		state, _ := check.ServiceState(exec, unit)
+		if state == "" {
+			return "", false
+		}
+		return unit + "=" + state, true
 	}
-	s := strings.TrimSpace(out)
-	if s == "" {
-		return "", false
-	}
-	return s, true
+	return "", false
 }
 
 // clockSkew measures the node's clock against this machine's. Certificates

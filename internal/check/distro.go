@@ -43,15 +43,73 @@ func (d Distro) Kubeconfig() string {
 	return ""
 }
 
-// unitPresent reports whether a systemd unit file exists on the node.
-// `systemctl is-active` prints "inactive" for a unit that was never
-// installed, so presence has to be asked separately — that ambiguity is why
-// a missing k3s used to be reported as "restart the service" rather than
-// "install it".
-func unitPresent(exec Executor, unit string) bool {
+// UnitPresent reports whether a systemd unit file exists on the node.
+//
+// `systemctl is-active` prints "inactive" for a unit that was never installed,
+// so presence has to be asked separately — that ambiguity is why a missing k3s
+// used to be reported as "restart the service" rather than "install it".
+//
+// It asks the filesystem first and systemd second. `systemctl` talks to the
+// system bus, and an SSH user who cannot reach that bus — a host without
+// dbus, a locked-down login — gets "Failed to connect to bus" for every
+// query. Reading that as "the unit does not exist" told operators k3s was not
+// installed on nodes where k3s was running and serving traffic.
+func UnitPresent(exec Executor, unit string) bool {
 	out, _, err := exec.Run(fmt.Sprintf(
-		`systemctl list-unit-files %s.service --no-legend 2>/dev/null | head -1`, unit))
+		`ls /etc/systemd/system/%[1]s.service /run/systemd/system/%[1]s.service `+
+			`/lib/systemd/system/%[1]s.service /usr/lib/systemd/system/%[1]s.service 2>/dev/null | head -1`,
+		unit))
+	if err == nil && strings.TrimSpace(out) != "" {
+		return true
+	}
+	// A unit can also be generated at runtime and never written to any of
+	// those directories, so fall back to systemd's own view — with sudo,
+	// which is the path that still works when the login's bus access does not.
+	out, _, err = exec.Run(fmt.Sprintf(
+		`sudo -n systemctl list-unit-files %s.service --no-legend 2>/dev/null | head -1`, unit))
 	return err == nil && strings.Contains(out, unit)
+}
+
+// unitPresent is the unexported spelling the checks in this package use.
+func unitPresent(exec Executor, unit string) bool { return UnitPresent(exec, unit) }
+
+// ServiceState returns what `systemctl is-active` says about a unit.
+//
+// It tries unprivileged first and privileged second, and returns an empty
+// state with the explanation when neither produced something systemd actually
+// prints. Both halves matter: a host without passwordless sudo answers only
+// the first, a host whose login cannot reach the system bus answers only the
+// second, and inventing a state from an error message would report a running
+// service as down.
+func ServiceState(exec Executor, unit string) (state, problem string) {
+	for _, cmd := range []string{
+		fmt.Sprintf(`systemctl is-active %s 2>&1`, unit),
+		fmt.Sprintf(`sudo -n systemctl is-active %s 2>&1`, unit),
+	} {
+		out, _, err := exec.Run(cmd)
+		s := strings.TrimSpace(out)
+		if err == nil && IsServiceState(s) {
+			return s, ""
+		}
+		if s != "" {
+			problem = s
+		}
+	}
+	if problem == "" {
+		problem = "systemctl produced no output"
+	}
+	return "", problem
+}
+
+// IsServiceState reports whether out is something `systemctl is-active`
+// actually prints, as opposed to an error from the shell or the bus.
+func IsServiceState(out string) bool {
+	switch out {
+	case "active", "inactive", "failed", "activating", "deactivating",
+		"reloading", "unknown", "maintenance":
+		return true
+	}
+	return false
 }
 
 // DetectDistro works out which distribution a node runs by looking for the
@@ -106,14 +164,15 @@ func (c ServiceCheck) Run(ctx Context) Result {
 			missing = append(missing, unit)
 			continue
 		}
-		out, code, err := ctx.Exec.Run(fmt.Sprintf(`sudo -n systemctl is-active %s 2>/dev/null`, unit))
-		if err != nil && code == -1 {
+		state, problem := ServiceState(ctx.Exec, unit)
+		if state == "" {
+			// Neither query answered: say so rather than reporting a unit
+			// whose state is unknown as one that is down.
 			res.Status = Skip
-			res.Summary = "systemctl unavailable"
-			res.Details = out
+			res.Summary = "could not read the state of " + unit
+			res.Details = problem
 			return res
 		}
-		state := strings.TrimSpace(out)
 		evidence = append(evidence, unit+"="+state)
 		if state != "active" {
 			inactive = append(inactive, fmt.Sprintf("%s is %s", unit, state))
@@ -156,11 +215,11 @@ func (c K3sServiceCheck) Run(ctx Context) Result {
 	if c.Role == "agent" {
 		unit = "k3s-agent"
 	}
-	out, code, err := ctx.Exec.Run(fmt.Sprintf(`sudo -n systemctl is-active %s 2>/dev/null`, unit))
-	active := strings.TrimSpace(out)
-	if err != nil && code == -1 {
+	active, problem := ServiceState(ctx.Exec, unit)
+	out := active
+	if active == "" {
 		return Result{ID: c.ID(), Category: c.Category(), Name: c.Name(), Status: Skip,
-			Summary: "systemctl unavailable", Details: out}
+			Summary: "could not read the state of " + unit, Details: problem}
 	}
 	switch {
 	case active == "active":
