@@ -6,14 +6,15 @@
 k3helper is a portable k3s/kubernetes helper with a TUI.
 
   init        create a targets.yaml describing your nodes
-  vm setup    install k3s on target VMs over SSH
+  vm setup    install k3s or kubeadm on target VMs over SSH
   verify      validate Kubernetes YAML manifests
   gen         generate correct Kubernetes YAML
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
-  doctor      troubleshoot: find issues + remediation (--watch to keep watching)
+  doctor      troubleshoot: find issues + remediation (--watch to keep looking)
+  registry    configure the private registries the cluster pulls from
   ctx         list clusters defined in the targets file
-  tui         launch the interactive dashboard
+  tui         interactive dashboard + resource browser
 ```
 
 ## Why
@@ -271,6 +272,83 @@ k3helper doctor -t targets.yaml --context staging
 
 `--context` works on every subcommand. The single-cluster format (`cluster:` and `nodes:` at the top level) keeps working unchanged — a one-cluster file never has to grow a list.
 
+### 5b. Private registries
+
+Declare the registries the cluster pulls from in the targets file. They apply
+to every node — a mirror configured on two machines out of three produces pods
+that run in some places and not others, which is a miserable thing to debug.
+
+```yaml
+cluster: prod
+registries:
+  - host: docker-registry.example.net       # as it appears in an image reference
+    username: ci
+    password_env: REGISTRY_PASSWORD         # read from the environment, not stored here
+    ca_file: /etc/ssl/certs/internal-ca.crt # path ON THE NODES
+nodes:
+  - name: server-1
+    ...
+```
+
+`vm setup` writes them during the install, before the first image pull. For a
+cluster that already exists:
+
+```bash
+export REGISTRY_PASSWORD=...
+k3helper registry apply -t targets.yaml
+```
+
+That writes `/etc/rancher/k3s/registries.yaml` (mode 0600, root-owned) on every
+node and restarts k3s, because k3s does not re-read the file on its own — an
+apply without the restart changes nothing you can observe. `registry show`
+prints what would be written with the password redacted, for pasting into a
+ticket. `--no-restart` if you would rather pick the moment.
+
+The password never reaches a command line: the file is staged with 0600 and
+installed with `sudo`, because a `sudo tee` pipeline puts the credential in
+`ps` output for every user on the machine.
+
+One-off, without editing the file:
+
+```bash
+k3helper registry apply -t targets.yaml \
+  --registry docker-registry.example.net --registry-user ci --registry-password "$PW"
+```
+
+**Mirroring a public registry** — point a well-known name somewhere else:
+
+```yaml
+registries:
+  - host: docker.io
+    endpoint: https://mirror.example.net:5000
+```
+
+**Self-signed certificate**: prefer `ca_file` with the CA copied to the nodes.
+`insecure_skip_verify: true` exists for throwaway registries and accepts any
+certificate, including one presented by something that is not your registry. If
+the registry speaks plain HTTP, set `endpoint: http://...` rather than turning
+verification off.
+
+**Per-workload credentials** instead of cluster-wide:
+
+```bash
+k3helper gen secret sf-registry --docker-registry docker-registry.example.net \
+  --registry-user ci --registry-password "$PW" > pull-secret.yaml
+k3helper deploy -f pull-secret.yaml -t targets.yaml
+k3helper gen deployment web -i docker-registry.example.net/app:1.2 --image-pull-secret sf-registry
+```
+
+**kubeadm nodes** get mirrors, CAs and `insecure_skip_verify` written to
+containerd's `/etc/containerd/certs.d`. Credentials there are *refused* rather
+than written: containerd's auth schema moved between 1.x and 2.x, and writing
+one we cannot verify on the node fails silently at pull time. Use a pull secret
+— the error says so.
+
+`check` validates what is on the node: a `registries.yaml` that does not parse
+(k3s ignores the whole file, and every private pull silently becomes an
+anonymous public one), a `ca_file` that was never copied, TLS verification left
+off.
+
 ### 6. Find issues fast
 
 ```bash
@@ -293,6 +371,7 @@ Doctor gathers evidence across every layer — VM host (`df`, `free`, cgroups, s
 | Layer | Signatures |
 |---|---|
 | Workload | ImagePullBackOff · CrashLoopBackOff · OOMKilled · unschedulable (resources/taints/cordon) · running but never ready · evicted |
+| Registry | credentials rejected · certificate not trusted · registry unreachable from the node |
 | Node | service down · NotReady with a running service · container runtime down · DiskPressure · MemoryPressure · clock skew · image-cache bloat · unreachable over SSH |
 | Cluster | embedded-etcd quorum lost or at risk · TLS certificates expiring · kubeconfig/auth broken · evidence that could not be gathered |
 | Network / storage | CoreDNS has no ready replicas · Services with no ready endpoints · PVC stuck Pending |
@@ -301,6 +380,13 @@ Ranking is by confidence, so a cause floats above the symptoms it produces: a
 stopped k3s outranks "kubeconfig invalid", a CoreDNS outage outranks the
 Services it takes down, and a crashlooping pod outranks its Service having no
 endpoints.
+
+The same rule splits image-pull failures. `ImagePullBackOff` is one symptom of
+four different problems — a typo in the tag, a missing credential, an untrusted
+CA, a registry the nodes cannot reach — and the kubelet records which in the
+event text. When it does, that cause is reported above the generic finding,
+with the fix for *that* cause. Sending someone to check credentials when the
+name never resolved is the failure this avoids.
 
 Signatures stay silent rather than guessing when the evidence they need is
 absent — a sqlite-backed single-server cluster has no etcd, so the quorum
@@ -586,6 +672,7 @@ make bundle          # offline paste bundle (see the browser-console section)
 | Fault | Expected signature |
 |---|---|
 | `imagepull` · `crashloop` · `oom` | `pod.imagepull` · `pod.crashloop` · `pod.oom` |
+| `registry` | `registry.unreachable` — a registry the node cannot resolve, told apart from a missing image |
 | `pending` · `cordon` | `pod.pending-sched` |
 | `pvc-pending` | `storage.pvc-pending` |
 | `coredns` · `empty-endpoints` | `network.coredns` · `network.empty-endpoints` |

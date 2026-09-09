@@ -2,21 +2,21 @@ cluster: sandbox
 nodes:
   - name: server
     role: server
-    host: 192.168.139.28
+    host: 192.168.139.52
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519
     insecure_host_key: true
   - name: agent1
     role: agent
-    host: 192.168.139.119
+    host: 192.168.139.236
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519
     insecure_host_key: true
   - name: agent2
     role: agent
-    host: 192.168.139.175
+    host: 192.168.139.125
     port: 22
     user: sandbox
     key: test/sandbox/ssh/id_ed25519

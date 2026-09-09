@@ -4,6 +4,89 @@ Notable changes per release. The release workflow publishes the section
 matching the tag it is building, so this file is the source of the release
 notes on GitHub.
 
+## v0.4.0
+
+Private registries: declared once, applied to every node, and diagnosed
+properly when a pull fails.
+
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solutionforest/k3helper/main/install.sh | sh
+```
+
+Or take a single binary — `k3helper-{linux,darwin}-{amd64,arm64}`, each listed
+in `checksums.txt`. No breaking changes from v0.3.0.
+
+### Registries in the targets file
+
+```yaml
+registries:
+  - host: docker-registry.example.net
+    username: ci
+    password_env: REGISTRY_PASSWORD          # read from the environment, not stored here
+    ca_file: /etc/ssl/certs/internal-ca.crt  # path ON THE NODES
+```
+
+Cluster-level, not per-node: a mirror configured on two machines out of three
+produces pods that run in some places and not others.
+
+- `vm setup` writes them **before** the install — the first thing a fresh node
+  does is pull images, so a mirror applied afterwards is too late for exactly
+  the pulls an air-gapped or credentialled environment needs it for.
+- `k3helper registry apply` pushes them to a cluster that already exists and
+  restarts k3s, which does not re-read the file on its own. `--no-restart` to
+  pick your own moment; `registry show` prints what would be written with the
+  password redacted.
+- `password_env` keeps the credential out of a file that goes into a
+  repository. An unset variable fails at apply time rather than becoming an
+  anonymous pull that fails later, on another machine, as "unauthorized".
+- The password never reaches a command line: the file is staged 0600 and
+  installed with sudo, because a `sudo tee` pipeline puts the credential in
+  `ps` output for every user on the machine.
+- One-off without editing the file: `--registry`, `--registry-user`,
+  `--registry-password`, `--registry-ca-file`, `--registry-insecure`.
+
+### Pull secrets and imagePullSecrets
+
+```bash
+k3helper gen secret sf-registry --docker-registry docker-registry.example.net \
+  --registry-user ci --registry-password "$PW"
+k3helper gen deployment web -i docker-registry.example.net/app:1.2 --image-pull-secret sf-registry
+```
+
+`--image-pull-secret` reaches the pod spec of every kind that has one.
+
+### ImagePullBackOff now says *why*
+
+Three new signatures — `registry.auth`, `registry.cert`,
+`registry.unreachable` — read the reason out of the kubelet's pull-failure
+events and rank above the generic `pod.imagepull`, which is demoted when a
+cause is known. One symptom covered four different problems and four different
+fixes; sending someone to check credentials when the registry name never
+resolved was the failure worth removing.
+
+`check` gained `registry.config`, which catches what only shows up at pull
+time: a `registries.yaml` that does not parse (k3s ignores the whole file, so
+every private pull silently becomes an anonymous public one), a `ca_file` that
+was never copied to the node, TLS verification left off.
+
+### kubeadm
+
+Mirrors, CAs and `insecure_skip_verify` are written to containerd's
+`/etc/containerd/certs.d`, and containerd is pointed at that directory —
+without which the files are written and ignored. Credentials on this path are
+refused rather than written: containerd's auth schema moved between 1.x and
+2.x, and writing one we cannot verify on the node fails silently at pull time.
+The error names the alternative.
+
+### Fixed
+
+A `registries:` block in a single-cluster targets file was parsed and then
+dropped on load, so it configured nothing. Registries can also be declared at
+file level in a multi-cluster file, where they apply to every cluster that
+does not declare its own.
+
 ## v0.3.0
 
 The TUI grew from four views to fifteen, CI now runs the whole product on

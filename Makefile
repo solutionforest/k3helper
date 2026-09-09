@@ -1,5 +1,5 @@
 BINARY     := k3helper
-VERSION    := 0.3.0
+VERSION    := 0.4.0
 VERPKG     := github.com/solutionforest/k3helper/internal/cli.version
 LDFLAGS    := -ldflags "-X $(VERPKG)=$(VERSION)"
 # -s -w strips the symbol table and DWARF: ~25% smaller downloads, and Go

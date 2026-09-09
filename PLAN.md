@@ -52,6 +52,37 @@ exit code. `--json` for scripts.
 - Shared bootstrap path as the single source of truth for the k3s install
   (k3sup-proven pattern).
 
+### 3b. Private registries
+Cluster-level, declared once in the targets file and applied to every node —
+a mirror on two nodes out of three produces pods that run in some places and
+not others.
+
+- **k3s**: `/etc/rancher/k3s/registries.yaml` (mirrors, auth, CA/TLS), written
+  0600 and root-owned. `vm setup` writes it before the install, because the
+  first thing a fresh node does is pull images. `registry apply` writes it to
+  an existing cluster and restarts k3s, which does not re-read the file.
+- **kubeadm**: containerd's `/etc/containerd/certs.d/<host>/hosts.toml`, plus
+  pointing containerd's `config_path` at it — files there are ignored
+  otherwise. Credentials are **refused** on this path rather than written:
+  containerd's auth schema moved between 1.x and 2.x, and writing one we
+  cannot verify on the node fails silently at pull time. The error names the
+  alternative.
+- **Secrets stay out of the file**: `password_env` names an environment
+  variable. An unset variable is an error at apply time, not an anonymous pull
+  that fails later on another machine as "unauthorized".
+- **Never on a command line.** The file is staged 0600 and installed with
+  sudo; `sudo tee` would put the credential in `ps` for every user on the box.
+- **Per workload**: `gen secret --docker-registry` produces a
+  `kubernetes.io/dockerconfigjson` Secret, and `--image-pull-secret` adds
+  `imagePullSecrets` to every generated pod spec.
+- **Diagnosis**: `registry.auth`, `registry.cert` and `registry.unreachable`
+  read the reason out of the kubelet's pull-failure events and rank above the
+  generic `pod.imagepull`, which is demoted when a cause is known. Four
+  problems wearing one symptom, and four different fixes.
+- **`check`** validates the file on the node: unparseable YAML (k3s ignores
+  the whole file, so every private pull silently becomes an anonymous public
+  one), a `ca_file` that was never copied, verification left off.
+
 ### 4. Quick deploy
 `k3helper deploy -f <file>` → dry-run → confirm → apply → wait for rollout → report.
 
@@ -171,6 +202,7 @@ titles, so rewording a finding cannot silently break the suite.
 | `coredns` | scale CoreDNS to zero | `network.coredns` |
 | `empty-endpoints` | Service whose selector matches nothing | `network.empty-endpoints` |
 | `bad-kubeconfig` | corrupt `k3s.yaml` | `cluster.kubeconfig` |
+| `registry` | pod pulling from `registry.invalid` | `registry.unreachable` |
 
 Each is `make fault-<name>`, with `make fault-list` and `make fault-clean`.
 
@@ -361,6 +393,8 @@ scripts/bundle.sh
    without the API server. ✅
 10. **kubeadm** — a second distribution behind the same commands. ✅
 11. **Linux CI sandbox** — the container driver runs the full E2E. ✅
+12. **Private registries** — targets-file declaration, `registry apply`,
+    pull-secret generation, node-side check, three diagnosis signatures. ✅
 
 Remaining: nothing from the original scope. Open items are new asks, tracked
 under "Open questions" below.
@@ -397,15 +431,7 @@ No existing tool spans **VM host layer → k3s service → cluster → workloads
 
 ## Open questions
 
-1. **Private registries.** k3s reads `/etc/rancher/k3s/registries.yaml` for
-   mirrors, credentials and CA/TLS settings; k3helper does not write it. The
-   shape of the work is clear — `vm setup --registry/--registry-user/
-   --registry-password` writing that file on every node before the install,
-   `gen secret --docker-registry` for the per-workload path, and splitting
-   today's single `pod.imagepull` signature into `registry.auth` (a 401),
-   `registry.unreachable` (DNS or connection) and `registry.cert` (an untrusted
-   CA), which are three different fixes wearing one message today. Not started.
-2. **Docker Swarm.** Asked about; out of scope as a managed platform — every
+1. **Docker Swarm.** Asked about; out of scope as a managed platform — every
    layer here speaks kubectl, and Swarm shares no API with it. k3helper itself
    runs fine *on* a Swarm host (static binary, SSH out), but installing k3s
    alongside Swarm on the same machines contends for iptables rules and ports
