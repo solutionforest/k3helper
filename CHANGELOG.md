@@ -4,6 +4,95 @@ Notable changes per release. The release workflow publishes the section
 matching the tag it is building, so this file is the source of the release
 notes on GitHub.
 
+## v0.2.0
+
+Bootstrapping now covers both distributions k3helper can already diagnose, and
+a control plane can be more than one machine.
+
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solutionforest/k3helper/main/install.sh | sh
+```
+
+Or take a single binary — `k3helper-{linux,darwin}-{amd64,arm64}`, each listed
+in `checksums.txt`. No breaking changes from v0.1.0.
+
+### HA control plane
+
+Give the targets file more than one `role: server` node and `vm setup` builds
+an embedded-etcd control plane: the first is installed with `--cluster-init`,
+the rest join with `--server`, **one at a time** — etcd learners join
+sequentially and a batch of them can cost quorum. A single server keeps k3s's
+default sqlite datastore.
+
+An even number of servers is refused with an explanation rather than quietly
+built: four tolerate the same single failure as three, and lose quorum at two.
+
+### vm setup for kubeadm
+
+```bash
+k3helper vm setup -t targets.yaml --distro kubeadm --k8s-version v1.31 --cni flannel
+```
+
+Prepares each host — containerd with the systemd cgroup driver, kernel modules,
+sysctls, the Kubernetes apt repository, and the packages kubeadm needs and does
+not install itself (`conntrack`, `socat`, `ethtool`) — then runs `kubeadm init`,
+installs a CNI, and joins the workers.
+
+`--no-conntrack-tuning` is needed where `/proc/sys/net/netfilter` is read-only
+or capped below what kube-proxy wants: nested VMs, containers, some managed
+images. kube-proxy raises that sysctl at startup and **exits** if the write is
+refused, which stops Service routing, which then stops the CNI reaching the API
+service. What you see is a crashlooping CNI, nowhere near the cause.
+
+kubeadm HA is not supported: joining more control-plane nodes needs
+`--upload-certs` and an endpoint in front of the API servers. `vm setup` says
+so rather than building half of it.
+
+### doctor
+
+- `--watch 30s` re-runs on an interval, redrawing in full only when the verdict
+  changes so a long watch does not bury the moment things went wrong. It
+  reconnects each pass: a node going away is one of the things being watched
+  for, and a held-open connection would keep reporting the state it last saw.
+- **etcd quorum is now assessed without a working API server.** Losing quorum
+  is exactly what stops the API server answering, so asking it about its own
+  members failed in the case that mattered most. It now falls back to the host
+  layer — how many control-plane nodes have a running service, counting
+  unreachable ones against quorum too.
+- A NotReady node and a stopped service on the same machine no longer produce
+  two findings for one fault. Cluster evidence names nodes as Kubernetes does
+  (`sandbox-agent2`); host evidence uses the targets file's name (`agent2`).
+  Nothing bridged the two.
+
+### TUI
+
+- `:ports` — a port-forward manager. `f` on a pod starts `kubectl port-forward`
+  on the cluster node **and** an SSH tunnel to it, because kubectl binds on the
+  node it runs on; without the tunnel the port is open there and not on your
+  machine. The list shows the local address to connect to, and `x` tears one
+  down — remote process and tunnel both.
+- `:logs` — tails every pod matching the current filter and labels each line
+  with the pod that wrote it. Changing the filter re-tails.
+
+### Testing
+
+The sandbox has a second driver: three privileged systemd containers, for hosts
+that cannot nest virtualisation. It provisions correctly and k3s reaches Ready,
+but **pod networking does not work there** — pods get addresses from the
+flannel range that nothing can reach, not even their own node, so readiness
+probes fail. Mounting `/lib/modules` removed one real blocker; what remains is
+container-in-container CNI. The CI E2E job stays `workflow_dispatch`-only and
+labelled unproven rather than reporting a pass nobody has seen.
+
+Verified for this release against the sandbox: a 3-server embedded-etcd cluster
+built by this code (stopping one member reports etcd degraded under the stopped
+service; stopping a second takes the API server down and quorum loss then leads
+at 95% from host evidence alone), a kubeadm v1.31 cluster with every pod
+Running, an HTTP request reaching an nginx pod through the port-forward tunnel,
+`make e2e` at 66 passed / 0 failed, and `make fault-check-all` at 10 / 0.
+
 ## v0.1.0
 
 The first release that is useful on a machine you cannot SSH into, and the

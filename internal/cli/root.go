@@ -8,7 +8,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var version = "0.1.0"
+// version is overridden at build time by the Makefile's ldflags. The literal
+// here is the fallback for a bare `go build`, so keep it in step with
+// Makefile's VERSION or `go run` reports a stale number.
+var version = "0.2.0"
 
 // contextName is the --context value: which cluster to use from a
 // multi-cluster targets file. Empty means the file's `current`, or its only

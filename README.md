@@ -335,7 +335,19 @@ A node it cannot reach is reported, never skipped — partial inspection must no
 k3helper tui -t targets.yaml
 ```
 
-Opens on a dashboard of per-node check cards with severity colours and remediation hints, and carries a k9s-style resource browser.
+Opens on a dashboard of per-node check cards — disk, memory, swap, cgroups and
+the k3s/kubelet service state — and carries a k9s-style resource browser. It
+reads the cluster through the server node over SSH, so no kubeconfig is needed
+on your own machine.
+
+```
+== node server (server) ==
+✓  OK  disk 49% used
+✓  OK  3456MB memory available
+✓  OK  swap disabled
+✓  OK  cgroup controllers present
+✓  OK  k3s services active (k3s=active)
+```
 
 **Navigation** — press `:` for the command bar:
 
