@@ -38,15 +38,15 @@ func NewRootCmd() *cobra.Command {
 		Short: "Portable k3s/k8s helper: VM setup, YAML verify/generate, deploy, doctor",
 		Long: `k3helper is a portable k3s/kubernetes helper with a TUI.
 
-  vm setup    install k3s on target VMs over SSH
+  vm setup    install k3s or kubeadm on target VMs over SSH
   verify      validate Kubernetes YAML manifests
   gen         generate correct Kubernetes YAML
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
-  doctor      troubleshoot: find issues + remediation
+  doctor      troubleshoot: find issues + remediation (--watch to keep looking)
   ctx         list clusters defined in the targets file
   init        create a targets.yaml describing your nodes
-  tui         launch the interactive dashboard`,
+  tui         interactive dashboard + resource browser`,
 		SilenceUsage: true,
 	}
 	// --context selects a cluster from a multi-cluster targets file. It is
