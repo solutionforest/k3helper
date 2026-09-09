@@ -38,12 +38,19 @@ exit code. `--json` for scripts.
 ### 2. YAML generate (#4)
 `k3helper gen <kind>` for the common kinds (Deployment, Service, Ingress, ConfigMap, Secret, PVC, Namespace, StatefulSet, Job, CronJob, k3s-specific like IngressRoute). Interactive prompt flow in TUI; `--flags` for scripts. Emits valid, schema-correct YAML with current `apiVersion`s. Round-trip guarantee: everything `gen` emits must pass `verify`.
 
-### 3. VM setup (#5) — providers: SSH, Multipass, Vagrant, Cloud
-- **SSH** (existing boxes): read `targets.yaml`, install k3s server + agents over SSH (token, cni, taint options), verify join.
-- **Multipass**: `multipass launch` → bootstrap.
-- **Vagrant**: generate `Vagrantfile` + provision → bootstrap.
-- **Cloud**: generate cloud-init/user-data + orchestrate via provider CLI (`aws`/`gcloud`/`doctl`) — no SDKs, to stay simple.
-- Shared `bootstrap.sh` template as the single source of truth for k3s install (k3sup-proven pattern).
+### 3. VM setup (#5) — SSH only, deliberately
+- **SSH** (existing boxes): read `targets.yaml`, install k3s server + agents over
+  SSH (token, cni, taint options), verify join. Also kubeadm, and HA control
+  planes with embedded etcd.
+- **Machine provisioning is out of scope.** Multipass, Vagrant and cloud
+  provider CLIs were in the original plan and have been dropped: each is a
+  wrapper around a tool the user already has, none of them touches the part
+  that is actually hard (bootstrap, diagnosis), and every one adds a runtime
+  dependency to a binary whose first design principle is not having any. A
+  machine that exists and answers SSH is the input; creating it is `multipass
+  launch`, `vagrant up` or `terraform apply`, and those do it better.
+- Shared bootstrap path as the single source of truth for the k3s install
+  (k3sup-proven pattern).
 
 ### 4. Quick deploy
 `k3helper deploy -f <file>` → dry-run → confirm → apply → wait for rollout → report.
@@ -84,15 +91,35 @@ A resource browser in the k9s mold (type `:` + alias to jump between resource vi
 | `:xray` | Ownership graph (deploy→rs→pod), tree view | — |
 | `:ports` | Port-forward manager | — |
 
-**Fancy factor (lipgloss/glamour)**
-- Themeable skins (YAML skin files like k9s, shipped with 3: dark/light/k3s-orange)
+**Fancy factor (lipgloss)**
+- Themeable skins (YAML skin files like k9s, shipped with 3: dark/light/k3s-orange),
+  switchable live with `:theme`
 - Styled panes with rounded borders, card grid on dashboard, colored severity badges
-- Sparkline graphs (bubbles `sparkline`) for node CPU/mem in dashboard + node drill-down
-- Progress bars (bubbles `progress`) during bootstrap/deploy/rollout
-- Streaming logs with syntax-aware coloring; glamour-rendered `describe`/yaml detail panes
+- Sparkline graphs for node CPU/mem on the dashboard cards
+- Progress bars (bubbles `progress`) during bootstrap and deploy rollout
+- Streaming logs with per-pod colouring; syntax-highlighted `describe`/YAML/diff panes
 - Status header bar: context, namespace, cluster score, fault count — always visible
 
-**Tech:** bubbletea + bubbles (table/list/textinput/spinner/progress/sparkline/viewport) + lipgloss styling + glamour markdown/yaml rendering. Live data via a poll loop (`kubectl get -w` style) feeding shared state; SSH streams multiplexed into the same update channel.
+**Tech:** bubbletea + bubbles (table/textinput/spinner/progress/viewport) +
+lipgloss styling. Live data via a poll loop feeding shared state; SSH streams
+multiplexed into the same update channel.
+
+Two deviations from the original list, both deliberate:
+
+- **No glamour.** It renders markdown, and the detail panes show YAML and
+  `kubectl describe` output, neither of which is markdown — a markdown renderer
+  reflows the column alignment that makes describe output readable. The panes
+  use a small highlighter written against the two formats we actually show,
+  which also keeps the dependency tree at "bubbletea + lipgloss + cobra".
+- **Sparklines are drawn here and fed from `/proc`, not from `bubbles` or
+  `kubectl top`.** `bubbles` ships no sparkline component. `kubectl top` needs
+  metrics-server, which is optional on k3s and absent on a plain kubeadm
+  cluster, and — the deciding argument — it cannot report on a node the API
+  server has lost sight of, which is precisely when the graph is worth having.
+  The dashboard already holds an SSH connection to every node, so the samples
+  come from `/proc/loadavg` and `/proc/meminfo`. A probe that fails is dropped
+  rather than stored as zero: an unreadable host must not draw a flat healthy
+  line, which is the same defect the fault matrix found in the memory check.
 
 ## Testing strategy
 
@@ -147,7 +174,14 @@ titles, so rewording a finding cannot silently break the suite.
 
 Each is `make fault-<name>`, with `make fault-list` and `make fault-clean`.
 
-Verified 2026-09-09: **10 passed, 0 failed.**
+Verified 2026-09-09 on both drivers: **11 passed, 0 failed.**
+
+`disk-full` runs last of all. Filling a node's root filesystem makes kubelet
+evict pods, and kubelet then holds the DiskPressure condition for its
+`eviction-pressure-transition-period` — five minutes by default — *after* the
+disk is free again, so that a node sitting on the threshold cannot flap. The
+sweep waits for the condition to clear before the next fault, and skips that
+wait when nothing follows.
 
 > This layer earns its keep. It found that `pod.pending-sched` never matched a
 > cordoned node — the remediation said "kubectl uncordon" while no matcher
@@ -212,33 +246,69 @@ The whole product against three fresh VMs:
 Modes: `make e2e` (fresh sandbox, ~12 min), `make e2e-fast` (`--keep`),
 `make e2e-quick` (`--keep --quick`, skips the sweep).
 
-Verified 2026-09-09: **67 passed, 0 failed.**
+Verified 2026-09-09 on the OrbStack VM driver: **66 passed, 0 failed**, and on
+the container driver: **65 passed, 0 failed**. The count varies by one or two
+between runs because some assertions are conditional — `--strict` is only
+exercised when the cluster has a warning to escalate, and the live-kubeconfig
+check needs a local `kubectl`. Both drivers also pass the integration tests
+and the full 11-fault matrix.
 
 ### Layer 5 — CI
 GitHub Actions on every push: gofmt, `go vet`, `go vet -tags=integration`
 (those files are never compiled by a plain vet and rot silently otherwise),
-`go test -race`, and a cross-compile.
+`go test -race`, a cross-compile, and — now that the container driver works —
+the full E2E, the integration tests and the fault matrix on `ubuntu-latest`.
 
-The sandbox E2E needs OrbStack VMs, which GitHub-hosted runners cannot
-provide, so that job targets a self-hosted macOS runner and is **skipped**
-elsewhere rather than reported as passing.
+Running CI on hosts whose login cannot reach the systemd bus paid for itself
+immediately. `check` and `doctor` both asked `systemctl list-unit-files`
+without sudo to decide whether k3s was installed. On such a host that query
+answers "Failed to connect to bus" for everything, so **a node running k3s was
+reported as not having it installed**, and a stopped `k3s-agent` — the fault
+the whole troubleshooter exists to catch — was invisible. Unit presence is now
+read from the filesystem, and unit *state* is asked unprivileged first and
+with `sudo -n` second, because neither query works on every host: a host
+without passwordless sudo answers only the first, a host without bus access
+only the second. When neither answers, the state is recorded as unknown rather
+than guessed — an unreadable probe must never be reported as a stopped
+service, nor as a healthy one.
 
 ## OrbStack sandbox — three real VMs
 
 `test/sandbox/`: three OrbStack Linux VMs that behave like SSH-reachable hosts.
 
-> Two drivers exist. `setup-orbstack.sh` creates VMs and is what the recorded
-> results were produced on. `setup-docker.sh` creates three privileged systemd
-> containers for hosts that cannot nest virtualisation.
+> Two drivers exist. `setup-orbstack.sh` creates VMs; `setup-docker.sh` creates
+> three privileged systemd containers, for CI runners and any host that cannot
+> nest virtualisation. Both now run the full E2E.
 >
-> The container driver provisions correctly and k3s reaches Ready, but pod
-> networking does not work there: pods get addresses from the flannel range
-> that nothing can reach, so readiness probes fail and CoreDNS crashloops.
-> Mounting /lib/modules fixed one real blocker — k3s could not modprobe the
-> iptables/nftables modules it needs — but the remaining problem is
-> container-in-container CNI networking, which likely needs the approach k3d
-> takes (purpose-built images and networking). That is why the CI E2E job is
-> dispatch-only rather than running on every push.
+> The container driver took three fixes, none of them in k3helper:
+>
+> 1. **overlayfs on overlayfs.** containerd's default snapshotter cannot mount
+>    an overlay inside a container whose own root is an overlay, so k3s never
+>    finished starting: `"overlayfs" snapshotter cannot be enabled ... invalid
+>    argument`. Each node now keeps `/var/lib/rancher/k3s`, `/var/lib/kubelet`
+>    and `/var/lib/cni` on a named volume — a plain host directory. The
+>    upstream rancher/k3s image declares the same paths for the same reason.
+> 2. **The cgroup namespace.** With `cgroup: host`, the systemd inside each
+>    container manages the real cgroup root and prunes the cgroups containerd
+>    creates for pods; every pod restarted every minute or two with "Pod
+>    sandbox changed", and CoreDNS never stayed up long enough to pass a
+>    readiness probe. A *private* cgroup namespace — what kind and k3d use —
+>    fixes it. The bind mount over `/sys/fs/cgroup` has to go with it, or
+>    systemd fails to boot at all (exit 255, no logs).
+> 3. **flannel VXLAN.** Unnecessary here: the three containers share one docker
+>    bridge, so `flannel-backend: host-gw` routes pod traffic with no
+>    encapsulation and no offload bug to work around. The sandbox writes that
+>    into `/etc/rancher/k3s/config.yaml`, so the environment describes itself
+>    and k3helper still performs the install being tested.
+>
+> The earlier diagnosis — "container-in-container CNI networking, which likely
+> needs the approach k3d takes" — was wrong in an instructive way. Pod
+> networking was never broken. Pods were being killed underneath it, and every
+> probe of a dead pod's address looked like a network fault.
+>
+> The container hosts deliberately do **not** install dbus, which means the SSH
+> login cannot talk to systemd's bus. That is a host shape real fleets have,
+> and running CI on it is what surfaced the unit-detection defect below.
 
 - `setup-orbstack.sh` creates the VMs, installs sshd, provisions the `sandbox`
   user with passwordless sudo, and writes `targets.sandbox.yaml` with live IPs.
@@ -281,12 +351,19 @@ scripts/bundle.sh
 4. **VM setup over SSH** — bootstrap from scratch, waits for the full node count. ✅
 5. **Troubleshoot engine** — 15 signatures, fault matrix green. ✅
 6. **Deploy** — upload, dry-run, diff, namespace handling, rollout wait. ✅
-7. **TUI** — dashboard + resource browser (pods/nodes/events/logs/describe). ✅
+7. **TUI** — every view in the table above: pods, nodes, deployments,
+   statefulsets, daemonsets, services, ingresses, events, doctor, xray, vm,
+   ctx, ports, multi-pod logs, YAML studio, deploy diff/apply. Skins,
+   sparklines, progress bars, regex filters, label selectors, column sort,
+   wide mode, faults-only. ✅
 8. **Polish + release** — cross-compile, installer, README, CI. ✅
+9. **HA control plane** — several servers, embedded etcd, quorum assessed
+   without the API server. ✅
+10. **kubeadm** — a second distribution behind the same commands. ✅
+11. **Linux CI sandbox** — the container driver runs the full E2E. ✅
 
-Remaining: HA control plane (multiple servers, embedded etcd), a Linux CI
-sandbox so the E2E can run on GitHub-hosted runners, and the TUI extras
-(port-forward manager, multi-pod log tailing).
+Remaining: nothing from the original scope. Open items are new asks, tracked
+under "Open questions" below.
 
 ## Research — similar tools
 
@@ -317,6 +394,22 @@ No existing tool spans **VM host layer → k3s service → cluster → workloads
 ### Implications for our build
 - **Leverage:** wrap `kubectl`, `k3s check-config`, kubeconform-style schemas, k3sup's SSH bootstrap pattern.
 - **Concentrate effort on:** (1) cross-layer `doctor`/signature engine, (2) YAML generator, (3) unified TUI, (4) the fault-injection test suite that keeps the troubleshooter honest.
+
+## Open questions
+
+1. **Private registries.** k3s reads `/etc/rancher/k3s/registries.yaml` for
+   mirrors, credentials and CA/TLS settings; k3helper does not write it. The
+   shape of the work is clear — `vm setup --registry/--registry-user/
+   --registry-password` writing that file on every node before the install,
+   `gen secret --docker-registry` for the per-workload path, and splitting
+   today's single `pod.imagepull` signature into `registry.auth` (a 401),
+   `registry.unreachable` (DNS or connection) and `registry.cert` (an untrusted
+   CA), which are three different fixes wearing one message today. Not started.
+2. **Docker Swarm.** Asked about; out of scope as a managed platform — every
+   layer here speaks kubectl, and Swarm shares no API with it. k3helper itself
+   runs fine *on* a Swarm host (static binary, SSH out), but installing k3s
+   alongside Swarm on the same machines contends for iptables rules and ports
+   (6443 vs 2377/7946/4789) and should not be recommended.
 
 ## Resolved questions
 1. **Binary name** — `k3helper`. Settled.

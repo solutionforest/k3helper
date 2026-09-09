@@ -349,19 +349,62 @@ on your own machine.
 ✓  OK  k3s services active (k3s=active)
 ```
 
+The header is always visible and always carries the cluster, the current view,
+the namespace scope, the health score computed from the check engine, and the
+doctor's finding count.
+
 **Navigation** — press `:` for the command bar:
 
 | Command | Shows |
 |---|---|
 | `:pods` (`:po`) | pods across all namespaces: ready, status, restarts, node, age |
 | `:nodes` (`:no`) | nodes: status, roles, kubelet version, age |
+| `:deploy` (`:dp`) | deployments: ready, up-to-date, available |
+| `:statefulsets` (`:sts`) | statefulsets |
+| `:daemonsets` (`:ds`) | daemonsets — ready counts read from the DaemonSet's own status fields |
+| `:services` (`:svc`) | services: type, cluster IP, external IP, ports |
+| `:ingresses` (`:ing`) | ingresses: class, hosts, address |
 | `:events` (`:ev`) | recent events, newest first |
-| `:dashboard` (`:dash`) | back to the health cards |
+| `:doctor` (`:dr`) | run every check live; findings ranked by confidence, `enter` for evidence + the fix |
+| `:xray` | ownership graph: deployment → replicaset → pod, health-coloured |
+| `:vm` | the targets file, probed live: SSH reachable? k3s installed? `b` bootstraps every node |
+| `:ctx` | switch cluster, for a multi-cluster targets file |
 | `:ports` (`:pf`) | active port forwards |
 | `:logs` | tail every pod matching the current filter, each line labelled with its pod |
 | `:ns <name>` | scope resource views to one namespace (`:ns all` clears it) |
+| `:gen <kind> <name> [image] [replicas] [port]` | YAML studio: generate, verify inline, `s` to save |
+| `:deploy <file>` | dry-run the manifest, show the diff against live state, `a` to apply |
+| `:theme <name>` | switch skin without restarting |
 
-**Keys** — `↑↓` move · `enter`/`l` pod logs · `d` describe · `f` port-forward · `/` filter · `esc` back or clear filter · `r` refresh now · `q` quit. In `:ports`, `x` stops the selected forward.
+`:deploy` with no argument is the deployments list; `:deploy <file>` is the
+apply flow.
+
+**Keys** — `↑↓` move · `enter`/`l` pod logs (on a deployment/service: its pods,
+by the workload's own label selector) · `d` describe · `f` port-forward · `/`
+filter · `esc` back or clear filter · `r` refresh now · `q` quit.
+`ctrl-w` wide mode (pod IP and labels, node internal IP/OS/kernel) ·
+`ctrl-z` faults only (hides everything healthy) · `N`/`A`/`S` sort by name,
+age or status, pressed twice to reverse. In `:ports`, `x` stops the selected
+forward. In `:vm`, `b` bootstraps every target with live install output.
+
+**Filtering.** `/` takes a regular expression, matched case-insensitively
+against every column — `/web|api`. A filter starting with `-l` is a *label
+selector* in kubectl's own syntax (`-l app=web`) and is evaluated by the API
+server, so set operators behave the way kubectl does.
+
+**Skins.** `--theme dark|light|k3s-orange`, or a path to a skin YAML file:
+
+```yaml
+# ~/.config/k3helper/skins/mine.yaml   →   k3helper tui --theme mine
+name: mine
+accent: "33"
+ok: "42"
+warn: "214"
+fail: "196"
+```
+
+Any field left out keeps the built-in default, so a partial skin cannot
+collapse the ok/warn/fail distinction.
 
 **Port forwarding.** `f` on a pod opens `kubectl port-forward` on the cluster
 node *and* an SSH tunnel to it, because kubectl binds on the node it runs on —
@@ -371,6 +414,13 @@ lists what is live, with the local address to connect to.
 The status column shows the container's waiting or terminated reason rather than the pod phase, so a `CrashLoopBackOff` reads as `CrashLoopBackOff` instead of `Pending`. Opening logs on a crashlooping pod whose current instance has produced nothing falls back to the previous instance automatically — that's where the cause usually is.
 
 Views reload every 5 seconds, preserving your cursor position so a refresh doesn't move the row under you.
+
+Each node card carries CPU and memory sparklines over the last two minutes.
+They are read from `/proc` over the SSH connection the dashboard already holds
+— not from `kubectl top`, which needs metrics-server and cannot report on a
+node the API server has lost sight of, which is exactly when you want the
+graph. A probe that fails is dropped rather than recorded as 0%, so an
+unreadable host never draws a flat healthy line.
 
 ## No SSH from your machine (browser console only)
 
@@ -552,40 +602,44 @@ healthy and a faulted cluster, and the fault sweep. `make e2e-quick` skips the
 sweep for a fast loop.
 
 The sandbox has two drivers, selected automatically and overridable with
-`SANDBOX_DRIVER`:
+`SANDBOX_DRIVER`. Both run the full E2E:
 
 | Driver | Hosts | Where |
 |---|---|---|
-| `orbstack` | three Linux VMs | macOS default; what the E2E results above were produced on |
-| `docker` | three privileged systemd containers | Linux, and anywhere VMs are unavailable |
+| `orbstack` | three Linux VMs | macOS default |
+| `docker` | three privileged systemd containers | Linux, CI, and anywhere VMs are unavailable |
 
-The container driver provisions hosts correctly and k3s installs and reaches
-Ready on them, but pod networking does not work there and it is **not proven
-end to end**. Investigated as far as this:
+Making the container driver work took three environment fixes, worth knowing
+if you run k3s in containers yourself:
 
-- pods are scheduled and get addresses from the flannel range, but nothing —
-  not even the node they run on — can reach those addresses, so every
-  readiness probe fails and CoreDNS is SIGTERMed on a loop
-- `/lib/modules` is now mounted into the containers, which fixed one real
-  blocker (k3s could not `modprobe` the iptables and nftables modules it needs)
-- it is *not* the conntrack sysctl restriction that broke the kubeadm path;
-  disabling kube-proxy's conntrack tuning changes nothing here
-
-What remains is container-in-container CNI networking, which likely needs a
-different approach (k3d builds its own images and networking for exactly this
-reason). Whether a native Linux runner behaves differently is untested — the
-only Linux kernel available for testing here is a nested one.
-
-The CI E2E job therefore runs on `workflow_dispatch` only: run it by hand to
-find out, rather than blocking every push on a job nobody has seen pass.
+- **containerd needs a non-overlay directory.** Its snapshotter cannot mount
+  overlayfs on top of the container's own overlayfs root, so k3s never
+  finishes starting. Each node keeps `/var/lib/rancher/k3s`,
+  `/var/lib/kubelet` and `/var/lib/cni` on a named volume.
+- **Use a private cgroup namespace.** With the host's, the systemd inside the
+  container prunes the cgroups containerd creates for pods, and every pod dies
+  every minute or two with "Pod sandbox changed". Drop the `/sys/fs/cgroup`
+  bind mount at the same time, or systemd will not boot.
+- **Skip VXLAN.** Containers on one docker bridge are on the same L2 segment,
+  so `flannel-backend: host-gw` routes pod traffic without encapsulation.
 
 CI on every push: gofmt, `go vet` (including under the `integration` build tag,
-so those files cannot rot unnoticed), race-enabled unit tests, and a
-cross-compile.
+so those files cannot rot unnoticed), race-enabled unit tests, a cross-compile,
+and the full E2E plus the fault matrix on the container driver.
+
+Those container hosts have no dbus, so the SSH login cannot reach systemd's
+bus — a shape real fleets have, and one that immediately caught a defect:
+`check` and `doctor` decided whether k3s was installed by asking `systemctl
+list-unit-files` unprivileged, which on such a host answers "Failed to connect
+to bus" for everything. A node running k3s was reported as not having it
+installed, and a stopped agent went unnoticed. Unit presence is now read from
+the filesystem, and unit state is asked unprivileged first and with `sudo -n`
+second — a host without passwordless sudo answers only the first, a host
+without bus access only the second.
 
 Integration tests (`-tags=integration`) read node addresses from `test/sandbox/targets.sandbox.yaml` rather than hardcoding them, because the sandbox is assigned new IPs each time it is recreated. Point them at another cluster with `K3HELPER_TARGETS=/path/to/targets.yaml`. With no sandbox running they skip rather than fail.
 
-> **On macOS, use the `orbstack` driver.** [OrbStack](https://orbstack.dev) gives real lightweight Linux VMs. Docker containers on macOS share the host kernel, which breaks kubelet's PLEG and kills pods falsely — so the `docker` driver is for Linux, not for a Mac.
+> **On macOS, use the `orbstack` driver.** [OrbStack](https://orbstack.dev) gives real lightweight Linux VMs. Docker Desktop containers on macOS share a kernel k3s does not expect — the `docker` driver is for Linux hosts and CI runners.
 
 ## Architecture
 

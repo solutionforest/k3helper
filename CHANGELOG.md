@@ -4,6 +4,91 @@ Notable changes per release. The release workflow publishes the section
 matching the tag it is building, so this file is the source of the release
 notes on GitHub.
 
+## v0.3.0
+
+The TUI grew from four views to fifteen, CI now runs the whole product on
+GitHub-hosted runners, and a defect that made k3helper misreport a running
+cluster was found by doing so.
+
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solutionforest/k3helper/main/install.sh | sh
+```
+
+Or take a single binary — `k3helper-{linux,darwin}-{amd64,arm64}`, each listed
+in `checksums.txt`. No breaking changes from v0.2.0.
+
+### Fixed: a running k3s reported as "not installed"
+
+`check` and `doctor` decided whether k3s was installed by asking `systemctl
+list-unit-files` without sudo. On a host whose SSH login cannot reach the
+systemd bus — no dbus, or a locked-down login — that query answers "Failed to
+connect to bus" for every unit, so:
+
+- `check` reported **"no Kubernetes service found"** on nodes where k3s was up
+  and serving traffic, and
+- `doctor` could not see a **stopped `k3s-agent`**, which is the single fault
+  the troubleshooter most needs to catch.
+
+Unit presence is now read from the filesystem, where it is a fact rather than a
+question for a bus that may not answer. Unit *state* is asked unprivileged
+first and with `sudo -n` second, because neither works everywhere: a host
+without passwordless sudo answers only the first, a host without bus access
+only the second. When neither answers, the state is reported as unknown — an
+unreadable probe is never rendered as a stopped service, nor as a healthy one.
+
+If you run k3helper against hosts that do not ship dbus, or where the login
+user has no systemd access, upgrade.
+
+### TUI: the rest of the resource browser
+
+New views, all reachable from the command bar: `:dp` deployments, `:sts`
+statefulsets, `:ds` daemonsets, `:svc` services, `:ing` ingresses, `:doctor`
+(findings ranked by confidence, `enter` for the evidence and the fix), `:xray`
+(deployment → replicaset → pod ownership graph), `:vm` (the targets file probed
+live, `b` bootstraps every node with streaming output), `:ctx` (switch
+cluster), `:gen` (YAML studio: generate, verify inline, save) and `:deploy
+<file>` (dry-run, diff against live state, `a` applies).
+
+`enter` on a deployment or service drills into *its* pods using the workload's
+own label selector, rather than guessing from the name.
+
+### TUI: navigation and presentation
+
+- `/` filters with a regular expression; a filter starting with `-l` is a
+  kubectl label selector, evaluated by the API server
+- `ctrl-w` wide mode, `ctrl-z` faults only, `N`/`A`/`S` sort by name, age or
+  status — ages sort as durations, so "3d" no longer sorts before "12m"
+- three skins (`--theme dark|light|k3s-orange`, or a skin YAML file), and
+  `:theme` to switch without restarting
+- an always-visible status bar with the cluster health score and doctor's
+  finding count
+- CPU and memory sparklines on each node card, sampled from `/proc` over the
+  SSH connection the dashboard already holds — no metrics-server needed, and
+  they still work for a node the API server has lost sight of
+- progress bars for deploy rollout and node bootstrap; syntax-highlighted
+  YAML, describe and diff panes
+
+### CI runs the whole product now
+
+The container sandbox driver works, so `ubuntu-latest` runs the full E2E, the
+integration tests and the fault matrix on every push, instead of a
+dispatch-only job nobody had seen pass. Three environment fixes: containerd
+state on named volumes (overlayfs cannot stack on itself), a private cgroup
+namespace (the container's systemd was pruning containerd's pod cgroups), and
+flannel `host-gw` instead of VXLAN (the containers share one bridge).
+
+The fault matrix now includes `disk-full`, which brings it to 11 faults. It
+runs last: kubelet holds DiskPressure for five minutes after the disk is free.
+
+### Scope
+
+Machine provisioning — Multipass, Vagrant, cloud provider CLIs — has been
+dropped from the plan rather than left as a promise. Each wraps a tool you
+already have, none touches the hard part, and every one costs a runtime
+dependency. A machine that answers SSH is the input.
+
 ## v0.2.0
 
 Bootstrapping now covers both distributions k3helper can already diagnose, and
