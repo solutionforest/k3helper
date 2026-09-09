@@ -59,25 +59,29 @@ case "$ARCH" in
   *) fail "unsupported architecture: $ARCH" ;;
 esac
 
-# --- resolve version ------------------------------------------------------
+# --- resolve download location --------------------------------------------
+# /releases/latest/download/<asset> redirects to the newest release's asset,
+# so the default path needs no version lookup at all. Asking the GitHub API
+# for the tag would work too, but it is rate limited to 60 requests an hour
+# per IP for unauthenticated callers — which anyone behind a shared or
+# corporate NAT can exhaust without doing anything wrong.
 VERSION="${K3HELPER_VERSION:-}"
-if [ -z "$VERSION" ]; then
-  log "resolving latest release..."
-  VERSION=$(fetch "https://api.github.com/repos/$REPO/releases/latest" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | head -n1)
-  [ -n "$VERSION" ] || fail "could not resolve latest release; set K3HELPER_VERSION=vX.Y.Z"
+if [ -n "$VERSION" ]; then
+  BASE="https://github.com/$REPO/releases/download/$VERSION"
+  LABEL="$VERSION"
+else
+  BASE="https://github.com/$REPO/releases/latest/download"
+  LABEL="latest"
 fi
 
 ASSET="${BIN_NAME}-${OS}-${ARCH}"
-BASE="https://github.com/$REPO/releases/download/$VERSION"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
 
-log "downloading $ASSET $VERSION..."
+log "downloading $ASSET ($LABEL)..."
 fetch_file "$BASE/$ASSET" "$TMP/$BIN_NAME" \
-  || fail "download failed: $BASE/$ASSET (does $VERSION publish $OS/$ARCH?)"
+  || fail "download failed: $BASE/$ASSET (does $LABEL publish $OS/$ARCH?)"
 
 # --- checksum verification (skipped only if the release has no manifest) ---
 if fetch_file "$BASE/checksums.txt" "$TMP/checksums.txt" 2>/dev/null; then
@@ -95,7 +99,7 @@ if fetch_file "$BASE/checksums.txt" "$TMP/checksums.txt" 2>/dev/null; then
     log "warning: $ASSET not listed in checksums.txt, skipping verification"
   fi
 else
-  log "warning: no checksums.txt in $VERSION, skipping verification"
+  log "warning: no checksums.txt in $LABEL, skipping verification"
 fi
 
 chmod +x "$TMP/$BIN_NAME"
