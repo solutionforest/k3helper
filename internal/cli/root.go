@@ -11,7 +11,7 @@ import (
 // version is overridden at build time by the Makefile's ldflags. The literal
 // here is the fallback for a bare `go build`, so keep it in step with
 // Makefile's VERSION or `go run` reports a stale number.
-var version = "0.3.0"
+var version = "0.4.0"
 
 // contextName is the --context value: which cluster to use from a
 // multi-cluster targets file. Empty means the file's `current`, or its only
@@ -44,6 +44,7 @@ func NewRootCmd() *cobra.Command {
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
   doctor      troubleshoot: find issues + remediation (--watch to keep looking)
+  registry    configure the private registries the cluster pulls from
   ctx         list clusters defined in the targets file
   init        create a targets.yaml describing your nodes
   tui         interactive dashboard + resource browser`,
@@ -76,6 +77,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newCheckCmd())
 	root.AddCommand(newVMCmd())
 	root.AddCommand(newDoctorCmd())
+	root.AddCommand(newRegistryCmd())
 	root.AddCommand(newDeployCmd())
 	root.AddCommand(newTUICmd())
 	return root

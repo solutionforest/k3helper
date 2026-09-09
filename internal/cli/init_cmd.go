@@ -216,6 +216,15 @@ func initHeader(local bool) string {
 #       nodes: [...]
 #   current: prod
 # then select one with --context <name>.
+#
+# Private registries and mirrors apply to every node in the cluster:
+#   registries:
+#     - host: docker-registry.example.net
+#       username: ci
+#       password_env: REGISTRY_PASSWORD   # read from the environment, never stored here
+#       ca_file: /etc/ssl/certs/internal-ca.crt   # path ON THE NODES
+# "k3helper vm setup" writes them during the install; "k3helper registry apply"
+# pushes them to a cluster that already exists.
 `
 	if local {
 		h += `#

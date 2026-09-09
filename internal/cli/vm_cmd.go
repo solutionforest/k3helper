@@ -2,8 +2,10 @@ package cli
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/solutionforest/k3helper/internal/config"
+	"github.com/solutionforest/k3helper/internal/registry"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/solutionforest/k3helper/internal/vm"
 	"github.com/spf13/cobra"
@@ -18,6 +20,51 @@ func newVMCmd() *cobra.Command {
 	return cmd
 }
 
+// registryFlags are the one-off overrides for `vm setup` and `registry apply`.
+// A targets file that lists registries needs none of them; they exist for the
+// single-registry case where writing a file first is friction.
+type registryFlags struct {
+	host     string
+	user     string
+	password string
+	caFile   string
+	insecure bool
+}
+
+func (f *registryFlags) bind(cmd *cobra.Command) {
+	cmd.Flags().StringVar(&f.host, "registry", "",
+		"private registry or mirror host, e.g. docker-registry.example.net (adds to any in the targets file)")
+	cmd.Flags().StringVar(&f.user, "registry-user", "", "username for --registry")
+	cmd.Flags().StringVar(&f.password, "registry-password", "", "password for --registry (prefer password_env in the targets file)")
+	cmd.Flags().StringVar(&f.caFile, "registry-ca-file", "", "path ON THE NODE to the CA that signed the registry certificate")
+	cmd.Flags().BoolVar(&f.insecure, "registry-insecure", false, "skip TLS verification for --registry (test registries only)")
+}
+
+// registriesFor combines the targets file's registries with the flags.
+func (f *registryFlags) registriesFor(targets *config.Targets) ([]config.Registry, error) {
+	regs, err := targets.ResolvedRegistries()
+	if err != nil {
+		return nil, err
+	}
+	if f.host == "" {
+		if f.user != "" || f.password != "" || f.caFile != "" || f.insecure {
+			return nil, fmt.Errorf("--registry-* flags need --registry to say which registry they describe")
+		}
+		return regs, nil
+	}
+	extra := config.Registry{
+		Host: f.host, Username: f.user, Password: f.password,
+		CAFile: f.caFile, InsecureSkipVerify: f.insecure,
+	}
+	// Validated through the same path as a file entry, so `--registry-user`
+	// without a password fails here rather than at pull time on the node.
+	probe := config.Targets{Cluster: targets.Cluster, Nodes: targets.Nodes, Registries: append(regs, extra)}
+	if err := probe.Validate(); err != nil {
+		return nil, err
+	}
+	return probe.Registries, nil
+}
+
 func newVMSetupCmd() *cobra.Command {
 	var (
 		targetsPath string
@@ -29,6 +76,7 @@ func newVMSetupCmd() *cobra.Command {
 		k8sVersion  string
 		cni         string
 		noConntrack bool
+		regFlags    registryFlags
 	)
 	cmd := &cobra.Command{
 		Use:   "setup",
@@ -74,6 +122,28 @@ func newVMSetupCmd() *cobra.Command {
 				if targets.Nodes[i].Role == "server" {
 					srvNode = &targets.Nodes[i]
 					break
+				}
+			}
+
+			// Registries are written before the install, not after: the very
+			// first thing a fresh node does is pull images, and a mirror
+			// configured afterwards would be too late for exactly the pulls
+			// an air-gapped or credentialled environment needs it for.
+			regs, err := regFlags.registriesFor(targets)
+			if err != nil {
+				return err
+			}
+			if len(regs) > 0 {
+				which := "k3s"
+				if distro == "kubeadm" {
+					which = "kubeadm"
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "configuring %d registr%s on %d node(s): %s\n",
+					len(regs), plural(len(regs), "y", "ies"), len(conns), strings.Join(registry.Hosts(regs), ", "))
+				for i, c := range conns {
+					if err := applyRegistries(c, which, regs); err != nil {
+						return fmt.Errorf("%s: %w", targets.Nodes[i].Name, err)
+					}
 				}
 			}
 
@@ -131,6 +201,7 @@ func newVMSetupCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noConntrack, "no-conntrack-tuning", false,
 		"stop kube-proxy managing nf_conntrack_max; needed where that sysctl is read-only or capped (nested VMs, containers)")
 	cmd.Flags().StringVar(&agentExtraArgs, "agent-extra-args", "", "extra args for k3s agent install")
+	regFlags.bind(cmd)
 	return cmd
 }
 

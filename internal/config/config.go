@@ -48,6 +48,82 @@ func (n Node) SSH() ssh.Node {
 type Targets struct {
 	Cluster string `json:"cluster"`
 	Nodes   []Node `json:"nodes"`
+	// Registries are the image registries every node in this cluster pulls
+	// from. Cluster-level rather than per-node: a mirror configured on some
+	// nodes and not others produces pods that run on two machines out of
+	// three, which is a miserable thing to debug.
+	Registries []Registry `json:"registries,omitempty"`
+}
+
+// Registry is a container image registry the nodes pull from — a private
+// registry, or a mirror in front of a public one.
+type Registry struct {
+	// Host is the registry as it appears in an image reference:
+	// "docker-registry.example.net", or "docker.io" to mirror the default.
+	Host string `json:"host"`
+	// Endpoint is the URL to actually contact. Defaults to https://<host>,
+	// which is what a registry that is its own endpoint needs; set it to point
+	// a well-known name at a mirror.
+	Endpoint string `json:"endpoint,omitempty"`
+
+	Username string `json:"username,omitempty"`
+	// Password is the credential in the file. PasswordEnv names an
+	// environment variable to read it from instead, so a targets file can be
+	// committed to a repository without a secret in it.
+	Password    string `json:"password,omitempty"`
+	PasswordEnv string `json:"password_env,omitempty"`
+
+	// CAFile is a path *on the node* to the CA that signed the registry's
+	// certificate — the fix for an internal CA, and the one that keeps TLS
+	// verification on.
+	CAFile string `json:"ca_file,omitempty"`
+	// InsecureSkipVerify turns certificate verification off. It exists
+	// because test registries with self-signed certificates exist; it is not
+	// what you want in front of a registry that holds your images.
+	InsecureSkipVerify bool `json:"insecure_skip_verify,omitempty"`
+}
+
+// URL is the endpoint to contact for this registry.
+func (r Registry) URL() string {
+	if r.Endpoint != "" {
+		return r.Endpoint
+	}
+	return "https://" + r.Host
+}
+
+// HasAuth reports whether credentials were supplied.
+func (r Registry) HasAuth() bool { return r.Username != "" || r.Password != "" }
+
+// Resolve fills the password from the environment when password_env is used.
+//
+// It fails loudly on an unset variable rather than writing an empty
+// credential: an anonymous pull against a private registry fails later, from
+// a different machine, as "unauthorized", which is a long way from the cause.
+func (r Registry) Resolve() (Registry, error) {
+	if r.PasswordEnv == "" {
+		return r, nil
+	}
+	v, ok := os.LookupEnv(r.PasswordEnv)
+	if !ok || v == "" {
+		return r, fmt.Errorf("registry %q: password_env %s is not set in this environment",
+			r.Host, r.PasswordEnv)
+	}
+	r.Password = v
+	return r, nil
+}
+
+// ResolvedRegistries returns the cluster's registries with password_env
+// expanded.
+func (t *Targets) ResolvedRegistries() ([]Registry, error) {
+	out := make([]Registry, 0, len(t.Registries))
+	for _, r := range t.Registries {
+		resolved, err := r.Resolve()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, resolved)
+	}
+	return out, nil
 }
 
 // File is a targets file. It accepts two shapes:
@@ -71,6 +147,11 @@ type File struct {
 	// multi-cluster form
 	Clusters []Targets `json:"clusters,omitempty"`
 	Current  string    `json:"current,omitempty"`
+	// Registries at file level apply to every cluster that does not declare
+	// its own. A cluster's own list replaces this one rather than merging
+	// with it: two lists combined by host is a surprise waiting to happen,
+	// and "this cluster pulls from somewhere else" is the reason to override.
+	Registries []Registry `json:"registries,omitempty"`
 }
 
 // Load reads a targets file in either shape and validates every cluster in it.
@@ -97,8 +178,15 @@ func Load(path string) (*File, error) {
 		return nil, fmt.Errorf("invalid targets %s: use either top-level cluster/nodes or a clusters list, not both", path)
 	}
 	if len(f.Clusters) == 0 {
-		f.Clusters = []Targets{{Cluster: f.Cluster, Nodes: f.Nodes}}
+		f.Clusters = []Targets{{Cluster: f.Cluster, Nodes: f.Nodes, Registries: f.Registries}}
 		f.Cluster, f.Nodes = "", nil
+	} else {
+		// File-level registries are the default for clusters that declare none.
+		for i := range f.Clusters {
+			if len(f.Clusters[i].Registries) == 0 {
+				f.Clusters[i].Registries = f.Registries
+			}
+		}
 	}
 	seen := map[string]bool{}
 	for i := range f.Clusters {
@@ -207,6 +295,41 @@ func (t *Targets) Validate() error {
 	}
 	if locals > 1 {
 		return fmt.Errorf("only one node can be local: true (k3helper runs on exactly one machine)")
+	}
+	return t.validateRegistries()
+}
+
+// validateRegistries rejects registry entries that cannot mean what they say.
+func (t *Targets) validateRegistries() error {
+	seen := map[string]bool{}
+	for i, r := range t.Registries {
+		if r.Host == "" {
+			return fmt.Errorf("registries[%d]: host is required (the name as it appears in an image reference)", i)
+		}
+		if seen[r.Host] {
+			return fmt.Errorf("registries[%d]: duplicate host %q", i, r.Host)
+		}
+		seen[r.Host] = true
+		if strings.Contains(r.Host, "://") {
+			return fmt.Errorf("registry %q: host is a name, not a URL — put the URL in `endpoint`", r.Host)
+		}
+		if r.Password != "" && r.PasswordEnv != "" {
+			return fmt.Errorf("registry %q: set password or password_env, not both", r.Host)
+		}
+		if r.Username == "" && (r.Password != "" || r.PasswordEnv != "") {
+			return fmt.Errorf("registry %q: a password without a username cannot authenticate", r.Host)
+		}
+		if r.Username != "" && r.Password == "" && r.PasswordEnv == "" {
+			return fmt.Errorf("registry %q: username %q has no password (use password, or password_env to keep it out of this file)",
+				r.Host, r.Username)
+		}
+		if r.CAFile != "" && r.InsecureSkipVerify {
+			return fmt.Errorf("registry %q: ca_file and insecure_skip_verify contradict each other — a CA is given, so verification can stay on",
+				r.Host)
+		}
+		if r.Endpoint != "" && !strings.Contains(r.Endpoint, "://") {
+			return fmt.Errorf("registry %q: endpoint %q needs a scheme (https:// or http://)", r.Host, r.Endpoint)
+		}
 	}
 	return nil
 }
