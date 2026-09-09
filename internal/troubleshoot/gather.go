@@ -18,6 +18,10 @@ type Gatherer struct {
 	Hosts map[string]ssh.Executor
 	// Unreachable: nodes in the targets file we could not connect to.
 	Unreachable []UnreachableNode
+	// ServerNodes: targets-file names of the nodes with role "server". Needed
+	// to assess etcd quorum from host evidence when the API server — the thing
+	// quorum loss takes down — cannot be reached to ask.
+	ServerNodes []string
 }
 
 // Collect assembles an Evidence bundle. Never fails: collection problems
@@ -42,6 +46,8 @@ func (g Gatherer) Collect() Evidence {
 		PVCEvents:        map[string][]string{},
 		ContainerRuntime: map[string]string{},
 		ClockSkew:        map[string]time.Duration{},
+		NodeAlias:        map[string]string{},
+		ServerNodes:      g.ServerNodes,
 		Unreachable:      g.Unreachable,
 	}
 
@@ -106,6 +112,15 @@ func (g Gatherer) Collect() Evidence {
 		}
 		if skew, ok := clockSkew(exec, time.Now()); ok {
 			e.ClockSkew[name] = skew
+		}
+		// The Kubernetes node name is the host's hostname, which is rarely the
+		// name the targets file uses ("sandbox-agent2" vs "agent2"). Record the
+		// mapping so cluster-layer evidence can be matched to host-layer
+		// evidence about the same machine.
+		if hn, code, err := exec.Run(`hostname`); err == nil && code == 0 {
+			if h := strings.TrimSpace(hn); h != "" {
+				e.NodeAlias[h] = name
+			}
 		}
 	}
 	return e

@@ -62,6 +62,12 @@ type Evidence struct {
 	// ClockSkew: node → absolute clock offset from the machine running
 	// k3helper.
 	ClockSkew map[string]time.Duration
+	// ServerNodes: targets-file names of the control-plane nodes.
+	ServerNodes []string
+	// NodeAlias maps a Kubernetes node name to the targets-file node name for
+	// the same machine. The two differ in practice ("sandbox-agent2" vs
+	// "agent2"), and matching cluster evidence to host evidence needs it.
+	NodeAlias map[string]string
 	// ProbeErrors: what could not be collected, and why. An absent finding is
 	// only good news if we actually looked, so these are reported rather than
 	// silently narrowing the diagnosis.
@@ -91,6 +97,20 @@ type HostMetric struct {
 type UnreachableNode struct {
 	Name   string
 	Reason string
+}
+
+// serviceStateFor resolves the Kubernetes service state for a node named as
+// the cluster names it, translating through NodeAlias when the targets file
+// calls the same machine something else.
+func (e Evidence) serviceStateFor(k8sNode string) (string, bool) {
+	if state, ok := e.K3sService[k8sNode]; ok {
+		return state, true
+	}
+	if alias, ok := e.NodeAlias[k8sNode]; ok {
+		state, ok := e.K3sService[alias]
+		return state, ok
+	}
+	return "", false
 }
 
 // probeFailed records that a piece of evidence could not be gathered.
@@ -171,7 +191,8 @@ var registry = []Signature{
 			// user to two places for one fault.
 			n := 0
 			for _, node := range e.NodeNotReady {
-				if state, seen := e.K3sService[node]; !seen || state == "active" {
+				state, seen := e.serviceStateFor(node)
+				if !seen || state == "active" {
 					n++
 				}
 			}
@@ -272,19 +293,44 @@ var registry = []Signature{
 		ID:    "cluster.etcd-quorum",
 		Title: "Embedded etcd has lost or is about to lose quorum",
 		Match: func(e Evidence) int {
-			if e.Etcd == nil || e.Etcd.Desired == 0 {
-				return 0 // sqlite-backed cluster: no etcd to lose
+			// Preferred source: the API server's own view of the members.
+			if e.Etcd != nil && e.Etcd.Desired > 0 {
+				quorum := e.Etcd.Desired/2 + 1
+				switch {
+				case e.Etcd.Ready < quorum:
+					return 95 // below quorum: read-only, or down entirely
+				case e.Etcd.Ready < e.Etcd.Desired:
+					return 70 // quorate, but one more failure ends the cluster
+				}
+				return 0
 			}
-			quorum := e.Etcd.Desired/2 + 1
-			switch {
-			case e.Etcd.Ready < quorum:
-				// below quorum the API server is read-only or down entirely
+			// Losing quorum is exactly what stops the API server answering, so
+			// the preferred source is unavailable in the case that matters
+			// most. Fall back to the host layer: how many control-plane nodes
+			// have a running service.
+			if len(e.ServerNodes) < 3 {
+				return 0 // single server, or too few to have had quorum
+			}
+			down := 0
+			for _, n := range e.ServerNodes {
+				if state, seen := e.K3sService[n]; seen && state != "active" && state != "" {
+					down++
+					continue
+				}
+				for _, u := range e.Unreachable {
+					if u.Name == n {
+						down++
+					}
+				}
+			}
+			if down == 0 {
+				return 0
+			}
+			quorum := len(e.ServerNodes)/2 + 1
+			if len(e.ServerNodes)-down < quorum {
 				return 95
-			case e.Etcd.Ready < e.Etcd.Desired:
-				// still quorate, but one more failure ends the cluster
-				return 70
 			}
-			return 0
+			return 70
 		},
 		Remediation: "Check each etcd server node: `sudo systemctl status k3s` and `sudo k3s etcd-snapshot ls`. Restore a failed member by restarting k3s on it; if a member is permanently gone, remove it with `k3s server --cluster-reset` on a surviving server (snapshot first). An even number of servers gains no quorum — run 3 or 5.",
 	},

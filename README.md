@@ -311,6 +311,11 @@ rather than quietly narrowing the diagnosis:
 ! could not gather pvcs: kubectl get pvc failed (exit 1)
 ```
 
+`doctor --watch 30s` re-runs on an interval, redrawing only when the verdict
+changes so a long watch does not bury the moment things went wrong. It
+reconnects each pass — a node going away is one of the things being watched
+for, and a held-open connection would keep reporting the last state it saw.
+
 `doctor --json` emits the same information as `probe_errors`, for scripts. An
 incomplete gather alone does not fail the exit code — a kubeconfig scoped away
 from one resource should not turn every run red — but it is always stated, so
@@ -589,9 +594,8 @@ Current, and worth knowing before pointing this at production:
 - **Certificate expiry is read via `k3s certificate check`**, so it is not
   collected on kubeadm clusters. `doctor` says so rather than implying the
   certificates are fine.
-- **etcd quorum is read through the API server**, so it cannot be assessed when
-  the API server is the thing that is down. In that case `doctor` reports the
-  stopped service or expired certificates it *can* see.
+- **`vm setup` only installs k3s.** A kubeadm cluster can be checked and
+  diagnosed, but not bootstrapped.
 - **Clock skew is measured against the machine running k3helper**, so a laptop
   with a wrong clock will accuse every node.
 - **A cluster member missing from the targets file is invisible.** Host

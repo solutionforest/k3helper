@@ -858,3 +858,112 @@ func TestEmptyEndpointsRanksUnderNotReadyPods(t *testing.T) {
 		t.Errorf("top = %s, want pod.not-ready above the Service symptom: %+v", d[0].SignatureID, d)
 	}
 }
+
+// --- etcd quorum from host evidence ---
+
+// Losing quorum is exactly what stops the API server answering, so asking the
+// API server about etcd fails in the case that matters most. The host layer
+// still knows how many control-plane services are running.
+func TestEtcdQuorumFromHostEvidenceWhenAPIIsDown(t *testing.T) {
+	base := Evidence{
+		ServerNodes:     []string{"s1", "s2", "s3"},
+		KubeconfigError: "kubectl get nodes failed (exit 1): no output",
+	}
+
+	// two of three servers down: quorum lost
+	lost := base
+	lost.K3sService = map[string]string{"s1": "active", "s2": "inactive", "s3": "failed"}
+	d := Diagnose(lost)
+	if len(d) == 0 || d[0].SignatureID != "cluster.etcd-quorum" {
+		t.Fatalf("quorum loss was not the leading finding: %+v", d)
+	}
+	if d[0].Confidence != 95 {
+		t.Errorf("confidence = %d, want 95", d[0].Confidence)
+	}
+
+	// one of three down: still quorate, but one failure from the edge
+	degraded := base
+	degraded.K3sService = map[string]string{"s1": "active", "s2": "active", "s3": "inactive"}
+	if c := confidenceOf(Diagnose(degraded), "cluster.etcd-quorum"); c != 70 {
+		t.Errorf("degraded-but-quorate confidence = %d, want 70", c)
+	}
+
+	// all healthy: silent
+	healthy := base
+	healthy.KubeconfigError = ""
+	healthy.K3sService = map[string]string{"s1": "active", "s2": "active", "s3": "active"}
+	if hasSig(Diagnose(healthy), "cluster.etcd-quorum") {
+		t.Error("a healthy control plane reported quorum trouble")
+	}
+}
+
+// An unreachable server counts against quorum just as a stopped one does.
+func TestUnreachableServersCountAgainstQuorum(t *testing.T) {
+	e := Evidence{
+		ServerNodes:     []string{"s1", "s2", "s3"},
+		K3sService:      map[string]string{"s1": "active"},
+		Unreachable:     []UnreachableNode{{Name: "s2", Reason: "i/o timeout"}, {Name: "s3", Reason: "i/o timeout"}},
+		KubeconfigError: "kubectl get nodes failed (exit 1)",
+	}
+	if c := confidenceOf(Diagnose(e), "cluster.etcd-quorum"); c != 95 {
+		t.Errorf("two unreachable of three servers = %d, want 95 (quorum lost)", c)
+	}
+}
+
+// A single-server cluster has no etcd and never had quorum to lose.
+func TestNoQuorumFindingForSingleServer(t *testing.T) {
+	e := Evidence{
+		ServerNodes:     []string{"s1"},
+		K3sService:      map[string]string{"s1": "inactive"},
+		KubeconfigError: "kubectl get nodes failed (exit 1)",
+	}
+	if hasSig(Diagnose(e), "cluster.etcd-quorum") {
+		t.Error("a single-server cluster reported quorum loss")
+	}
+}
+
+// The API server's own view wins when it is available.
+func TestEtcdPrefersTheAPIServerView(t *testing.T) {
+	e := Evidence{
+		ServerNodes: []string{"s1", "s2", "s3"},
+		K3sService:  map[string]string{"s1": "active", "s2": "active", "s3": "active"},
+		Etcd:        &ReadyRatio{Ready: 1, Desired: 3}, // API says quorum is lost
+	}
+	if c := confidenceOf(Diagnose(e), "cluster.etcd-quorum"); c != 95 {
+		t.Errorf("confidence = %d, want the API server's verdict of 95", c)
+	}
+}
+
+// Cluster evidence names nodes as Kubernetes does ("sandbox-agent2"); host
+// evidence uses the targets file's name ("agent2"). Without the mapping,
+// node.notready fired alongside node.notready-k3s-down for one fault.
+func TestNodeAliasMatchesClusterNamesToHostEvidence(t *testing.T) {
+	e := Evidence{
+		NodeNotReady: []string{"sandbox-agent2"},
+		K3sService:   map[string]string{"agent2": "inactive"},
+		NodeAlias:    map[string]string{"sandbox-agent2": "agent2"},
+	}
+	d := Diagnose(e)
+	if hasSig(d, "node.notready") {
+		t.Errorf("both signatures fired for one fault: %+v", d)
+	}
+	if !hasSig(d, "node.notready-k3s-down") {
+		t.Errorf("the stopped service was not reported: %+v", d)
+	}
+
+	// Without an alias the node is genuinely unaccounted for, so the generic
+	// NotReady finding is right.
+	e.NodeAlias = nil
+	if !hasSig(Diagnose(e), "node.notready") {
+		t.Error("an unmatched NotReady node should still be reported")
+	}
+}
+
+func confidenceOf(ds []Diagnosis, id string) int {
+	for _, d := range ds {
+		if d.SignatureID == id {
+			return d.Confidence
+		}
+	}
+	return 0
+}

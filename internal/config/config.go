@@ -221,6 +221,18 @@ func (t *Targets) Server() (*Node, error) {
 	return nil, fmt.Errorf("no server node in targets")
 }
 
+// Servers returns every server node, in file order. The first is the one that
+// initialises the cluster when several are present.
+func (t *Targets) Servers() []Node {
+	var out []Node
+	for _, n := range t.Nodes {
+		if n.Role == "server" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // Agent returns all agent nodes.
 func (t *Targets) Agents() []Node {
 	var out []Node

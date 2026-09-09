@@ -79,23 +79,18 @@ func TestFullBootstrap(t *testing.T) {
 	}
 
 	server := sandbox.Dial(t, "server")
-	agents := make([]struct {
-		Node   ssh.Node
-		Client *ssh.Client
-	}, 0, len(agentNodes))
+	servers := []vm.Target{{Node: serverNode, Client: server}}
+	agents := make([]vm.Target, 0, len(agentNodes))
 	for _, n := range agentNodes {
 		c, err := ssh.Dial(n)
 		if err != nil {
 			t.Fatalf("connect agent %s: %v", n.Host, err)
 		}
 		defer c.Close()
-		agents = append(agents, struct {
-			Node   ssh.Node
-			Client *ssh.Client
-		}{n, c})
+		agents = append(agents, vm.Target{Node: n, Client: c})
 	}
 
-	err = vm.Setup(server, serverNode, agents, vm.Options{
+	err = vm.Setup(servers, agents, vm.Options{
 		ServerExtraArgs: "--snapshotter=native --disable=traefik",
 		AgentExtraArgs:  "--snapshotter=native",
 	})

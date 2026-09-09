@@ -40,54 +40,106 @@ func (o Options) channel() string {
 	return o.Channel
 }
 
-// Setup installs k3s on the server then joins agents.
-// targets is expressed with minimal structural coupling: serverNode + agents.
-func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
+// Host is what Setup needs from a connection. *ssh.Client satisfies it; tests
+// substitute a recorder so the install commands can be asserted without a VM.
+type Host interface {
+	Run(cmd string) (string, int, error)
+	SudoRun(cmd string) (string, int, error)
+	Stream(cmd string, w io.Writer) (int, error)
+	SudoPrefix() string
+}
+
+// Target is one machine to bootstrap, with an open connection to it.
+type Target struct {
 	Node   ssh.Node
-	Client *ssh.Client
-}, opts Options) error {
+	Client Host
+}
+
+// Compile-time check that the real client still fits.
+var _ Host = (*ssh.Client)(nil)
+
+// Setup installs k3s across the cluster: servers first, then agents.
+//
+// One server keeps k3s's default sqlite datastore. Two or more switch to
+// embedded etcd: the first is installed with --cluster-init and the rest join
+// it with --server. etcd needs an odd number of members to hold quorum, so an
+// even count is reported rather than silently built.
+func Setup(servers []Target, agents []Target, opts Options) error {
 	progressf := func(format string, a ...interface{}) {
 		if opts.Progress != nil {
 			fmt.Fprintf(opts.Progress, format+"\n", a...)
 		}
 	}
+	if len(servers) == 0 {
+		return fmt.Errorf("at least one server is required")
+	}
+	if len(servers)%2 == 0 {
+		return fmt.Errorf(
+			"%d servers cannot hold etcd quorum: a cluster of %d tolerates the same "+
+				"single failure as %d, and loses quorum at two. Use an odd number (1, 3 or 5)",
+			len(servers), len(servers), len(servers)-1)
+	}
 
-	// 1. install k3s on server
-	progressf("[server] installing k3s server (%s channel)...", opts.channel())
-	// The token is single-quoted: this string is piped straight into a root
-	// shell, so an unquoted token containing a space, ; or $( ) would break
-	// the command or run as one.
+	first := servers[0]
+	ha := len(servers) > 1
+
+	// 1. first server. --cluster-init switches k3s from sqlite to embedded
+	// etcd; it must be given only to the node that creates the cluster.
+	mode := "single-server (sqlite)"
+	initArgs := opts.ServerExtraArgs
+	if ha {
+		mode = fmt.Sprintf("HA (%d servers, embedded etcd)", len(servers))
+		initArgs = strings.TrimSpace("--cluster-init " + opts.ServerExtraArgs)
+	}
+	progressf("[%s] installing k3s server — %s...", first.Node.Host, mode)
 	tokenArg := ""
 	if opts.Token != "" {
 		tokenArg = " K3S_TOKEN=" + shellQuote(opts.Token)
 	}
 	cmd := fmt.Sprintf(
 		`curl -sfL %s | %sINSTALL_K3S_CHANNEL=%s%s sh -s - server%s`,
-		opts.installURL(), server.SudoPrefix(), opts.channel(), tokenArg, withSpace(opts.ServerExtraArgs),
+		opts.installURL(), first.Client.SudoPrefix(), opts.channel(), tokenArg, withSpace(initArgs),
 	)
-	if code, err := streamSudo(server, cmd, opts.Progress); err != nil || code != 0 {
+	if code, err := streamSudo(first.Client, cmd, opts.Progress); err != nil || code != 0 {
 		return fmt.Errorf("server install failed (exit %d): %w", code, err)
 	}
 
-	// 2. fetch node token from server
-	progressf("[server] fetching join token...")
-	token, err := serverToken(server)
+	// 2. the join token and the address the others will reach it on
+	progressf("[%s] fetching join token...", first.Node.Host)
+	token, err := serverToken(first.Client)
 	if err != nil {
 		return fmt.Errorf("fetch token: %w", err)
 	}
-
-	// 3. fetch server internal IP for agents to join
-	ip, err := serverInternalIP(server)
+	ip, err := serverInternalIP(first.Client)
 	if err != nil {
 		return fmt.Errorf("fetch server IP: %w", err)
 	}
 
-	// 4. join agents
+	// 3. remaining servers join the etcd cluster
+	for _, s := range servers[1:] {
+		progressf("[%s] joining as server (etcd member)...", s.Node.Host)
+		joinCmd := fmt.Sprintf(
+			`curl -sfL %s | %sK3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - server --server https://%s:6443%s`,
+			opts.installURL(), s.Client.SudoPrefix(), shellQuote(token), opts.channel(), ip,
+			withSpace(opts.ServerExtraArgs),
+		)
+		if code, err := streamSudo(s.Client, joinCmd, opts.Progress); err != nil || code != 0 {
+			return fmt.Errorf("server %s join failed (exit %d): %w", s.Node.Host, code, err)
+		}
+		// Servers are added one at a time on purpose: etcd learners join
+		// sequentially, and adding several at once can cost quorum.
+		if err := waitReady(first.Client, 0, 120*time.Second); err != nil {
+			return fmt.Errorf("cluster did not settle after %s joined: %w", s.Node.Host, err)
+		}
+	}
+
+	// 4. agents
 	for _, a := range agents {
 		progressf("[%s] installing k3s agent...", a.Node.Host)
 		joinCmd := fmt.Sprintf(
 			`curl -sfL %s | %sK3S_URL=https://%s:6443 K3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - agent%s`,
-			opts.installURL(), a.Client.SudoPrefix(), ip, shellQuote(token), opts.channel(), withSpace(opts.AgentExtraArgs),
+			opts.installURL(), a.Client.SudoPrefix(), ip, shellQuote(token), opts.channel(),
+			withSpace(opts.AgentExtraArgs),
 		)
 		if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 			return fmt.Errorf("agent %s install failed (exit %d): %w", a.Node.Host, code, err)
@@ -95,12 +147,14 @@ func Setup(server *ssh.Client, serverNode ssh.Node, agents []struct {
 	}
 
 	// 5. wait for every node to register AND become ready
-	expected := 1 + len(agents)
+	expected := len(servers) + len(agents)
 	progressf("waiting for %d node(s) to become ready...", expected)
-	return waitReady(server, expected, 180*time.Second)
+	return waitReady(first.Client, expected, 180*time.Second)
 }
 
-// shellQuote wraps a value in single quotes, escaping any it contains.
+// shellQuote wraps a value in single quotes, escaping any it contains. These
+// strings are piped into a root shell, so an unquoted token containing a
+// space, ; or $( ) would break the command or run as one.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
@@ -112,7 +166,7 @@ func withSpace(s string) string {
 	return " " + strings.TrimSpace(s)
 }
 
-func streamSudo(c *ssh.Client, cmd string, w io.Writer) (int, error) {
+func streamSudo(c Host, cmd string, w io.Writer) (int, error) {
 	if w != nil {
 		return c.Stream(cmd, w)
 	}
@@ -154,6 +208,8 @@ func serverInternalIP(server Runner) (string, error) {
 }
 
 // waitReady polls until `expected` nodes have registered and all are Ready.
+// An expected of 0 means "however many are registered, all must be Ready",
+// which is what the pause between etcd members joining needs.
 //
 // Counting only the nodes that happen to have registered would let the server
 // alone satisfy the wait while agents are still joining, so "cluster ready"

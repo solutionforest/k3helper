@@ -1,6 +1,9 @@
 package vm
 
 import (
+	"io"
+
+	"github.com/solutionforest/k3helper/internal/ssh"
 	"strings"
 	"testing"
 	"time"
@@ -214,5 +217,147 @@ func TestReadySummaryDistinguishesFailureModes(t *testing.T) {
 	}
 	if strings.Contains(notReady, "agent2") {
 		t.Errorf("should not name Ready nodes: %s", notReady)
+	}
+}
+
+// --- HA control plane ---
+
+// fakeHost records every command Setup issues, and answers the few probes it
+// makes, so the install arguments can be asserted without a VM.
+type fakeHost struct {
+	name string
+	rec  *[]string
+}
+
+func (f fakeHost) Run(cmd string) (string, int, error) {
+	*f.rec = append(*f.rec, f.name+": "+cmd)
+	switch {
+	case strings.Contains(cmd, "node-token"):
+		return "K10secret::server:node\n", 0, nil
+	case strings.Contains(cmd, "hostname -I"):
+		return "10.0.0.1\n", 0, nil
+	case strings.Contains(cmd, "get nodes"):
+		// enough Ready nodes to satisfy any arrangement these tests build
+		return "a=True\nb=True\nc=True\nd=True\n", 0, nil
+	}
+	return "", 0, nil
+}
+func (f fakeHost) SudoRun(cmd string) (string, int, error) { return f.Run("sudo -n " + cmd) }
+func (f fakeHost) Stream(cmd string, w io.Writer) (int, error) {
+	*f.rec = append(*f.rec, f.name+": "+cmd)
+	return 0, nil
+}
+func (f fakeHost) SudoPrefix() string { return "sudo " }
+
+func fakeTargets(rec *[]string, names ...string) []Target {
+	var out []Target
+	for _, n := range names {
+		out = append(out, Target{Node: ssh.Node{Host: n}, Client: fakeHost{name: n, rec: rec}})
+	}
+	return out
+}
+
+// etcd needs an odd member count to hold quorum. Four servers tolerate the
+// same single failure as three and lose quorum at two, so building one is
+// almost never what the operator meant.
+func TestSetupRejectsEvenServerCount(t *testing.T) {
+	var rec []string
+	for _, n := range [][]string{{"s1", "s2"}, {"s1", "s2", "s3", "s4"}} {
+		err := Setup(fakeTargets(&rec, n...), nil, Options{})
+		if err == nil {
+			t.Fatalf("%d servers was accepted", len(n))
+		}
+		if !strings.Contains(err.Error(), "quorum") {
+			t.Errorf("error should explain quorum: %v", err)
+		}
+	}
+	if err := Setup(nil, nil, Options{}); err == nil {
+		t.Error("zero servers should be rejected")
+	}
+}
+
+// A single server keeps k3s's default sqlite datastore; --cluster-init would
+// switch it to embedded etcd for no reason.
+func TestSingleServerKeepsSqlite(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1"), nil, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if strings.Contains(all, "--cluster-init") {
+		t.Errorf("a single server should not use --cluster-init:\n%s", all)
+	}
+	if !strings.Contains(all, "sh -s - server") {
+		t.Errorf("no server install issued:\n%s", all)
+	}
+}
+
+// Three servers: the first initialises embedded etcd, the other two join it.
+func TestHAServersInitialiseThenJoin(t *testing.T) {
+	var rec []string
+	servers := fakeTargets(&rec, "s1", "s2", "s3")
+	agents := fakeTargets(&rec, "a1")
+	if err := Setup(servers, agents, Options{ServerExtraArgs: "--disable=traefik"}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	var s1, s2, s3, a1 string
+	for _, line := range rec {
+		if !strings.Contains(line, "sh -s -") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "s1: "):
+			s1 = line
+		case strings.HasPrefix(line, "s2: "):
+			s2 = line
+		case strings.HasPrefix(line, "s3: "):
+			s3 = line
+		case strings.HasPrefix(line, "a1: "):
+			a1 = line
+		}
+	}
+
+	if !strings.Contains(s1, "--cluster-init") {
+		t.Errorf("the first server must initialise the cluster: %s", s1)
+	}
+	if !strings.Contains(s1, "--disable=traefik") {
+		t.Errorf("extra args were dropped from the first server: %s", s1)
+	}
+	for name, line := range map[string]string{"s2": s2, "s3": s3} {
+		if strings.Contains(line, "--cluster-init") {
+			t.Errorf("%s must join, not re-initialise: %s", name, line)
+		}
+		if !strings.Contains(line, "--server https://10.0.0.1:6443") {
+			t.Errorf("%s did not join the first server: %s", name, line)
+		}
+		if !strings.Contains(line, "K3S_TOKEN='K10secret::server:node'") {
+			t.Errorf("%s joined without the quoted token: %s", name, line)
+		}
+	}
+	if !strings.Contains(a1, "K3S_URL=https://10.0.0.1:6443") || strings.Contains(a1, "--server ") {
+		t.Errorf("the agent should join with K3S_URL, not --server: %s", a1)
+	}
+}
+
+// Servers are added one at a time: etcd learners join sequentially, and adding
+// several at once can cost quorum.
+func TestHAServersJoinSequentially(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1", "s2", "s3"), nil, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	joinIdx, settleAfterJoin := -1, false
+	for i, line := range rec {
+		if strings.HasPrefix(line, "s2: ") && strings.Contains(line, "sh -s -") {
+			joinIdx = i
+		}
+		if joinIdx >= 0 && i > joinIdx && strings.Contains(line, "get nodes") {
+			settleAfterJoin = true
+			break
+		}
+	}
+	if !settleAfterJoin {
+		t.Error("the cluster was not allowed to settle before the next server joined")
 	}
 }

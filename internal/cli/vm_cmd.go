@@ -34,48 +34,46 @@ func newVMSetupCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			srvNode, err := targets.Server()
-			if err != nil {
-				return err
-			}
-			sshSrv := toSSHNode(*srvNode)
-			server, err := ssh.Dial(sshSrv)
-			if err != nil {
-				return fmt.Errorf("connect to server %s: %w", srvNode.Name, err)
-			}
-			defer server.Close()
-
-			type agentConn struct {
-				node   ssh.Node
-				client *ssh.Client
-			}
-			var agents []agentConn
+			// Servers first, then agents. Multiple servers switch k3s to
+			// embedded etcd; the first one initialises the cluster.
+			var servers, agents []vm.Target
+			var conns []*ssh.Client
+			// Kept concretely: FetchKubeconfig needs the real client, not the
+			// narrower interface Setup takes.
+			var firstServer *ssh.Client
 			defer func() {
-				for _, a := range agents {
-					a.client.Close()
+				for _, c := range conns {
+					c.Close()
 				}
 			}()
-			for _, n := range targets.Agents() {
-				c, err := ssh.Dial(toSSHNode(n))
+			for _, n := range targets.Nodes {
+				c, err := ssh.Dial(n.SSH())
 				if err != nil {
-					return fmt.Errorf("connect to agent %s: %w", n.Name, err)
+					return fmt.Errorf("connect to %s (%s): %w", n.Name, n.Host, err)
 				}
-				agents = append(agents, agentConn{node: toSSHNode(n), client: c})
+				conns = append(conns, c)
+				t := vm.Target{Node: n.SSH(), Client: c}
+				if n.Role == "server" {
+					if firstServer == nil {
+						firstServer = c
+					}
+					servers = append(servers, t)
+				} else {
+					agents = append(agents, t)
+				}
+			}
+			if len(servers) == 0 {
+				return fmt.Errorf("no server node in targets")
+			}
+			srvNode := &targets.Nodes[0]
+			for i := range targets.Nodes {
+				if targets.Nodes[i].Role == "server" {
+					srvNode = &targets.Nodes[i]
+					break
+				}
 			}
 
-			// convert for vm.Setup (avoid import cycle with a plain struct)
-			agentList := make([]struct {
-				Node   ssh.Node
-				Client *ssh.Client
-			}, len(agents))
-			for i, a := range agents {
-				agentList[i] = struct {
-					Node   ssh.Node
-					Client *ssh.Client
-				}{a.node, a.client}
-			}
-
-			err = vm.Setup(server, sshSrv, agentList, vm.Options{
+			err = vm.Setup(servers, agents, vm.Options{
 				Channel:         channel,
 				Token:           token,
 				ServerExtraArgs: extraArgs,
@@ -86,7 +84,7 @@ func newVMSetupCmd() *cobra.Command {
 				return err
 			}
 			if kubeconfig != "" {
-				if err := vm.FetchKubeconfig(server, kubeconfig, srvNode.Host); err != nil {
+				if err := vm.FetchKubeconfig(firstServer, kubeconfig, srvNode.Host); err != nil {
 					return fmt.Errorf("fetch kubeconfig: %w", err)
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "kubeconfig written to %s\n", kubeconfig)
