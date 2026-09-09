@@ -1,13 +1,19 @@
 package cli
 
 import (
-	"github.com/charmbracelet/lipgloss"
+	"fmt"
+	"strings"
+
+	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/tui"
 	"github.com/spf13/cobra"
 )
 
 func newTUICmd() *cobra.Command {
-	var targetsPath string
+	var (
+		targetsPath string
+		theme       string
+	)
 	cmd := &cobra.Command{
 		Use:   "tui",
 		Short: "Launch the interactive dashboard",
@@ -16,13 +22,23 @@ func newTUICmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, err = tui.NewProgram(tui.New(targets))
+			if err := tui.SetTheme(theme); err != nil {
+				return err
+			}
+			m := tui.New(targets)
+			// The whole file (not just the selected cluster) backs `:ctx`, so
+			// the operator can switch clusters without leaving the TUI. A file
+			// that fails to reload is not fatal: the dashboard still works for
+			// the cluster already loaded, minus the switcher.
+			if f, err := config.Load(targetsPath); err == nil {
+				m = m.WithFile(f, targetsPath)
+			}
+			_, err = tui.NewProgram(m)
 			return err
 		},
 	}
 	cmd.Flags().StringVarP(&targetsPath, "targets", "t", "targets.yaml", "path to targets YAML")
+	cmd.Flags().StringVar(&theme, "theme", "",
+		fmt.Sprintf("skin: %s, or a path to a skin YAML file", strings.Join(tui.ThemeNames(), " | ")))
 	return cmd
 }
-
-// keep lipgloss referenced for future styling in this package
-var _ = lipgloss.NewStyle

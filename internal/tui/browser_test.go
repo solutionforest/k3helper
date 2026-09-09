@@ -226,7 +226,7 @@ func TestTickTriggersRefresh(t *testing.T) {
 }
 
 func TestPodRowsRenderExpectedColumns(t *testing.T) {
-	rows := podRows(samplePods(), "")
+	rows := podRows(samplePods(), rowOpts{})
 	if len(rows) != 3 {
 		t.Fatalf("rows = %d", len(rows))
 	}
@@ -247,7 +247,7 @@ func TestPodRowsRenderExpectedColumns(t *testing.T) {
 
 func TestEventRowsTruncateLongMessages(t *testing.T) {
 	long := strings.Repeat("x", 200)
-	rows := eventRows([]kube.Event{{Namespace: "p", Type: "Warning", Reason: "R", Object: "Pod/a", Message: long}}, "")
+	rows := eventRows([]kube.Event{{Namespace: "p", Type: "Warning", Reason: "R", Object: "Pod/a", Message: long}}, rowOpts{})
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d", len(rows))
 	}

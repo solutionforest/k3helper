@@ -85,6 +85,10 @@ type Pod struct {
 	Restarts  int
 	Node      string
 	Age       time.Duration
+	// IP and Labels are only shown in wide mode, but are always parsed: a
+	// second query to fill them in would show a different moment's cluster.
+	IP     string
+	Labels map[string]string
 }
 
 // Node is one row of the node browser.
@@ -94,6 +98,10 @@ type Node struct {
 	Roles   string
 	Version string
 	Age     time.Duration
+	// Wide-mode columns.
+	InternalIP string
+	OSImage    string
+	Kernel     string
 }
 
 // Event is one row of the event browser.
@@ -110,7 +118,21 @@ type Event struct {
 // ListPods returns pods in ns ("" = all namespaces), newest problems first is
 // left to the caller; ordering here is namespace/name for stability.
 func ListPods(exec Executor, ns string) ([]Pod, error) {
-	out, code, err := exec.Run(Builder(exec)("get pods "+nsFlag(ns)+" -o json") + " 2>/dev/null")
+	return ListPodsSelector(exec, ns, "")
+}
+
+// ListPodsSelector is ListPods narrowed by a label selector, in kubectl's own
+// `-l` syntax (`app=web`, `tier!=db`, `app in (a,b)`).
+//
+// The selector is evaluated by the API server rather than here: label matching
+// has semantics (set operators, inequality) that a client-side reimplementation
+// would get subtly wrong, and a wrong selector would silently hide pods.
+func ListPodsSelector(exec Executor, ns, selector string) ([]Pod, error) {
+	args := "get pods " + nsFlag(ns) + " -o json"
+	if selector != "" {
+		args += " -l " + shellQuote(selector)
+	}
+	out, code, err := exec.Run(Builder(exec)(args) + " 2>/dev/null")
 	if err != nil {
 		return nil, err
 	}
@@ -120,9 +142,10 @@ func ListPods(exec Executor, ns string) ([]Pod, error) {
 	var raw struct {
 		Items []struct {
 			Metadata struct {
-				Namespace         string    `json:"namespace"`
-				Name              string    `json:"name"`
-				CreationTimestamp time.Time `json:"creationTimestamp"`
+				Namespace         string            `json:"namespace"`
+				Name              string            `json:"name"`
+				Labels            map[string]string `json:"labels"`
+				CreationTimestamp time.Time         `json:"creationTimestamp"`
 			} `json:"metadata"`
 			Spec struct {
 				NodeName string `json:"nodeName"`
@@ -130,6 +153,7 @@ func ListPods(exec Executor, ns string) ([]Pod, error) {
 			Status struct {
 				Phase             string `json:"phase"`
 				Reason            string `json:"reason"`
+				PodIP             string `json:"podIP"`
 				ContainerStatuses []struct {
 					Ready        bool `json:"ready"`
 					RestartCount int  `json:"restartCount"`
@@ -157,6 +181,8 @@ func ListPods(exec Executor, ns string) ([]Pod, error) {
 			Node:      it.Spec.NodeName,
 			Status:    it.Status.Phase,
 			Age:       now.Sub(it.Metadata.CreationTimestamp),
+			IP:        it.Status.PodIP,
+			Labels:    it.Metadata.Labels,
 		}
 		if it.Status.Reason != "" {
 			p.Status = it.Status.Reason
@@ -223,8 +249,14 @@ func ListNodes(exec Executor) ([]Node, error) {
 					Type   string `json:"type"`
 					Status string `json:"status"`
 				} `json:"conditions"`
+				Addresses []struct {
+					Type    string `json:"type"`
+					Address string `json:"address"`
+				} `json:"addresses"`
 				NodeInfo struct {
 					KubeletVersion string `json:"kubeletVersion"`
+					OSImage        string `json:"osImage"`
+					KernelVersion  string `json:"kernelVersion"`
 				} `json:"nodeInfo"`
 			} `json:"status"`
 		} `json:"items"`
@@ -240,10 +272,17 @@ func ListNodes(exec Executor) ([]Node, error) {
 			Status:  "NotReady",
 			Version: it.Status.NodeInfo.KubeletVersion,
 			Age:     now.Sub(it.Metadata.CreationTimestamp),
+			OSImage: it.Status.NodeInfo.OSImage,
+			Kernel:  it.Status.NodeInfo.KernelVersion,
 		}
 		for _, c := range it.Status.Conditions {
 			if c.Type == "Ready" && c.Status == "True" {
 				n.Status = "Ready"
+			}
+		}
+		for _, a := range it.Status.Addresses {
+			if a.Type == "InternalIP" {
+				n.InternalIP = a.Address
 			}
 		}
 		var roles []string
