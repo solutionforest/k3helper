@@ -5,17 +5,23 @@ import (
 	"testing"
 )
 
-func TestRootCmdVersion(t *testing.T) {
-	var out strings.Builder
+// The version must land on stdout, not stderr: `VER=$(k3helper version)` is how
+// scripts and the release workflow pin it, and cobra's cmd.Printf writes to
+// stderr, so pointing both streams at one buffer would hide the difference.
+func TestRootCmdVersionGoesToStdout(t *testing.T) {
+	var out, errOut strings.Builder
 	root := NewRootCmd()
 	root.SetOut(&out)
-	root.SetErr(&out)
+	root.SetErr(&errOut)
 	root.SetArgs([]string{"version"})
 	if err := root.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	if !strings.Contains(out.String(), "k3helper") {
-		t.Errorf("output = %q, want version string", out.String())
+		t.Errorf("stdout = %q, want the version string", out.String())
+	}
+	if errOut.String() != "" {
+		t.Errorf("stderr = %q, want empty", errOut.String())
 	}
 }
 

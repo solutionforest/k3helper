@@ -83,7 +83,10 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.Printf("k3helper %s\n", version)
+			// Not cmd.Printf: cobra sends that to stderr, so `$(k3helper
+			// version)` captured nothing and scripts pinning a version saw an
+			// empty string.
+			fmt.Fprintf(cmd.OutOrStdout(), "k3helper %s\n", version)
 			return nil
 		},
 	}
