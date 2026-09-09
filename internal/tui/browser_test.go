@@ -330,3 +330,96 @@ func TestCommandBarSwallowsQuitKey(t *testing.T) {
 		t.Errorf("input = %q, want q typed into the bar", m.input.Value())
 	}
 }
+
+// --- port forwards and multi-pod logs ---
+
+func TestResolveViewPortsAndLogs(t *testing.T) {
+	for in, want := range map[string]view{
+		"ports": viewPorts, "pf": viewPorts, "port-forward": viewPorts,
+		"logs": viewMultiLogs, "tail": viewMultiLogs,
+	} {
+		got, ok := resolveView(in)
+		if !ok || got != want {
+			t.Errorf("resolveView(%q) = %v,%v; want %v,true", in, got, ok, want)
+		}
+	}
+}
+
+func TestForwardRowsRenderLocalAndTarget(t *testing.T) {
+	rows := forwardRows([]forward{
+		{Namespace: "prod", Target: "pod/web-1", RemotePort: 8080, LocalPort: 51234},
+	})
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	// local port, namespace, target, remote port
+	if rows[0][0] != "51234" || rows[0][1] != "prod" || rows[0][2] != "pod/web-1" || rows[0][3] != "8080" {
+		t.Errorf("row = %v", rows[0])
+	}
+}
+
+// The empty state must say how to create a forward, and why a tunnel exists —
+// otherwise "no active port forwards" is a dead end.
+func TestPortsEmptyStateExplainsItself(t *testing.T) {
+	m := New(browserTargets())
+	m.view = viewPorts
+	m.loading = false
+	out := m.View()
+	for _, want := range []string{"no active port forwards", ":pods", "press f", "tunnel"} {
+		if !contains(out, want) {
+			t.Errorf("empty state missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// Every log line must be attributable to the pod that wrote it.
+func TestMultiLogsPrefixEachLineWithItsPod(t *testing.T) {
+	out := renderMultiLogs([]kube.PodLog{
+		{Namespace: "prod", Pod: "web-1", Lines: []string{"listening on :8080", "ready"}},
+		{Namespace: "prod", Pod: "web-2", Lines: []string{"listening on :8080"}},
+	}, 100)
+	for _, want := range []string{"prod/web-1", "prod/web-2", "listening on :8080", "ready"} {
+		if !contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	// each pod's own name prefixes its lines
+	if strings.Count(out, "web-1 │") != 2 {
+		t.Errorf("web-1's two lines are not both prefixed:\n%s", out)
+	}
+}
+
+func TestMultiLogsReportsPerPodErrors(t *testing.T) {
+	out := renderMultiLogs([]kube.PodLog{
+		{Namespace: "prod", Pod: "broken", Err: errFake{}},
+		{Namespace: "prod", Pod: "quiet", Lines: nil},
+	}, 100)
+	if !contains(out, "boom") {
+		t.Errorf("a pod's error was swallowed:\n%s", out)
+	}
+	if !contains(out, "(no output)") {
+		t.Errorf("a pod with no logs should say so:\n%s", out)
+	}
+}
+
+func TestMultiLogsEmpty(t *testing.T) {
+	if got := renderMultiLogs(nil, 80); !contains(got, "no pods matched") {
+		t.Errorf("got %q", got)
+	}
+}
+
+// A forward list arriving from the command updates the table in place.
+func TestForwardsMsgPopulatesTheTable(t *testing.T) {
+	m := New(browserTargets())
+	m.view = viewPorts
+	next, _ := m.Update(forwardsMsg{forwards: []forward{
+		{Namespace: "prod", Target: "pod/web-1", RemotePort: 80, LocalPort: 50000},
+	}})
+	m = next.(Model)
+	if len(m.forwards) != 1 {
+		t.Fatalf("forwards = %+v", m.forwards)
+	}
+	if len(m.table.Rows()) != 1 {
+		t.Errorf("table not rebuilt: %d rows", len(m.table.Rows()))
+	}
+}

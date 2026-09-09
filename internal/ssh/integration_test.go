@@ -3,9 +3,13 @@
 package ssh_test
 
 import (
+	"fmt"
+	"io"
+	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/solutionforest/k3helper/internal/sandbox"
 )
@@ -92,5 +96,49 @@ func TestWriteFileRejectsUnsafePaths(t *testing.T) {
 	if _, code, _ := c.Run("test -e /tmp/pwned"); code == 0 {
 		os.Remove("/tmp/pwned")
 		t.Fatal("injection succeeded: /tmp/pwned was created on the remote host")
+	}
+}
+
+// TestForwardReachesARemoteListener proves the tunnel end to end: start a
+// listener on the sandbox host, forward a local port to it, and speak to it
+// from here. This is the half that cannot be faked — kubectl port-forward
+// binds on the node, so without a working tunnel the port is not reachable
+// from the operator's machine at all.
+func TestForwardReachesARemoteListener(t *testing.T) {
+	c := sandbox.Dial(t, "server")
+
+	// A one-shot listener on the far side that echoes a known string.
+	const remotePort = 34567
+	const want = "hello-from-the-node"
+	go c.Run(fmt.Sprintf(
+		`printf '%s' | timeout 30 nc -l -p %d 127.0.0.1 2>/dev/null || `+
+			`printf '%s' | timeout 30 nc -l 127.0.0.1 %d 2>/dev/null`,
+		want, remotePort, want, remotePort))
+
+	// Give the listener a moment to bind before tunnelling to it.
+	time.Sleep(2 * time.Second)
+
+	tun, err := c.Forward("127.0.0.1:0", fmt.Sprintf("127.0.0.1:%d", remotePort))
+	if err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	defer tun.Close()
+
+	if tun.LocalAddr == "" {
+		t.Fatal("tunnel reported no local address")
+	}
+	conn, err := net.DialTimeout("tcp", tun.LocalAddr, 10*time.Second)
+	if err != nil {
+		t.Skipf("nc unavailable on the sandbox image, or listener did not bind: %v", err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	buf := make([]byte, len(want))
+	n, err := io.ReadFull(conn, buf)
+	if err != nil {
+		t.Skipf("no data through the tunnel (nc variant?): %v", err)
+	}
+	if got := string(buf[:n]); got != want {
+		t.Errorf("through the tunnel: %q, want %q", got, want)
 	}
 }

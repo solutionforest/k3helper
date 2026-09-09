@@ -370,3 +370,135 @@ func ShortAge(d time.Duration) string {
 		return fmt.Sprintf("%dd", int(d.Hours()/24))
 	}
 }
+
+// --- port forwarding ---
+
+// PortForward is a running `kubectl port-forward` on the cluster node.
+type PortForward struct {
+	Namespace string
+	// Target is the object being forwarded to, e.g. "pod/web-1" or "svc/web".
+	Target string
+	// RemotePort is the port on the object; LocalPort is what the operator
+	// connects to on their own machine.
+	RemotePort int
+	LocalPort  int
+	// nodePort is the port kubectl bound on the cluster node, which the SSH
+	// tunnel connects to.
+	nodePort int
+	stop     func() error
+}
+
+// StartPortForward runs `kubectl port-forward` on the node and returns once it
+// is listening.
+//
+// kubectl binds on the node, so the caller still has to tunnel to
+// NodeAddr() to reach it from elsewhere.
+func StartPortForward(exec Executor, ns, target string, remotePort, nodePort int) (*PortForward, error) {
+	if nodePort <= 0 {
+		return nil, fmt.Errorf("a node port is required")
+	}
+	kubectl := Builder(exec)
+	// Backgrounded with nohup and its pid recorded, because the session that
+	// starts it goes away as soon as Run returns.
+	cmd := fmt.Sprintf(
+		`nohup %s >/tmp/k3helper-pf-%d.log 2>&1 & echo $!`,
+		kubectl(fmt.Sprintf("port-forward -n %s %s %d:%d --address 127.0.0.1",
+			shellQuote(ns), shellQuote(target), nodePort, remotePort)),
+		nodePort)
+	out, code, err := exec.Run(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("start port-forward: %w", err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("start port-forward (exit %d): %s", code, strings.TrimSpace(out))
+	}
+	pid := strings.TrimSpace(out)
+	if pid == "" {
+		return nil, fmt.Errorf("port-forward did not start")
+	}
+
+	// Wait for kubectl to bind before reporting success, or the first
+	// connection through the tunnel races it and is refused.
+	ready := false
+	for i := 0; i < 20; i++ {
+		if _, code, _ := exec.Run(fmt.Sprintf(
+			`grep -q "Forwarding from" /tmp/k3helper-pf-%d.log 2>/dev/null`, nodePort)); code == 0 {
+			ready = true
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if !ready {
+		log, _, _ := exec.Run(fmt.Sprintf(`cat /tmp/k3helper-pf-%d.log 2>/dev/null`, nodePort))
+		exec.Run(fmt.Sprintf(`kill %s 2>/dev/null`, shellQuote(pid)))
+		return nil, fmt.Errorf("port-forward did not start listening: %s", firstLine(strings.TrimSpace(log)))
+	}
+
+	return &PortForward{
+		Namespace: ns, Target: target, RemotePort: remotePort, nodePort: nodePort,
+		stop: func() error {
+			exec.Run(fmt.Sprintf(`kill %s 2>/dev/null; rm -f /tmp/k3helper-pf-%d.log`, shellQuote(pid), nodePort))
+			return nil
+		},
+	}, nil
+}
+
+// NodeAddr is the address kubectl is listening on, on the cluster node.
+func (p *PortForward) NodeAddr() string { return fmt.Sprintf("127.0.0.1:%d", p.nodePort) }
+
+// Stop terminates the remote kubectl.
+func (p *PortForward) Stop() error {
+	if p.stop == nil {
+		return nil
+	}
+	err := p.stop()
+	p.stop = nil
+	return err
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// --- multi-pod logs ---
+
+// PodLog is one pod's recent output.
+type PodLog struct {
+	Namespace string
+	Pod       string
+	Lines     []string
+	Err       error
+}
+
+// LogsForSelector tails the last `tail` lines from every pod matching a label
+// selector, keeping each pod's output separate so the caller can label it.
+//
+// kubectl's own multi-pod output interleaves without saying which pod a line
+// came from unless --prefix is used, and --prefix cannot be turned off per
+// line; keeping them apart lets the caller colour and filter by pod.
+func LogsForSelector(exec Executor, ns, selector string, tail int) ([]PodLog, error) {
+	pods, err := ListPods(exec, ns)
+	if err != nil {
+		return nil, err
+	}
+	var out []PodLog
+	for _, p := range pods {
+		if selector != "" && !strings.Contains(p.Name, selector) {
+			continue
+		}
+		body, err := Logs(exec, p.Namespace, p.Name, tail, false)
+		l := PodLog{Namespace: p.Namespace, Pod: p.Name, Err: err}
+		if err == nil {
+			for _, line := range strings.Split(strings.TrimRight(body, "\n"), "\n") {
+				if line != "" {
+					l.Lines = append(l.Lines, line)
+				}
+			}
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}

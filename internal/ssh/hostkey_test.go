@@ -272,3 +272,25 @@ func testRSAKey(t *testing.T) gossh.PublicKey {
 	}
 	return pub
 }
+
+// A local node has nothing to tunnel through, and must say so rather than
+// pretending to build one.
+func TestForwardRefusedForLocalNode(t *testing.T) {
+	c, err := Dial(Node{Local: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Forward("127.0.0.1:0", "127.0.0.1:80"); err == nil {
+		t.Error("a local node should not build a tunnel")
+	}
+}
+
+// A tunnel on a closed client must fail rather than listen on a port that can
+// never carry traffic.
+func TestForwardRefusedOnClosedClient(t *testing.T) {
+	c := &Client{}
+	if _, err := c.Forward("127.0.0.1:0", "127.0.0.1:80"); err == nil {
+		t.Error("expected an error with no ssh connection")
+	}
+}

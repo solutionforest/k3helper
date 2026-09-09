@@ -2,6 +2,8 @@ package tui
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/table"
@@ -9,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/solutionforest/k3helper/internal/kube"
+	"github.com/solutionforest/k3helper/internal/ssh"
 )
 
 // view identifies what the browser is currently showing.
@@ -21,6 +24,8 @@ const (
 	viewEvents    view = "events"
 	viewLogs      view = "logs"
 	viewDescribe  view = "describe"
+	viewPorts     view = "ports"
+	viewMultiLogs view = "multi-logs"
 )
 
 // resolveView maps a command-bar word to a view, accepting the k9s-style
@@ -35,6 +40,10 @@ func resolveView(s string) (view, bool) {
 		return viewEvents, true
 	case "dash", "dashboard", "home":
 		return viewDashboard, true
+	case "pf", "port", "ports", "port-forward":
+		return viewPorts, true
+	case "logs", "log", "tail":
+		return viewMultiLogs, true
 	}
 	return "", false
 }
@@ -218,6 +227,13 @@ func columnsFor(v view, width int) []table.Column {
 			{Title: "VERSION", Width: 16},
 			{Title: "AGE", Width: 6},
 		}
+	case viewPorts:
+		return []table.Column{
+			{Title: "LOCAL", Width: 8},
+			{Title: "NAMESPACE", Width: 16},
+			{Title: "TARGET", Width: clamp(width-50, 16, 40)},
+			{Title: "PORT", Width: 8},
+		}
 	case viewEvents:
 		msg := width - 6 - 9 - 20 - 14 - 26 - 8
 		return []table.Column{
@@ -253,4 +269,142 @@ func newViewport(width, height int, body string) viewport.Model {
 	vp := viewport.New(width, height)
 	vp.SetContent(body)
 	return vp
+}
+
+// --- port forwards ---
+
+// forward is one active tunnel: kubectl running on the node, plus the SSH
+// tunnel that makes its port reachable here.
+type forward struct {
+	Namespace  string
+	Target     string
+	RemotePort int
+	LocalPort  int
+	pf         *kube.PortForward
+	tunnel     *ssh.Tunnel
+}
+
+func (f forward) String() string {
+	return fmt.Sprintf("localhost:%d → %s/%s:%d", f.LocalPort, f.Namespace, f.Target, f.RemotePort)
+}
+
+// forwardsMsg carries the updated forward list back to the model.
+type forwardsMsg struct {
+	forwards []forward
+	err      error
+}
+
+// startForward opens a port-forward on the node and tunnels it here.
+//
+// Both halves are needed: kubectl binds on the cluster node, so without the
+// tunnel the port is open there and not on the operator's machine.
+func startForward(client *ssh.Client, ns, target string, remotePort int, existing []forward) tea.Cmd {
+	return func() tea.Msg {
+		if client == nil {
+			return forwardsMsg{forwards: existing, err: fmt.Errorf("no server connection")}
+		}
+		// A node-side port distinct from the local one, so several forwards
+		// can coexist and neither side collides with something already bound.
+		nodePort := 39000 + len(existing)
+		pf, err := kube.StartPortForward(client, ns, target, remotePort, nodePort)
+		if err != nil {
+			return forwardsMsg{forwards: existing, err: err}
+		}
+		// :0 lets the OS choose a free local port and report which.
+		tunnel, err := client.Forward("127.0.0.1:0", pf.NodeAddr())
+		if err != nil {
+			pf.Stop()
+			return forwardsMsg{forwards: existing, err: err}
+		}
+		local := 0
+		if _, portStr, e := net.SplitHostPort(tunnel.LocalAddr); e == nil {
+			local, _ = strconv.Atoi(portStr)
+		}
+		f := forward{
+			Namespace: ns, Target: target, RemotePort: remotePort, LocalPort: local,
+			pf: pf, tunnel: tunnel,
+		}
+		return forwardsMsg{forwards: append(existing, f)}
+	}
+}
+
+// stopForward tears one down, remote process and tunnel both.
+func stopForward(fs []forward, idx int) tea.Cmd {
+	return func() tea.Msg {
+		if idx < 0 || idx >= len(fs) {
+			return forwardsMsg{forwards: fs}
+		}
+		f := fs[idx]
+		if f.tunnel != nil {
+			f.tunnel.Close()
+		}
+		if f.pf != nil {
+			f.pf.Stop()
+		}
+		return forwardsMsg{forwards: append(append([]forward{}, fs[:idx]...), fs[idx+1:]...)}
+	}
+}
+
+func forwardRows(fs []forward) []table.Row {
+	rows := make([]table.Row, 0, len(fs))
+	for _, f := range fs {
+		rows = append(rows, table.Row{
+			fmt.Sprintf("%d", f.LocalPort), f.Namespace, f.Target, fmt.Sprintf("%d", f.RemotePort),
+		})
+	}
+	return rows
+}
+
+// --- multi-pod logs ---
+
+type multiLogsMsg struct {
+	logs []kube.PodLog
+	err  error
+}
+
+// fetchMultiLogs tails every pod matching the current filter.
+func fetchMultiLogs(exec kube.Executor, ns, filter string) tea.Cmd {
+	return func() tea.Msg {
+		if exec == nil {
+			return multiLogsMsg{err: fmt.Errorf("no server connection")}
+		}
+		logs, err := kube.LogsForSelector(exec, ns, filter, 60)
+		return multiLogsMsg{logs: logs, err: err}
+	}
+}
+
+// renderMultiLogs interleaves pods with a per-pod prefix, so a line is always
+// attributable to the pod that wrote it.
+func renderMultiLogs(logs []kube.PodLog, width int) string {
+	if len(logs) == 0 {
+		return "(no pods matched)"
+	}
+	var b strings.Builder
+	for _, l := range logs {
+		name := l.Pod
+		if len(name) > 28 {
+			name = name[:27] + "…"
+		}
+		header := podPrefixStyle.Render(fmt.Sprintf("── %s/%s ", l.Namespace, l.Pod))
+		b.WriteString(header + "\n")
+		if l.Err != nil {
+			b.WriteString("   " + errStyle.Render(l.Err.Error()) + "\n")
+			continue
+		}
+		if len(l.Lines) == 0 {
+			b.WriteString("   (no output)\n")
+			continue
+		}
+		for _, line := range l.Lines {
+			b.WriteString(podPrefixStyle.Render(name+" │ ") + truncate(line, max(20, width-32)) + "\n")
+		}
+	}
+	return b.String()
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

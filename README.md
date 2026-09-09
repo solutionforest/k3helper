@@ -345,9 +345,16 @@ Opens on a dashboard of per-node check cards with severity colours and remediati
 | `:nodes` (`:no`) | nodes: status, roles, kubelet version, age |
 | `:events` (`:ev`) | recent events, newest first |
 | `:dashboard` (`:dash`) | back to the health cards |
+| `:ports` (`:pf`) | active port forwards |
+| `:logs` | tail every pod matching the current filter, each line labelled with its pod |
 | `:ns <name>` | scope resource views to one namespace (`:ns all` clears it) |
 
-**Keys** — `↑↓` move · `enter`/`l` pod logs · `d` describe · `/` filter · `esc` back or clear filter · `r` refresh now · `q` quit.
+**Keys** — `↑↓` move · `enter`/`l` pod logs · `d` describe · `f` port-forward · `/` filter · `esc` back or clear filter · `r` refresh now · `q` quit. In `:ports`, `x` stops the selected forward.
+
+**Port forwarding.** `f` on a pod opens `kubectl port-forward` on the cluster
+node *and* an SSH tunnel to it, because kubectl binds on the node it runs on —
+without the tunnel the port is open there and not on your machine. `:ports`
+lists what is live, with the local address to connect to.
 
 The status column shows the container's waiting or terminated reason rather than the pod phase, so a `CrashLoopBackOff` reads as `CrashLoopBackOff` instead of `Pending`. Opening logs on a crashlooping pod whose current instance has produced nothing falls back to the previous instance automatically — that's where the cause usually is.
 

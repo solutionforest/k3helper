@@ -4,6 +4,7 @@ package tui
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +57,7 @@ var (
 	statusWarnStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	statusFailStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	paneBorder      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
+	podPrefixStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("109"))
 )
 
 // Model is the root TUI model.
@@ -83,9 +85,12 @@ type Model struct {
 	table     table.Model
 	namespace string // "" = all namespaces
 
-	// text pane (logs / describe)
+	// text pane (logs / describe / multi-pod logs)
 	viewport  viewport.Model
 	textTitle string
+
+	// active port forwards
+	forwards []forward
 
 	// command bar and filter
 	input      textinput.Model
@@ -187,8 +192,10 @@ func (m Model) refresh() tea.Cmd {
 		return doChecks(m.targets)
 	case viewPods, viewNodes, viewEvents:
 		return fetchResources(m.server, m.view, m.namespace)
+	case viewMultiLogs:
+		return fetchMultiLogs(m.server, m.namespace, m.filter)
 	}
-	return nil // logs/describe are point-in-time snapshots
+	return nil // logs/describe/ports are point-in-time or locally held
 }
 
 // Update implements tea.Model.
@@ -221,6 +228,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case resourcesMsg:
 		return m.handleResources(msg)
+
+	case forwardsMsg:
+		m.loading = false
+		m.err = msg.err
+		m.forwards = msg.forwards
+		if m.view == viewPorts {
+			m.rebuildTable()
+		}
+		return m, nil
+
+	case multiLogsMsg:
+		m.loading = false
+		m.err = msg.err
+		if msg.err == nil {
+			m.view = viewMultiLogs
+			m.textTitle = fmt.Sprintf("logs from %d pod(s)", len(msg.logs))
+			m.viewport = newViewport(m.width-2, m.bodyHeight(), renderMultiLogs(msg.logs, m.width))
+		}
+		return m, nil
 
 	case textMsg:
 		m.loading = false
@@ -266,6 +292,8 @@ func (m *Model) rebuildTable() {
 		rows = nodeRows(m.nodes, m.filter)
 	case viewEvents:
 		rows = eventRows(m.events, m.filter)
+	case viewPorts:
+		rows = forwardRows(m.forwards)
 	default:
 		return
 	}
@@ -287,7 +315,7 @@ func (m Model) bodyHeight() int {
 }
 
 func (m *Model) applySize() {
-	if m.view == viewLogs || m.view == viewDescribe {
+	if m.view == viewLogs || m.view == viewDescribe || m.view == viewMultiLogs {
 		m.viewport.Width = m.width - 2
 		m.viewport.Height = m.bodyHeight()
 		return
@@ -314,6 +342,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.runCommand(value)
 			}
 			m.filter = value
+			if m.view == viewMultiLogs {
+				m.loading = true
+				return m, fetchMultiLogs(m.server, m.namespace, m.filter)
+			}
 			m.rebuildTable()
 			return m, nil
 		}
@@ -348,8 +380,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "esc":
 		// Step back out of a drill-down, or clear an active filter.
-		if m.view == viewLogs || m.view == viewDescribe {
+		if m.view == viewLogs || m.view == viewDescribe || m.view == viewMultiLogs {
 			m.view = m.returnView
+			if m.returnView == "" {
+				m.view = viewPods
+			}
 			m.err = nil
 			m.rebuildTable()
 			return m, m.refresh()
@@ -374,6 +409,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case "f":
+		// forward a port from the selected pod
+		if m.view == viewPods {
+			if ns, name, ok := m.selectedPod(); ok {
+				port := m.podPort(name)
+				m.loading = true
+				return m, startForward(m.server, ns, "pod/"+name, port, m.forwards)
+			}
+		}
+		return m, nil
+
+	case "x":
+		// stop the selected forward
+		if m.view == viewPorts {
+			return m, stopForward(m.forwards, m.table.Cursor())
+		}
+		return m, nil
+
 	case "d":
 		// describe the selected object
 		switch m.view {
@@ -393,7 +446,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	// Remaining keys drive the active widget.
 	var cmd tea.Cmd
-	if m.view == viewLogs || m.view == viewDescribe {
+	if m.view == viewLogs || m.view == viewDescribe || m.view == viewMultiLogs {
 		m.viewport, cmd = m.viewport.Update(msg)
 	} else if m.view != viewDashboard {
 		m.table, cmd = m.table.Update(msg)
@@ -434,6 +487,16 @@ func (m Model) runCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.loading = true
 		return m, doChecks(m.targets)
 	}
+	switch v {
+	case viewPorts:
+		m.view = v
+		m.rebuildTable()
+		return m, nil
+	case viewMultiLogs:
+		m.returnView = viewPods
+		m.loading = true
+		return m, fetchMultiLogs(m.server, m.namespace, m.filter)
+	}
 	m.view = v
 	m.loading = true
 	return m, fetchResources(m.server, v, m.namespace)
@@ -449,8 +512,14 @@ func (m Model) View() string {
 		b.WriteString("  " + m.spinner.View() + " running checks...\n")
 	case m.view == viewDashboard:
 		b.WriteString(m.dashboardBody())
-	case m.view == viewLogs || m.view == viewDescribe:
+	case m.view == viewLogs || m.view == viewDescribe || m.view == viewMultiLogs:
 		b.WriteString(m.viewport.View() + "\n")
+	case m.view == viewPorts && len(m.forwards) == 0:
+		b.WriteString(helpStyle.Render(
+			"  no active port forwards.\n\n"+
+				"  Open one from the pod list: :pods, select a pod, press f.\n"+
+				"  kubectl binds on the cluster node, so k3helper also opens an\n"+
+				"  SSH tunnel — the local address shown is reachable from here.\n") + "\n")
 	default:
 		b.WriteString(m.table.View() + "\n")
 	}
@@ -491,11 +560,15 @@ func (m Model) footer() string {
 	case viewDashboard:
 		keys = ": command  r: refresh  q: quit"
 	case viewPods:
-		keys = "↑↓: move  enter/l: logs  d: describe  /: filter  :: command  r: refresh  q: quit"
+		keys = "↑↓: move  enter/l: logs  d: describe  f: port-forward  /: filter  :: command  r: refresh  q: quit"
 	case viewNodes:
 		keys = "↑↓: move  d: describe  /: filter  :: command  r: refresh  q: quit"
 	case viewEvents:
 		keys = "↑↓: move  /: filter  :: command  r: refresh  q: quit"
+	case viewPorts:
+		keys = "↑↓: move  x: stop forward  :pods then f: add one  :: command  q: quit"
+	case viewMultiLogs:
+		keys = "↑↓/pgup/pgdn: scroll  /: filter pods  r: refresh  esc: back  q: quit"
 	default:
 		keys = "↑↓/pgup/pgdn: scroll  esc: back  q: quit"
 	}
@@ -546,4 +619,22 @@ func (m Model) dashboardBody() string {
 		b.WriteString(paneBorder.Render(card) + "\n")
 	}
 	return b.String()
+}
+
+// podPort guesses the port to forward for a pod: the containerPort it
+// declares, falling back to 80. The pod list does not carry ports, so this
+// asks the cluster for the one pod being forwarded rather than every pod.
+func (m Model) podPort(name string) int {
+	if m.server == nil {
+		return 80
+	}
+	out, code, err := m.server.Run(kube.Builder(m.server)(
+		"get pod " + name + " -o jsonpath={.spec.containers[0].ports[0].containerPort}"))
+	if err != nil || code != 0 {
+		return 80
+	}
+	if p, err := strconv.Atoi(strings.TrimSpace(out)); err == nil && p > 0 {
+		return p
+	}
+	return 80
 }
