@@ -63,21 +63,31 @@ jobs:
           path: bin/
           retention-days: 7
 
-  # Sandbox E2E on the container driver.
+  # Sandbox E2E on the container driver — three privileged systemd containers
+  # standing in for three Linux hosts, which is what a GitHub-hosted runner can
+  # actually provide.
   #
-  # STATUS: unproven on a GitHub-hosted runner. The driver provisions the three
-  # hosts correctly and k3s installs and reaches Ready, but on the author's
-  # machine (Docker inside an OrbStack Linux VM) CoreDNS is repeatedly SIGTERMed
-  # because kubelet's probes cannot reach pod IPs through flannel. Whether a
-  # native Linux runner behaves the same has not been established.
+  # This job was dispatch-only until the container driver was made to work.
+  # Three things were wrong, all of them in the sandbox rather than in
+  # k3helper:
   #
-  # It is therefore behind workflow_dispatch: run it by hand to find out, rather
-  # than having every push blocked by, or falsely reassured about, a job whose
-  # outcome nobody has verified. Promote it to `push` once it passes.
+  #   1. containerd's overlay snapshotter cannot mount overlayfs on top of the
+  #      container's own overlayfs root, so k3s never finished starting. Each
+  #      node now keeps /var/lib/rancher/k3s, /var/lib/kubelet and /var/lib/cni
+  #      on a named volume, which is a plain directory on the host filesystem.
+  #   2. With the host's cgroup namespace, the systemd inside each container
+  #      manages the real cgroup root and prunes the cgroups containerd creates
+  #      for its pods: every pod died every minute or two with "Pod sandbox
+  #      changed". The containers now use a private cgroup namespace, as kind
+  #      and k3d do.
+  #   3. flannel's VXLAN backend is unnecessary here — the three containers
+  #      share one docker bridge — and its encapsulation is what made pod
+  #      addresses unreachable. The sandbox configures host-gw.
+  #
+  # It runs on every push now that it passes.
   e2e:
-    name: Sandbox E2E (docker driver, unproven)
+    name: Sandbox E2E (docker driver)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch'
     timeout-minutes: 40
     env:
       SANDBOX_DRIVER: docker

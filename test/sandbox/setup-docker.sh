@@ -34,6 +34,10 @@ echo "building the sandbox image..."
 docker compose build --quiet
 
 echo "starting three sandbox hosts..."
+# -v as well as down: the nodes keep containerd and kubelet state in named
+# volumes, and a leftover half-installed k3s from a previous run would make
+# this one test an upgrade rather than an install.
+docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 docker compose up -d --force-recreate
 
 container_ip() {
@@ -69,6 +73,25 @@ IP_AGENT2=$(container_ip sandbox-agent2)
 for v in "$IP_SERVER" "$IP_AGENT1" "$IP_AGENT2"; do
   [ -n "$v" ] || { echo "✗ could not determine a container IP"; exit 1; }
 done
+
+# --- CNI configuration for containers ---------------------------------------
+#
+# k3s defaults to flannel's VXLAN backend, which encapsulates pod traffic in
+# UDP and relies on checksum handling that veth pairs get wrong on several
+# kernels: pods come up, get addresses, and are unreachable from any other
+# node — which is exactly what this driver used to do.
+#
+# All three "hosts" here are containers on one docker bridge, so they are on
+# the same layer 2 segment and flannel's host-gw backend applies: it adds a
+# plain route to each node's pod CIDR and encapsulates nothing. Fewer moving
+# parts, and no offload bug to work around.
+#
+# This is written as k3s's own config file rather than passed as an install
+# flag, because the thing under test is our bootstrap code: the sandbox
+# describes the environment, k3helper still performs the install.
+docker exec sandbox-server sh -c \
+  'mkdir -p /etc/rancher/k3s && printf "flannel-backend: host-gw\n" > /etc/rancher/k3s/config.yaml'
+echo "configured flannel host-gw (containers share one bridge; VXLAN is not needed)"
 
 # Same shape as the OrbStack driver writes, so the test scripts do not care
 # which one provisioned the hosts.

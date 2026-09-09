@@ -1,60 +1,101 @@
 name: k3helper-sandbox
 
+# Three containers that behave like SSH-reachable Linux hosts. The settings
+# below are the ones a kubelet needs and a plain container does not have;
+# node-prep.sh (baked into the image) does the rest at boot.
+#
+# The YAML anchor keeps the three definitions honest: a setting added to one
+# node and forgotten on the others is exactly how "it works on the server but
+# the agents never join" happens. Volumes are the exception — a merge key
+# cannot concatenate sequences, and each node needs its own state — so those
+# are written out per service.
+x-node: &node
+  image: k3helper-sandbox-vm
+  privileged: true
+  # A *private* cgroup namespace, which is docker's default on cgroup v2 and
+  # what kind and k3d both use. With the host's namespace, the systemd inside
+  # the container manages the real cgroup root, prunes the cgroups containerd
+  # created for its pods, and pod sandboxes disappear underneath the kubelet:
+  # every pod restarts every minute or two with "Pod sandbox changed".
+  cgroup: private
+  # No bind mount over /sys/fs/cgroup: with a private cgroup namespace docker
+  # mounts the container's own cgroup subtree there, and covering it with the
+  # host's tree makes systemd fail to boot at all (the container exits 255
+  # before it writes a single log line).
+  # systemd wants a writable /run, and the kubelet writes into /run/k3s.
+  tmpfs:
+    - /run
+    - /run/lock
+  # AppArmor/seccomp profiles block the mount and bpf calls containerd makes
+  # for its own containers.
+  security_opt:
+    - seccomp=unconfined
+    - apparmor=unconfined
+  networks: [sandbox]
+  environment:
+    - container=docker
+
+# Why every node mounts a volume over containerd's state:
+#
+# A container's root filesystem is already an overlay mount, and the overlay
+# filesystem cannot be stacked on itself. containerd's default snapshotter
+# therefore fails with `"overlayfs" snapshotter cannot be enabled ... failed
+# to mount overlay: invalid argument`, k3s never finishes starting, and the
+# node never registers. A named volume is a plain directory on the host
+# filesystem, so the overlay mounts inside it work normally. The upstream
+# rancher/k3s image declares the same paths as volumes for the same reason.
+
 services:
   server:
+    <<: *node
     build:
       context: .
       args:
         UBUNTU_VERSION: "24.04"
-    image: k3helper-sandbox-vm
     hostname: sandbox-server
     container_name: sandbox-server
-    privileged: true
-    cgroup: host
     volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
       # k3s modprobes iptables/nftables modules at startup. Without the host's
       # modules the load fails, pod networking never routes, and readiness
       # probes fail on pods that otherwise started fine.
       - /lib/modules:/lib/modules:ro
-    networks: [sandbox]
-    environment:
-      - container=docker
+      - server-k3s:/var/lib/rancher/k3s
+      - server-kubelet:/var/lib/kubelet
+      - server-cni:/var/lib/cni
 
   agent1:
-    image: k3helper-sandbox-vm
+    <<: *node
     hostname: sandbox-agent1
     container_name: sandbox-agent1
-    privileged: true
-    cgroup: host
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-      # k3s modprobes iptables/nftables modules at startup. Without the host's
-      # modules the load fails, pod networking never routes, and readiness
-      # probes fail on pods that otherwise started fine.
-      - /lib/modules:/lib/modules:ro
-    networks: [sandbox]
-    environment:
-      - container=docker
     depends_on: [server]
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - agent1-k3s:/var/lib/rancher/k3s
+      - agent1-kubelet:/var/lib/kubelet
+      - agent1-cni:/var/lib/cni
 
   agent2:
-    image: k3helper-sandbox-vm
+    <<: *node
     hostname: sandbox-agent2
     container_name: sandbox-agent2
-    privileged: true
-    cgroup: host
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-      # k3s modprobes iptables/nftables modules at startup. Without the host's
-      # modules the load fails, pod networking never routes, and readiness
-      # probes fail on pods that otherwise started fine.
-      - /lib/modules:/lib/modules:ro
-    networks: [sandbox]
-    environment:
-      - container=docker
     depends_on: [server]
+    volumes:
+      - /lib/modules:/lib/modules:ro
+      - agent2-k3s:/var/lib/rancher/k3s
+      - agent2-kubelet:/var/lib/kubelet
+      - agent2-cni:/var/lib/cni
 
 networks:
   sandbox:
     driver: bridge
+
+volumes:
+  server-k3s:
+  server-kubelet:
+  server-cni:
+  agent1-k3s:
+  agent1-kubelet:
+  agent1-cni:
+  agent2-k3s:
+  agent2-kubelet:
+  agent2-cni:
