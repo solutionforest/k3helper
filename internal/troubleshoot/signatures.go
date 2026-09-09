@@ -136,6 +136,66 @@ type Diagnosis struct {
 	Evidence    string `json:"evidence"`
 }
 
+// pullFailures counts image-pull failures by what the registry actually said.
+type pullFailures struct {
+	auth        int
+	cert        int
+	unreachable int
+}
+
+// classifyPullFailures reads the reason out of image-pull events.
+//
+// "ImagePullBackOff" is a symptom shared by a wrong tag, a missing credential,
+// an untrusted CA and a registry nobody can reach — four different fixes. The
+// kubelet records the underlying error in the event text, so the distinction
+// is available and worth making: a single generic finding sends people to
+// check credentials when the name simply did not resolve.
+func classifyPullFailures(e Evidence) pullFailures {
+	var f pullFailures
+	for _, evs := range e.PodEvents {
+		for _, ev := range evs {
+			if !strings.Contains(ev, "Failed to pull image") &&
+				!strings.Contains(ev, "ErrImagePull") &&
+				!strings.Contains(ev, "ImagePullBackOff") {
+				continue
+			}
+			low := strings.ToLower(ev)
+			switch {
+			// Order matters: an auth failure over a bad certificate is
+			// reported as a certificate error, and fixing the credential
+			// would not help.
+			case containsAny(low, "x509", "certificate signed by unknown authority",
+				"certificate has expired", "tls: failed to verify",
+				"failed to verify certificate", "server gave http response to https client",
+				// containerd's own message when registries.yaml names a
+				// ca_file that is not on the node — seen against a real
+				// cluster, and not something any of the TLS phrases above
+				// would have matched.
+				"unable to read ca cert", "failed to load ca"):
+				f.cert++
+			case containsAny(low, "401 unauthorized", "unauthorized", "authentication required",
+				"pull access denied", "denied: requested access to the resource is denied",
+				"403 forbidden"):
+				f.auth++
+			case containsAny(low, "no such host", "dial tcp", "connection refused",
+				"i/o timeout", "network is unreachable", "temporary failure in name resolution",
+				"context deadline exceeded"):
+				f.unreachable++
+			}
+		}
+	}
+	return f
+}
+
+func containsAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // Diagnose runs all signatures against the evidence and returns
 // ranked diagnoses (highest confidence first, 0-confidence dropped).
 func Diagnose(e Evidence) []Diagnosis {
@@ -418,6 +478,53 @@ var registry = []Signature{
 		Remediation: "The Service selector matches no ready pod. Compare them: `kubectl get svc <svc> -o wide` and `kubectl get pods -l <selector>`. Usual causes: a selector that does not match the pod labels, pods failing their readiness probe, or all backing pods being down — check the pod-level findings above first.",
 	},
 	{
+		ID:    "registry.auth",
+		Title: "Registry refused the credentials (image pull unauthorized)",
+		Match: func(e Evidence) int {
+			n := classifyPullFailures(e).auth
+			if n == 0 {
+				return 0
+			}
+			return min(92, 82+n*5)
+		},
+		Remediation: "The registry answered, and rejected who we are. Either the node has no credentials for it or they are wrong. " +
+			"Cluster-wide: put the registry in the targets file under `registries:` with a username and `password_env`, then " +
+			"`k3helper registry apply -t targets.yaml` (it restarts k3s, which does not re-read the file on its own). " +
+			"Per workload: `k3helper gen secret <name> --docker-registry <host> --registry-user <u> --registry-password <p>`, apply it, " +
+			"and reference it from the pod's imagePullSecrets. Verify on the node with `sudo crictl pull <image>`.",
+	},
+	{
+		ID:    "registry.cert",
+		Title: "Registry TLS certificate not trusted by the node",
+		Match: func(e Evidence) int {
+			n := classifyPullFailures(e).cert
+			if n == 0 {
+				return 0
+			}
+			return min(90, 80+n*5)
+		},
+		Remediation: "Either the certificate is not trusted — an internal CA, a self-signed certificate, or a registry serving plain " +
+			"HTTP on an https endpoint — or the `ca_file` in registries.yaml names a file that is not on this node. " +
+			"`k3helper check` reports the second case directly. Right fix: copy the CA to every node and set `ca_file:` on the " +
+			"registry in the targets file, then `k3helper registry apply`. For a throwaway registry only, `insecure_skip_verify: true`. " +
+			"If the registry speaks HTTP, set `endpoint: http://<host>` instead of turning verification off.",
+	},
+	{
+		ID:    "registry.unreachable",
+		Title: "Registry could not be reached from the node (DNS or connection failure)",
+		Match: func(e Evidence) int {
+			n := classifyPullFailures(e).unreachable
+			if n == 0 {
+				return 0
+			}
+			return min(88, 78+n*5)
+		},
+		Remediation: "The pull never got as far as an answer: the name did not resolve, or nothing accepted the connection. " +
+			"Check it from the node itself, not from your machine — `getent hosts <registry>` and " +
+			"`curl -sSv https://<registry>/v2/ -o /dev/null`. Usual causes: the registry is reachable from your network and not " +
+			"from the nodes', a firewall between them, or a mirror endpoint pointing somewhere that no longer exists.",
+	},
+	{
 		ID:    "pod.imagepull",
 		Title: "Pods failing to pull images (ImagePullBackOff / ErrImagePull)",
 		Match: func(e Evidence) int {
@@ -437,9 +544,17 @@ var registry = []Signature{
 			if n == 0 {
 				return 0
 			}
+			// When the registry said *why*, that finding is the cause and this
+			// one is the symptom. Ranking the symptom above it is the mistake
+			// that sent operators to check a kubeconfig that was fine.
+			if f := classifyPullFailures(e); f.auth+f.cert+f.unreachable > 0 {
+				return 55
+			}
 			return min(95, 80+n*15)
 		},
-		Remediation: "Check image name/tag spelling; if private registry, verify imagePullSecrets (`kubectl create secret docker-registry`) and registry auth; test pull manually: `sudo crictl pull <image>`",
+		Remediation: "Check the image name and tag first — a typo and a missing tag look identical to a permission problem from here. " +
+			"Then, for a private registry, check credentials (`k3helper registry apply`, or imagePullSecrets on the workload). " +
+			"Test the pull on the node: `sudo crictl pull <image>`.",
 	},
 	{
 		ID:    "pod.crashloop",

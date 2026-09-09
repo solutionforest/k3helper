@@ -25,7 +25,7 @@ go build -o "$K" ./cmd/k3helper || exit 1
 # all: it fills a node's root filesystem, so kubelet evicts pods and the node
 # needs time to settle afterwards. Running it earlier would leave every later
 # fault racing an evicting node.
-ALL=(imagepull crashloop pending pvc-pending empty-endpoints coredns oom cordon k3s-down bad-kubeconfig disk-full)
+ALL=(imagepull registry crashloop pending pvc-pending empty-endpoints coredns oom cordon k3s-down bad-kubeconfig disk-full)
 FAULTS=("$@")
 [ ${#FAULTS[@]} -eq 0 ] && FAULTS=("${ALL[@]}")
 
@@ -45,6 +45,7 @@ settle_for() {
     cordon|pending) echo 40 ;;
     crashloop)    echo 30 ;;
     imagepull)    echo 25 ;;
+    registry)     echo 25 ;;
     coredns)      echo 10 ;;
     *)            echo 12 ;;
   esac

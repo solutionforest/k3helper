@@ -46,11 +46,12 @@ expect_for() {
     coredns)         echo "network.coredns" ;;
     empty-endpoints) echo "network.empty-endpoints" ;;
     bad-kubeconfig)  echo "cluster.kubeconfig" ;;
+    registry)        echo "registry.unreachable" ;;
     *)               echo "" ;;
   esac
 }
 
-FAULT_NAMES="bad-kubeconfig cordon coredns crashloop disk-full empty-endpoints imagepull k3s-down oom pending pvc-pending"
+FAULT_NAMES="bad-kubeconfig cordon coredns crashloop disk-full empty-endpoints imagepull k3s-down oom pending pvc-pending registry"
 
 usage() {
   echo "usage: $0 <fault|clean|list|expect>"
@@ -212,6 +213,23 @@ spec:
 EOF
     ;;
 
+  registry)
+    echo "deploying a pod whose image comes from a registry that does not resolve"
+    # A registry the node cannot reach and an image that does not exist look
+    # identical from the pod's status — ImagePullBackOff either way — and need
+    # different fixes. This fault exists to assert doctor says which.
+    apply_manifest registry <<'YAML'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fault-registry
+spec:
+  containers:
+    - name: c
+      image: registry.invalid/app:1.0
+YAML
+    ;;
+
   bad-kubeconfig)
     echo "corrupting the kubeconfig on the server ($SERVER)"
     on "$SERVER" 'sudo cp /etc/rancher/k3s/k3s.yaml /etc/rancher/k3s/k3s.yaml.bak && echo "not: [valid" | sudo tee /etc/rancher/k3s/k3s.yaml >/dev/null'
@@ -223,7 +241,7 @@ EOF
     for host in $(grep 'host:' "$TARGETS" | awk '{print $2}'); do
       on "$host" 'sudo rm -f /bigfile; sudo systemctl start k3s 2>/dev/null; sudo systemctl start k3s-agent 2>/dev/null'
     done
-    kctl 'delete pod fault-imagepull fault-crashloop fault-oom fault-pending fault-cordon --ignore-not-found --force --grace-period=0' >/dev/null
+    kctl 'delete pod fault-imagepull fault-crashloop fault-oom fault-pending fault-cordon fault-registry --ignore-not-found --force --grace-period=0' >/dev/null
     # PVCs are removed after their consumers, and confirmed: a Pending PVC
     # left behind fires storage.pvc-pending in every later diagnosis.
     kctl 'delete pvc fault-pvc --ignore-not-found --timeout=30s' >/dev/null

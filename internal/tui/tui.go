@@ -201,6 +201,7 @@ func doChecks(targets *config.Targets) tea.Cmd {
 				check.SwapCheck{},
 				check.CgroupCheck{},
 				check.ServiceCheck{Role: node.Role},
+				check.RegistryCheck{},
 			)
 			results[node.Name] = runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 			samples[node.Name] = sampleHost(client)

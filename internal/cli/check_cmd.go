@@ -43,6 +43,7 @@ dead k3s does.`,
 					check.SwapCheck{},
 					check.CgroupCheck{},
 					check.ServiceCheck{Role: node.Role},
+					check.RegistryCheck{},
 				)
 				results := runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 				client.Close()
