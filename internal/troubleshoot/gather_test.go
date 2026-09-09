@@ -97,7 +97,9 @@ func TestGatherDetectsCoreDNSOutage(t *testing.T) {
 	// later test in the package see a broken cluster.
 	t.Cleanup(func() {
 		server.Run(kubectl + " -n kube-system scale deployment coredns --replicas=1")
-		for i := 0; i < 30; i++ {
+		// Scaling back up has to schedule the pod, pull if needed and pass a
+		// readiness probe; 30s was tight enough to fail intermittently.
+		for i := 0; i < 120; i++ {
 			out, _, _ := server.Run(kubectl + " -n kube-system get deployment coredns -o jsonpath={.status.readyReplicas}")
 			if strings.TrimSpace(out) == "1" {
 				return

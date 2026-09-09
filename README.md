@@ -11,7 +11,7 @@ k3helper is a portable k3s/kubernetes helper with a TUI.
   gen         generate correct Kubernetes YAML
   deploy      quick deploy manifests to the cluster
   check       run cluster/node/k3s health checks
-  doctor      troubleshoot: find issues + remediation
+  doctor      troubleshoot: find issues + remediation (--watch to keep watching)
   ctx         list clusters defined in the targets file
   tui         launch the interactive dashboard
 ```
@@ -548,12 +548,24 @@ The sandbox has two drivers, selected automatically and overridable with
 | `docker` | three privileged systemd containers | Linux, and anywhere VMs are unavailable |
 
 The container driver provisions hosts correctly and k3s installs and reaches
-Ready on them, but it is **not yet proven end to end**: on the author's machine
-(Docker inside an OrbStack Linux VM) CoreDNS is repeatedly SIGTERMed because
-kubelet's probes cannot reach pod IPs through flannel. Whether a native Linux
-runner behaves the same is untested. The CI E2E job therefore runs on
-`workflow_dispatch` only — run it by hand to find out, rather than blocking
-every push on an unverified job. Promote it to `push` once it passes.
+Ready on them, but pod networking does not work there and it is **not proven
+end to end**. Investigated as far as this:
+
+- pods are scheduled and get addresses from the flannel range, but nothing —
+  not even the node they run on — can reach those addresses, so every
+  readiness probe fails and CoreDNS is SIGTERMed on a loop
+- `/lib/modules` is now mounted into the containers, which fixed one real
+  blocker (k3s could not `modprobe` the iptables and nftables modules it needs)
+- it is *not* the conntrack sysctl restriction that broke the kubeadm path;
+  disabling kube-proxy's conntrack tuning changes nothing here
+
+What remains is container-in-container CNI networking, which likely needs a
+different approach (k3d builds its own images and networking for exactly this
+reason). Whether a native Linux runner behaves differently is untested — the
+only Linux kernel available for testing here is a nested one.
+
+The CI E2E job therefore runs on `workflow_dispatch` only: run it by hand to
+find out, rather than blocking every push on a job nobody has seen pass.
 
 CI on every push: gofmt, `go vet` (including under the `integration` build tag,
 so those files cannot rot unnoticed), race-enabled unit tests, and a
@@ -615,11 +627,12 @@ Current, and worth knowing before pointing this at production:
 
 ## Roadmap
 
-- [ ] HA control plane: multiple servers, `--cluster-init`, embedded etcd setup
-- [ ] Port-forward manager and multi-pod log tailing in the TUI
-- [ ] `doctor --watch` for continuous monitoring
-- [ ] Get the container sandbox passing the E2E so CI can run it on every push
-- [ ] `vm setup` for kubeadm, so bootstrap covers both distributions it can check
+- [ ] Container-in-container CNI for the sandbox, so CI can run the E2E on
+      every push (see Testing for how far this got)
+- [ ] kubeadm HA: `--upload-certs` and an API server endpoint
+- [ ] Certificate expiry on kubeadm (currently k3s-only)
+- [ ] Cross-check cluster membership against the targets file, so a node nobody
+      listed is reported rather than invisible
 
 ## License
 

@@ -13,6 +13,10 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # k3s modprobes iptables/nftables modules at startup. Without the host's
+      # modules the load fails, pod networking never routes, and readiness
+      # probes fail on pods that otherwise started fine.
+      - /lib/modules:/lib/modules:ro
     networks: [sandbox]
     environment:
       - container=docker
@@ -25,6 +29,10 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # k3s modprobes iptables/nftables modules at startup. Without the host's
+      # modules the load fails, pod networking never routes, and readiness
+      # probes fail on pods that otherwise started fine.
+      - /lib/modules:/lib/modules:ro
     networks: [sandbox]
     environment:
       - container=docker
@@ -38,6 +46,10 @@ services:
     cgroup: host
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      # k3s modprobes iptables/nftables modules at startup. Without the host's
+      # modules the load fails, pod networking never routes, and readiness
+      # probes fail on pods that otherwise started fine.
+      - /lib/modules:/lib/modules:ro
     networks: [sandbox]
     environment:
       - container=docker

@@ -231,9 +231,13 @@ elsewhere rather than reported as passing.
 > results were produced on. `setup-docker.sh` creates three privileged systemd
 > containers for hosts that cannot nest virtualisation.
 >
-> The container driver provisions correctly and k3s reaches Ready, but is not
-> yet proven end to end: CoreDNS is repeatedly SIGTERMed because kubelet probes
-> cannot reach pod IPs through flannel. That is why the CI E2E job is
+> The container driver provisions correctly and k3s reaches Ready, but pod
+> networking does not work there: pods get addresses from the flannel range
+> that nothing can reach, so readiness probes fail and CoreDNS crashloops.
+> Mounting /lib/modules fixed one real blocker — k3s could not modprobe the
+> iptables/nftables modules it needs — but the remaining problem is
+> container-in-container CNI networking, which likely needs the approach k3d
+> takes (purpose-built images and networking). That is why the CI E2E job is
 > dispatch-only rather than running on every push.
 
 - `setup-orbstack.sh` creates the VMs, installs sshd, provisions the `sandbox`
