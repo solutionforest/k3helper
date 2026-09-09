@@ -361,3 +361,136 @@ func TestHAServersJoinSequentially(t *testing.T) {
 		t.Error("the cluster was not allowed to settle before the next server joined")
 	}
 }
+
+// --- kubeadm bootstrap ---
+
+func TestKubeadmDefaultsMatchTheCNI(t *testing.T) {
+	// Flannel and the pod CIDR passed to `kubeadm init` must agree, or pods
+	// get addresses the CNI will not route.
+	flannel := KubeadmOptions{}
+	if flannel.cni() != "flannel" || flannel.podCIDR() != "10.244.0.0/16" {
+		t.Errorf("flannel defaults = %s / %s", flannel.cni(), flannel.podCIDR())
+	}
+	calico := KubeadmOptions{CNI: "Calico"}
+	if calico.cni() != "calico" || calico.podCIDR() != "192.168.0.0/16" {
+		t.Errorf("calico defaults = %s / %s", calico.cni(), calico.podCIDR())
+	}
+	// An explicit CIDR always wins.
+	explicit := KubeadmOptions{CNI: "calico", PodCIDR: "10.99.0.0/16"}
+	if explicit.podCIDR() != "10.99.0.0/16" {
+		t.Errorf("explicit CIDR was overridden: %s", explicit.podCIDR())
+	}
+}
+
+// kubeadm HA needs --upload-certs and an endpoint in front of the API
+// servers. Saying so beats building half of it.
+func TestKubeadmRefusesMultipleServers(t *testing.T) {
+	var rec []string
+	err := SetupKubeadm(fakeTargets(&rec, "s1", "s2"), nil, KubeadmOptions{})
+	if err == nil {
+		t.Fatal("multiple control-plane nodes were accepted")
+	}
+	for _, want := range []string{"upload-certs", "k3s"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should explain the limitation and the alternative: %v", err)
+		}
+	}
+	if err := SetupKubeadm(nil, nil, KubeadmOptions{}); err == nil {
+		t.Error("zero servers should be rejected")
+	}
+}
+
+// The prerequisite script must do the things kubeadm requires and does not do
+// itself; each omission fails much later and confusingly.
+func TestKubeadmPrereqScriptCoversTheRequirements(t *testing.T) {
+	script := kubeadmPrereqScript("v1.31")
+	for _, want := range []string{
+		"swapoff -a",   // kubelet refuses to start with swap on
+		"br_netfilter", // pod traffic must be visible to iptables
+		"bridge-nf-call-iptables",
+		"ip_forward",
+		"nf_conntrack_max",     // kube-proxy dies if it has to raise this and cannot
+		"containerd",           // there must be a CRI to run containers
+		"SystemdCgroup = true", // must match the kubelet's cgroup driver
+		"conntrack",            // a hard kubeadm preflight requirement
+		"socat",                // kubectl port-forward uses it on the node
+		"kubelet kubeadm kubectl",
+		"apt-mark hold", // pin, so an unattended upgrade cannot skew versions
+		"pkgs.k8s.io/core:/stable:/v1.31",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("prerequisite script is missing %q", want)
+		}
+	}
+	// The version must be threaded through, not hardcoded.
+	if strings.Contains(kubeadmPrereqScript("v1.30"), "stable:/v1.31") {
+		t.Error("the requested version was ignored")
+	}
+}
+
+func TestLastNonEmptyLine(t *testing.T) {
+	out := "W0101 some warning\nkubeadm join 10.0.0.1:6443 --token abc --discovery-token-ca-cert-hash sha256:x\n\n"
+	got := lastNonEmptyLine(out)
+	if !strings.HasPrefix(got, "kubeadm join") {
+		t.Errorf("lastNonEmptyLine = %q, want the join command", got)
+	}
+	if lastNonEmptyLine("   \n\n") != "" {
+		t.Error("blank input should yield an empty string")
+	}
+}
+
+// waitReady speaks k3s's dialect; on kubeadm the same query has to go through
+// kubectl with the admin kubeconfig.
+func TestKubeadmRunnerTranslatesTheKubectlDialect(t *testing.T) {
+	var got string
+	h := recordingHost{fn: func(cmd string) { got = cmd }}
+	kubeadmRunner{h}.SudoRun(`k3s kubectl get nodes -o jsonpath='{...}'`)
+	if strings.Contains(got, "k3s kubectl") {
+		t.Errorf("k3s dialect leaked to a kubeadm node: %s", got)
+	}
+	if !strings.Contains(got, "kubectl --kubeconfig /etc/kubernetes/admin.conf") {
+		t.Errorf("not translated: %s", got)
+	}
+}
+
+type recordingHost struct{ fn func(string) }
+
+func (r recordingHost) Run(cmd string) (string, int, error) { r.fn(cmd); return "", 0, nil }
+func (r recordingHost) SudoRun(cmd string) (string, int, error) {
+	return r.Run("sudo -n " + cmd)
+}
+func (r recordingHost) Stream(cmd string, w io.Writer) (int, error) { r.fn(cmd); return 0, nil }
+func (r recordingHost) SudoPrefix() string                          { return "sudo " }
+
+// A non-zero exit with no Go error is the normal remote failure; %w on a nil
+// error prints "%!w(<nil>)" and tells the reader nothing.
+func TestExitReasonReadsWell(t *testing.T) {
+	if got := exitReason(1, nil); strings.Contains(got, "%!w") || !strings.Contains(got, "exit 1") {
+		t.Errorf("exitReason(1, nil) = %q", got)
+	}
+	if got := exitReason(0, io.ErrUnexpectedEOF); got != io.ErrUnexpectedEOF.Error() {
+		t.Errorf("exitReason should prefer a real error: %q", got)
+	}
+}
+
+// The prerequisite script must run as root: it writes under /etc and loads
+// kernel modules, and running it unprivileged fails line by line.
+func TestKubeadmPrereqRunsAsRoot(t *testing.T) {
+	var rec []string
+	SetupKubeadm(fakeTargets(&rec, "s1"), nil, KubeadmOptions{})
+	var prep string
+	for _, line := range rec {
+		if strings.Contains(line, "base64 -d") {
+			prep = line
+		}
+	}
+	if prep == "" {
+		t.Fatalf("no prerequisite command was issued: %v", rec)
+	}
+	if !strings.Contains(prep, "sudo ") {
+		t.Errorf("prerequisites are not run as root: %s", prep)
+	}
+	if !strings.Contains(prep, "bash -s") {
+		t.Errorf("script is not fed to a shell: %s", prep)
+	}
+}

@@ -275,6 +275,20 @@ func allReady(lines []string) bool {
 	return true
 }
 
+// FetchKubeadmKubeconfig copies /etc/kubernetes/admin.conf from the control
+// plane, rewriting the server address the same way as the k3s path.
+func FetchKubeadmKubeconfig(server *ssh.Client, localPath, serverHost string) error {
+	out, code, err := server.SudoRun(`cat /etc/kubernetes/admin.conf`)
+	if err != nil || code != 0 {
+		return fmt.Errorf("read admin.conf (exit %d): %s", code, out)
+	}
+	rewritten, err := rewriteKubeconfigServer(out, serverHost)
+	if err != nil {
+		return err
+	}
+	return writeFile(localPath, []byte(rewritten))
+}
+
 // FetchKubeconfig copies /etc/rancher/k3s/k3s.yaml from the server to
 // localPath, rewriting the server address so the file works from here.
 //

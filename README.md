@@ -142,7 +142,7 @@ A key that *changed* is always refused, in every mode — that is the case worth
 stopping for. Per node, `insecure_host_key: true` in the targets file skips
 verification for hosts whose address churns (the test sandbox does this).
 
-### 2. Install k3s on all nodes
+### 2. Install Kubernetes on all nodes
 
 ```bash
 k3helper vm setup -t targets.yaml \
@@ -491,7 +491,7 @@ Back on the server, `k3s kubectl get nodes` should show them joining. You lose `
 | check host service layer | ✅ (`k3s`/`k3s-agent`) | ✅ (`kubelet` + `containerd`) |
 | kubeconfig discovery | ✅ `/etc/rancher/k3s/k3s.yaml` | ✅ `/etc/kubernetes/admin.conf` |
 | certificate expiry | ✅ (`k3s certificate check`) | ❌ k3s-specific command |
-| vm setup | ✅ | ❌ install script is k3s-specific |
+| vm setup | ✅ (incl. HA) | ✅ single control plane (`--distro kubeadm`) |
 
 The distribution is detected per node from its unit files, so a mixed
 inventory works: kubectl is invoked through whichever kubeconfig exists, and
@@ -601,8 +601,12 @@ Current, and worth knowing before pointing this at production:
 - **Certificate expiry is read via `k3s certificate check`**, so it is not
   collected on kubeadm clusters. `doctor` says so rather than implying the
   certificates are fine.
-- **`vm setup` only installs k3s.** A kubeadm cluster can be checked and
-  diagnosed, but not bootstrapped.
+- **kubeadm HA is not supported.** Joining extra control-plane nodes needs
+  `--upload-certs` and an endpoint in front of the API servers; `vm setup`
+  says so rather than building half of it. k3s handles HA.
+- **Certificate expiry is not collected on kubeadm** (it reads
+  `k3s certificate check`), and `doctor` says so rather than implying the
+  certificates are fine.
 - **Clock skew is measured against the machine running k3helper**, so a laptop
   with a wrong clock will accuse every node.
 - **A cluster member missing from the targets file is invisible.** Host
