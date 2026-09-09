@@ -373,6 +373,14 @@ That produces numbered snippets. Paste `001-paste.sh`, `002-paste.sh`, … into 
 
 ### 2. Write targets.yaml on the server
 
+For a **single-node cluster**, one command is the whole step:
+
+```bash
+k3helper init --local
+```
+
+A server **plus** agents is a mixed inventory — one local node and some over SSH — which `--local` deliberately refuses to generate (`--local describes a single node; do not combine it with --server/--agent`). Write it by hand:
+
 ```yaml
 cluster: prod
 nodes:
@@ -416,6 +424,8 @@ Verify from the server before continuing — same preflight as [step 0](#0-confi
 ssh -i /root/.ssh/k3helper -o BatchMode=yes root@10.0.0.11 'echo ssh ok; sudo -n true && echo sudo ok'
 ```
 
+That `ssh` writes the agents into the server's `known_hosts` as a side effect, which is also what k3helper's own [host-key verification](#ssh-host-keys) needs — do it for every agent, or pass `--accept-new-host-key` on the first k3helper command below.
+
 ### 4. Bootstrap
 
 ```bash
@@ -423,6 +433,8 @@ k3helper vm setup -t targets.yaml --kubeconfig /root/.kube/config
 k3helper check  -t targets.yaml
 k3helper doctor -t targets.yaml
 ```
+
+The `local: true` server is never dialled, so it needs no host key at all — only the agents do.
 
 Everything else — `check`, `doctor`, `deploy`, `verify --dry-run-server`, `tui` — works the same from here, with the local node checked in-process and the agents over SSH.
 
@@ -475,14 +487,15 @@ the service check looks for the units that distribution actually installs.
 
 ## Testing
 
-The repo ships a self-contained sandbox: 3 Ubuntu 24.04 VMs (OrbStack) that k3helper installs k3s onto from scratch.
+The repo ships a self-contained sandbox: three Ubuntu 24.04 hosts that k3helper installs k3s onto from scratch.
 
 ```bash
-make sandbox-up      # 3 VMs + SSH
+make sandbox-up      # 3 hosts + SSH
 make bootstrap       # k3helper installs k3s on all nodes
 make check / doctor  # live cluster
 make e2e             # full lifecycle, ~10-15 min
-make e2e-fast        # reuse running sandbox, ~6 min
+make e2e-fast        # reuse running sandbox, ~8 min
+make e2e-quick       # reuse sandbox, skip the fault sweep, ~4 min
 make test            # unit tests
 make test-integration
 make fault-list      # every fault + the signature it should trigger
@@ -514,8 +527,6 @@ against the live API server, deploy/diff/namespaces, contexts, `doctor` on a
 healthy and a faulted cluster, and the fault sweep. `make e2e-quick` skips the
 sweep for a fast loop.
 
-The E2E script proves the whole loop: fresh VMs → check detects missing k3s → bootstrap → all green → gen/verify/deploy → doctor healthy → **inject faults (k3s stop, OOMKill) → doctor catches each → recover**.
-
 The sandbox has two drivers, selected automatically and overridable with
 `SANDBOX_DRIVER`:
 
@@ -536,9 +547,9 @@ CI on every push: gofmt, `go vet` (including under the `integration` build tag,
 so those files cannot rot unnoticed), race-enabled unit tests, and a
 cross-compile.
 
-Integration tests (`-tags=integration`) read node addresses from `test/sandbox/targets.sandbox.yaml` rather than hardcoding them, because OrbStack assigns new IPs each time the VMs are recreated. Point them at another cluster with `K3HELPER_TARGETS=/path/to/targets.yaml`. With no sandbox running they skip rather than fail.
+Integration tests (`-tags=integration`) read node addresses from `test/sandbox/targets.sandbox.yaml` rather than hardcoding them, because the sandbox is assigned new IPs each time it is recreated. Point them at another cluster with `K3HELPER_TARGETS=/path/to/targets.yaml`. With no sandbox running they skip rather than fail.
 
-> Note: sandbox VMs require [OrbStack](https://orbstack.dev) on macOS. Plain Docker containers share the macOS kernel and break kubelet PLEG (pods killed falsely), so real lightweight VMs are used.
+> **On macOS, use the `orbstack` driver.** [OrbStack](https://orbstack.dev) gives real lightweight Linux VMs. Docker containers on macOS share the host kernel, which breaks kubelet's PLEG and kills pods falsely — so the `docker` driver is for Linux, not for a Mac.
 
 ## Architecture
 
@@ -547,20 +558,22 @@ cmd/k3helper/            entry point
 install.sh               one-liner installer (POSIX sh, checksum-verified)
 scripts/bundle.sh        offline paste bundle for air-gapped web consoles
 internal/
-  config/    targets.yaml loading + validation
-  ssh/       node transport: SSH client (key auth, run/stream/sudo) or,
-             for `local: true` nodes, direct /bin/sh execution
+  config/    targets.yaml loading + validation, single- and multi-cluster
+  ssh/       node transport: SSH client (key auth, known_hosts verification,
+             run/stream/sudo) or, for `local: true` nodes, direct /bin/sh
   vm/        k3s bootstrap over SSH (server → token → agents → wait Ready)
   kyaml/     YAML verify (3 layers, offline + live) + generate (12 kinds)
   kube/      cluster reads through kubectl: pods, nodes, events, logs, describe
   sandbox/   locates the test sandbox from targets.sandbox.yaml
-  deploy/    dry-run → apply → rollout wait
-  check/     check registry: {status, summary, evidence, remediation}
+  deploy/    dry-run → diff → apply → rollout wait
+  check/     check registry {status, summary, evidence, remediation} +
+             per-node k3s/kubeadm distro detection
   troubleshoot/  evidence gathering + signature matching + diagnosis ranking
-  tui/       Bubble Tea dashboard
+  tui/       Bubble Tea dashboard + k9s-style resource browser
   cli/       cobra commands
 test/
-  sandbox/   OrbStack 3-VM sandbox + setup script
+  sandbox/   3-host sandbox, orbstack (VMs) and docker (containers) drivers
+  faults/    fault injection + the troubleshooter's exam (check-all.sh)
   fixtures/  YAML corpus, goldens
   e2e.sh     full-lifecycle E2E
 ```
@@ -591,7 +604,7 @@ Current, and worth knowing before pointing this at production:
 - [ ] Port-forward manager and multi-pod log tailing in the TUI
 - [ ] `doctor --watch` for continuous monitoring
 - [ ] Get the container sandbox passing the E2E so CI can run it on every push
-- [ ] HA control plane: multiple servers, `--cluster-init`, embedded etcd
+- [ ] `vm setup` for kubeadm, so bootstrap covers both distributions it can check
 
 ## License
 

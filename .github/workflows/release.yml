@@ -1,0 +1,106 @@
+name: Release
+
+# Tagging vX.Y.Z publishes the release: cross-compiled binaries, a checksums
+# manifest install.sh verifies against, and the notes for that version taken
+# from CHANGELOG.md.
+on:
+  push:
+    tags: ["v*"]
+  # Re-run a release by hand if publishing failed after the tag was pushed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.26.2"
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in
+            v*) ;;
+            *) echo "::error::tag must start with v, got '$tag'"; exit 1 ;;
+          esac
+          echo "tag=$tag"            >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}"    >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      # The release must not ship code that would fail CI.
+      - name: Verify
+        run: |
+          unformatted="$(gofmt -l ./cmd ./internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt'd: $unformatted"; exit 1
+          fi
+          go vet ./...
+          go vet -tags=integration ./...
+          go test -race -count=1 ./...
+
+      # VERSION comes from the tag, so `k3helper version` can never disagree
+      # with the release it was published under.
+      - name: Build artifacts
+        run: make release VERSION=${{ steps.tag.outputs.version }}
+
+      - name: Check the built binary reports the tagged version
+        run: |
+          got="$(./dist/k3helper-linux-amd64 version)"
+          echo "$got"
+          case "$got" in
+            *"${{ steps.tag.outputs.version }}"*) ;;
+            *) echo "::error::binary reports '$got', expected ${{ steps.tag.outputs.version }}"; exit 1 ;;
+          esac
+
+      # Pull the section for this version out of CHANGELOG.md. Falling back to
+      # generated notes would quietly ship a commit list as the release notes,
+      # so a missing section is an error instead.
+      - name: Extract release notes
+        run: |
+          awk -v tag="${{ steps.tag.outputs.tag }}" '
+            $0 ~ "^## " tag "$" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::no '## ${{ steps.tag.outputs.tag }}' section in CHANGELOG.md"
+            exit 1
+          fi
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$tag" --notes-file notes.md
+          else
+            gh release create "$tag" --title "$tag" --notes-file notes.md
+          fi
+          gh release upload "$tag" \
+            dist/k3helper-* dist/checksums.txt dist/install.sh --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.tag.outputs.tag }}
+          path: dist/
+          retention-days: 3
