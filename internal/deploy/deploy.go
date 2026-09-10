@@ -161,7 +161,7 @@ func Deploy(exec Executor, manifest string, opts Options) (*Result, error) {
 		return res, fmt.Errorf("--namespace %s conflicts with the manifest: %s; remove metadata.namespace or drop the flag",
 			opts.Namespace, strings.Join(conflicts, "; "))
 	}
-	remote, err := kyaml.RemotePath(manifest)
+	remote, err := kyaml.RemotePathIn(kyaml.StageDir(exec), manifest)
 	if err != nil {
 		return res, err
 	}

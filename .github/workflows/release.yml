@@ -70,6 +70,26 @@ jobs:
             *) echo "::error::binary reports '$got', expected ${{ steps.tag.outputs.version }}"; exit 1 ;;
           esac
 
+      # Every asset install.sh can ask for has to be in the release, and the
+      # Windows ones have to carry .exe or Windows will not execute them. A
+      # missing or misnamed asset only surfaces when somebody's download 404s.
+      - name: Every platform asset is present and listed in checksums.txt
+        run: |
+          for asset in \
+            k3helper-linux-amd64 k3helper-linux-arm64 \
+            k3helper-darwin-amd64 k3helper-darwin-arm64 \
+            k3helper-windows-amd64.exe k3helper-windows-arm64.exe
+          do
+            [ -f "dist/$asset" ] || { echo "::error::dist/$asset missing"; exit 1; }
+            grep -q " $asset\$" dist/checksums.txt \
+              || { echo "::error::$asset not listed in checksums.txt"; exit 1; }
+            echo "✓ $asset"
+          done
+          case "$(file -b dist/k3helper-windows-amd64.exe)" in
+            *"PE32"*|*"MS Windows"*) ;;
+            *) echo "::error::the Windows asset is not a Windows executable"; exit 1 ;;
+          esac
+
       # Pull the section for this version out of CHANGELOG.md. Falling back to
       # generated notes would quietly ship a commit list as the release notes,
       # so a missing section is an error instead.

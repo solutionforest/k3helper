@@ -7,21 +7,24 @@ import (
 	"strings"
 
 	"github.com/solutionforest/k3helper/internal/config"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
 )
 
 func newInitCmd() *cobra.Command {
 	var (
-		outPath  string
-		cluster  string
-		server   string
-		agents   []string
-		user     string
-		key      string
-		local    bool
-		force    bool
-		insecure bool
+		outPath     string
+		cluster     string
+		server      string
+		agents      []string
+		user        string
+		key         string
+		local       bool
+		force       bool
+		insecure    bool
+		kubeconfig  string
+		kubeContext string
 	)
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -36,6 +39,9 @@ Examples:
   # this machine, no SSH (provider browser console)
   k3helper init --local
 
+  # a managed cluster (EKS/GKE/AKS): no SSH, driven through kubectl
+  k3helper init --kubeconfig ~/.kube/config --kube-context prod
+
   # a template to fill in by hand
   k3helper init`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -43,14 +49,14 @@ Examples:
 				return fmt.Errorf("%s already exists; pass --force to overwrite it", outPath)
 			}
 
-			targets, err := buildTargets(cluster, server, agents, user, key, local, insecure)
+			targets, err := buildTargets(cluster, server, agents, user, key, local, insecure, kubeconfig, kubeContext)
 			if err != nil {
 				return err
 			}
 			// Render before validating: Validate fills in defaults (it sets a
 			// local node's host to "localhost"), and echoing those back into
 			// the file would clutter it with values the user never chose.
-			body := initHeader(local) + renderTargets(targets)
+			body := initHeader(local, kubeconfig != "") + renderTargets(targets)
 
 			// A targets file that cannot be loaded back is worse than none, so
 			// validate a copy and then re-parse what we are about to write.
@@ -70,6 +76,11 @@ Examples:
 
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "✓ wrote %s\n\n", outPath)
+			if targets.Mode() == config.ModeKubeconfig {
+				fmt.Fprintf(out, "  %-8s %s\n", targets.Cluster, transport.ServerName(targets))
+				fmt.Fprintf(out, "\nNext: k3helper doctor -t %s\n", outPath)
+				return nil
+			}
 			for _, n := range targets.Nodes {
 				where := n.Host
 				if n.Local {
@@ -88,6 +99,10 @@ Examples:
 	cmd.Flags().StringVarP(&user, "user", "u", "root", "SSH user for every node")
 	cmd.Flags().StringVarP(&key, "key", "k", "~/.ssh/id_ed25519", "SSH private key for every node")
 	cmd.Flags().BoolVar(&local, "local", false, "single node: the machine k3helper runs on, no SSH")
+	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "",
+		"reach the cluster through this kubeconfig instead of over SSH (managed clusters)")
+	cmd.Flags().StringVar(&kubeContext, "kube-context", "",
+		"context to use inside --kubeconfig (default: the file's current-context)")
 	cmd.Flags().BoolVar(&insecure, "insecure-host-key", false, "skip SSH host key verification for these nodes")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing file")
 	return cmd
@@ -95,8 +110,19 @@ Examples:
 
 // buildTargets assembles the cluster from the flags, falling back to a
 // placeholder template when no addresses were given.
-func buildTargets(cluster, server string, agents []string, user, key string, local, insecure bool) (*config.Targets, error) {
+func buildTargets(cluster, server string, agents []string, user, key string, local, insecure bool,
+	kubeconfig, kubeContext string) (*config.Targets, error) {
 	t := &config.Targets{Cluster: cluster}
+
+	if kubeconfig != "" {
+		if local || server != "" || len(agents) > 0 {
+			return nil, fmt.Errorf("--kubeconfig reaches the cluster through its API server; " +
+				"do not combine it with --local/--server/--agent, which describe machines to SSH into")
+		}
+		t.Kubeconfig = kubeconfig
+		t.KubeContext = kubeContext
+		return t, nil
+	}
 
 	if local {
 		if server != "" || len(agents) > 0 {
@@ -180,6 +206,13 @@ func splitHostPort(s string) (string, int, error) {
 func renderTargets(t *config.Targets) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster: %s\n", t.Cluster)
+	if t.Kubeconfig != "" {
+		fmt.Fprintf(&b, "kubeconfig: %s\n", t.Kubeconfig)
+		if t.KubeContext != "" {
+			fmt.Fprintf(&b, "kube_context: %s\n", t.KubeContext)
+		}
+		return b.String()
+	}
 	b.WriteString("nodes:\n")
 	for _, n := range t.Nodes {
 		fmt.Fprintf(&b, "  - name: %s\n", n.Name)
@@ -201,7 +234,7 @@ func renderTargets(t *config.Targets) string {
 	return b.String()
 }
 
-func initHeader(local bool) string {
+func initHeader(local, kubeconfig bool) string {
 	h := `# k3helper targets — the machines this cluster runs on.
 #
 #   role:  server | agent            (at least one server)
@@ -230,6 +263,31 @@ func initHeader(local bool) string {
 		h += `#
 # local: true means "the machine k3helper is running on" — commands run
 # through /bin/sh instead of SSH, so no host, user or key is needed.
+`
+	}
+	if kubeconfig {
+		h = `# k3helper targets — a cluster reached through its API server.
+#
+#   kubeconfig:   path on THIS machine; ~ is expanded
+#   kube_context: which context inside that file (default: its current-context)
+#
+# There are no nodes here on purpose. A kubeconfig reaches the API server, not
+# the machines behind it, so the host layer is not available: no disk/swap/
+# cgroup checks, no systemd or container-runtime state, and no "vm setup" or
+# "registry apply". Everything that works through kubectl still works —
+# verify, gen, deploy, doctor's cluster and workload signatures, and the TUI.
+#
+# For a self-managed cluster you can SSH into, describe its nodes instead and
+# get the host layer as well.
+#
+# Several clusters can live in one file, mixing both kinds:
+#   clusters:
+#     - cluster: prod
+#       kubeconfig: ~/.kube/prod.yaml
+#     - cluster: lab
+#       nodes: [...]
+#   current: prod
+# then select one with --context <name>.
 `
 	}
 	return h

@@ -40,10 +40,16 @@ settle_for() {
     # interval, so DiskPressure appears well after the disk is actually full
     disk-full)    echo 60 ;;
     k3s-down|oom) echo 45 ;;
+    # A crashlooping pod is not reported as CrashLoopBackOff the moment it
+    # fails. It has to pull its image, run, exit, and be restarted enough times
+    # for kubelet to give up and back off — and until then the pod is Running
+    # and unready, which doctor correctly reports as pod.not-ready instead.
+    # 30s caught it on a fast machine and missed it on a loaded CI runner. The
+    # oom fault is the same shape and already has 45.
+    crashloop)    echo 45 ;;
     # the scheduler retries FailedScheduling with backoff, so the event can
     # take longer to appear than the pod takes to go Pending
     cordon|pending) echo 40 ;;
-    crashloop)    echo 30 ;;
     imagepull)    echo 25 ;;
     registry)     echo 25 ;;
     coredns)      echo 10 ;;

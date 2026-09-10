@@ -59,7 +59,32 @@ chmod +x k3helper
 ./k3helper version
 ```
 
-Assets: `k3helper-linux-amd64`, `k3helper-linux-arm64`, `k3helper-darwin-amd64`, `k3helper-darwin-arm64`. Every release also ships `checksums.txt`.
+Assets: `k3helper-linux-amd64`, `k3helper-linux-arm64`, `k3helper-darwin-amd64`, `k3helper-darwin-arm64`, `k3helper-windows-amd64.exe`, `k3helper-windows-arm64.exe`. Every release also ships `checksums.txt`.
+
+### Windows — one .exe, nothing installed
+
+Download it, put it where you like, run it. No installer, no registry keys, no
+runtime, nothing written outside the folder you put it in.
+
+```powershell
+curl.exe -fLo k3helper.exe ^
+  https://github.com/solutionforest/k3helper/releases/latest/download/k3helper-windows-amd64.exe
+.\k3helper.exe version
+```
+
+On Windows on ARM take `k3helper-windows-arm64.exe` instead. Verify it against
+the release manifest if you want to:
+
+```powershell
+curl.exe -fLO https://github.com/solutionforest/k3helper/releases/latest/download/checksums.txt
+Get-FileHash k3helper.exe -Algorithm SHA256    # compare with the line in checksums.txt
+```
+
+Windows reaches clusters through a kubeconfig rather than over SSH — see
+[Clusters you cannot SSH into](#clusters-you-cannot-ssh-into) — so it needs
+`kubectl` on PATH and nothing else. SSH mode works too if your nodes are
+reachable, but the host-layer commands (`vm setup`, `registry apply`) target
+Linux nodes.
 
 ### From source
 
@@ -632,18 +657,74 @@ Back on the server, `k3s kubectl get nodes` should show them joining. You lose `
 
 ## k3s vs k8s support
 
-| Area | k3s | kubeadm / other k8s |
-|---|---|---|
-| verify / gen | ✅ | ✅ (pure YAML) |
-| deploy / doctor cluster layer | ✅ | ✅ (kubectl-based) |
-| check host service layer | ✅ (`k3s`/`k3s-agent`) | ✅ (`kubelet` + `containerd`) |
-| kubeconfig discovery | ✅ `/etc/rancher/k3s/k3s.yaml` | ✅ `/etc/kubernetes/admin.conf` |
-| certificate expiry | ✅ (`k3s certificate check`) | ❌ k3s-specific command |
-| vm setup | ✅ (incl. HA) | ✅ single control plane (`--distro kubeadm`) |
+| Area | k3s | kubeadm / other k8s | managed (EKS/GKE/AKS) |
+|---|---|---|---|
+| verify / gen | ✅ | ✅ (pure YAML) | ✅ |
+| deploy / doctor cluster layer | ✅ | ✅ (kubectl-based) | ✅ |
+| TUI browser, logs, port-forward | ✅ | ✅ | ✅ |
+| check host service layer | ✅ (`k3s`/`k3s-agent`) | ✅ (`kubelet` + `containerd`) | ❌ no host access |
+| kubeconfig discovery | ✅ `/etc/rancher/k3s/k3s.yaml` | ✅ `/etc/kubernetes/admin.conf` | ✅ your own kubeconfig |
+| certificate expiry | ✅ (`k3s certificate check`) | ❌ k3s-specific command | ❌ provider's job |
+| registry apply | ✅ | ✅ | ❌ writes files on nodes |
+| vm setup | ✅ (incl. HA) | ✅ single control plane (`--distro kubeadm`) | ❌ provider's job |
 
-The distribution is detected per node from its unit files, so a mixed
-inventory works: kubectl is invoked through whichever kubeconfig exists, and
-the service check looks for the units that distribution actually installs.
+For self-managed clusters the distribution is detected per node from its unit
+files, so a mixed inventory works: kubectl is invoked through whichever
+kubeconfig exists, and the service check looks for the units that distribution
+actually installs.
+
+### Clusters you cannot SSH into
+
+A managed cluster hands you a kubeconfig and nothing else — no control-plane
+node to log into, no `admin.conf` to read. Describe it by that kubeconfig
+instead of by nodes:
+
+```bash
+k3helper init --kubeconfig ~/.kube/config --kube-context prod-admin --cluster client-prod
+```
+
+```yaml
+cluster: client-prod
+kubeconfig: ~/.kube/config
+kube_context: prod-admin      # optional; defaults to the file's current-context
+```
+
+Then everything that works through the API server works normally:
+
+```bash
+k3helper doctor            # cluster + workload signatures, ranked, with fixes
+k3helper deploy -f app.yaml
+k3helper verify --dry-run-server app.yaml
+k3helper tui               # browser, logs, describe, port-forward
+```
+
+Two notes on what this cannot do:
+
+- **The host layer is not there to look at.** Disk pressure, swap, cgroups,
+  systemd units, the container runtime and certificate expiry are not checked.
+  `doctor` says so as a note on the scope of the diagnosis rather than staying
+  quiet, and it does not affect the exit code — a healthy managed cluster exits
+  0. `check` explains that it has nothing to check and stops.
+- **`vm setup` and `registry apply` refuse.** Both write files on the machines
+  themselves. On a managed cluster that is the provider's job.
+
+`kube_context` is deliberately not called `context`: `--context` already
+selects which cluster to use from a multi-cluster targets file, and one file
+can hold both kinds.
+
+```yaml
+clusters:
+  - cluster: client-prod        # managed, reached through its API server
+    kubeconfig: ~/.kube/client-prod.yaml
+  - cluster: lab                # self-managed, reached over SSH
+    nodes:
+      - {name: server, role: server, host: 10.0.0.10, user: ubuntu, key: ~/.ssh/id_ed25519}
+current: client-prod
+```
+
+`k3helper ctx` prints which is which. This mode drives your local `kubectl`, so
+it has to be installed — k3helper says so at the front door rather than part
+way through a diagnosis.
 
 ## Testing
 
@@ -657,6 +738,7 @@ make e2e             # full lifecycle, ~10-15 min
 make e2e-fast        # reuse running sandbox, ~8 min
 make e2e-quick       # reuse sandbox, skip the fault sweep, ~4 min
 make test            # unit tests
+make portable-check  # run the built binary from a bare directory
 make test-integration
 make fault-list      # every fault + the signature it should trigger
 make fault-<name>    # inject one fault, e.g. make fault-oom
@@ -761,6 +843,12 @@ Current, and worth knowing before pointing this at production:
 
 - **Host-layer checks assume systemd.** Nodes without it (some minimal or
   container-based images) get cluster-layer findings only.
+- **A kubeconfig cluster has no host layer at all.** That is the nature of a
+  managed cluster rather than a gap here, but it means roughly half the
+  signatures cannot fire. See "Clusters you cannot SSH into".
+- **Kubeconfig mode shells out to `kubectl`.** It is driven by argument, not
+  through a shell, so it works the same on Windows — but kubectl has to be on
+  PATH.
 - **`doctor` reads the cluster through the first server node.** If that node is
   down, cluster-layer evidence is unavailable even when other servers are up.
 - **Certificate expiry is read via `k3s certificate check`**, so it is not

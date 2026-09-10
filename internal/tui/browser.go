@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"net"
 	"regexp"
 	"sort"
 	"strconv"
@@ -14,7 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/solutionforest/k3helper/internal/kube"
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 )
 
 // view identifies what the browser is currently showing.
@@ -737,8 +736,7 @@ type forward struct {
 	Target     string
 	RemotePort int
 	LocalPort  int
-	pf         *kube.PortForward
-	tunnel     *ssh.Tunnel
+	fwd        transport.Forward
 }
 
 func (f forward) String() string {
@@ -751,52 +749,36 @@ type forwardsMsg struct {
 	err      error
 }
 
-// startForward opens a port-forward on the node and tunnels it here.
+// startForward opens a port-forward and reports the local port it landed on.
 //
-// Both halves are needed: kubectl binds on the cluster node, so without the
-// tunnel the port is open there and not on the operator's machine.
-func startForward(client *ssh.Client, ns, target string, remotePort int, existing []forward) tea.Cmd {
+// How that happens depends on the transport: over SSH kubectl binds on the
+// cluster node and a tunnel carries the port here, while through a kubeconfig
+// kubectl binds here directly. The TUI does not need to know which.
+func startForward(client transport.Cluster, ns, target string, remotePort int, existing []forward) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return forwardsMsg{forwards: existing, err: fmt.Errorf("no server connection")}
 		}
-		// A node-side port distinct from the local one, so several forwards
-		// can coexist and neither side collides with something already bound.
-		nodePort := 39000 + len(existing)
-		pf, err := kube.StartPortForward(client, ns, target, remotePort, nodePort)
+		fwd, err := transport.StartForward(client, ns, target, remotePort, len(existing))
 		if err != nil {
 			return forwardsMsg{forwards: existing, err: err}
-		}
-		// :0 lets the OS choose a free local port and report which.
-		tunnel, err := client.Forward("127.0.0.1:0", pf.NodeAddr())
-		if err != nil {
-			pf.Stop()
-			return forwardsMsg{forwards: existing, err: err}
-		}
-		local := 0
-		if _, portStr, e := net.SplitHostPort(tunnel.LocalAddr); e == nil {
-			local, _ = strconv.Atoi(portStr)
 		}
 		f := forward{
-			Namespace: ns, Target: target, RemotePort: remotePort, LocalPort: local,
-			pf: pf, tunnel: tunnel,
+			Namespace: ns, Target: target, RemotePort: remotePort,
+			LocalPort: fwd.LocalPort(), fwd: fwd,
 		}
 		return forwardsMsg{forwards: append(existing, f)}
 	}
 }
 
-// stopForward tears one down, remote process and tunnel both.
+// stopForward tears one down.
 func stopForward(fs []forward, idx int) tea.Cmd {
 	return func() tea.Msg {
 		if idx < 0 || idx >= len(fs) {
 			return forwardsMsg{forwards: fs}
 		}
-		f := fs[idx]
-		if f.tunnel != nil {
-			f.tunnel.Close()
-		}
-		if f.pf != nil {
-			f.pf.Stop()
+		if f := fs[idx]; f.fwd != nil {
+			f.fwd.Close()
 		}
 		return forwardsMsg{forwards: append(append([]forward{}, fs[:idx]...), fs[idx+1:]...)}
 	}

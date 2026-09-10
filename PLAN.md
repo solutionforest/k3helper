@@ -395,9 +395,49 @@ scripts/bundle.sh
 11. **Linux CI sandbox** — the container driver runs the full E2E. ✅
 12. **Private registries** — targets-file declaration, `registry apply`,
     pull-secret generation, node-side check, three diagnosis signatures. ✅
+13. **Kubeconfig transport** — clusters reached through their API server
+    instead of by SSH, so managed Kubernetes is in scope. ✅
 
 Remaining: nothing from the original scope. Open items are new asks, tracked
 under "Open questions" below.
+
+### 8. Kubeconfig transport (#13)
+
+**Why.** Every layer below the cluster assumed SSH into a node and a kubectl
+living there. That covers k3s and kubeadm and excludes every managed cluster,
+which is what most clients run: EKS/GKE/AKS hand out a kubeconfig and keep the
+machines. The cluster layer never needed the machines — only the transport did.
+
+**Shape.** A `Targets` entry carries either `nodes:` or `kubeconfig:`, and
+`Targets.Mode()` says which. `internal/transport` is the one place that opens
+connections; `internal/kubectl` is the local transport.
+
+**Why the local transport parses instead of shelling out.** The codebase builds
+shell command strings. `internal/ssh/local.go` runs them through `/bin/sh`,
+which Windows does not have — and the portable `.exe` is a deliverable. So
+`kubectl.Local.Run` asserts the command is one of its own kubectl invocations,
+strips the trailing redirection, splits the arguments honouring the single
+quoting `kube.shellQuote` produces, and execs kubectl directly. Anything else —
+`df`, `systemctl`, `free`, the k3s probes — is refused with exit 127. That
+refusal is the feature: host probes fail where they are written, with a reason,
+instead of somewhere further down.
+
+**Layers.** `check.HostChecks` is the single host-check list both `check` and
+the TUI build from. `Evidence.HostLayerUnavailable` is deliberately neither a
+`ProbeError` nor an `UnreachableNode`: both of those mean "we tried and failed",
+which is a fault, while this means "there was never anything to try", which is
+how managed clusters work. Conflating them reports every healthy EKS cluster as
+degraded. `Diagnosis.Informational()` keeps those notes out of the exit code.
+
+**Refusals.** `vm setup` and `registry apply` need machines. They stop with an
+explanation rather than doing half the job — a registry configured on some
+nodes and not others is the exact failure the cluster-level registry block
+exists to prevent.
+
+**Proof.** Unit tests parse the real command strings from `gather.go` and
+`deploy.go`; `exec_test.go` runs the whole path against a stub kubectl on PATH;
+the integration suite reads the sandbox twice, once over SSH and once through
+its kubeconfig, and asserts the two agree.
 
 ## Research — similar tools
 

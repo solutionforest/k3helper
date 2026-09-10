@@ -6,6 +6,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/solutionforest/k3helper/internal/check"
+	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/spf13/cobra"
 )
@@ -29,6 +30,16 @@ dead k3s does.`,
 			if err != nil {
 				return err
 			}
+			if targets.Mode() == config.ModeKubeconfig {
+				// Every check in this command reads the machine. Say so once,
+				// plainly, instead of printing a screen of skipped rows for a
+				// cluster that was never going to have them.
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"cluster %q is reached through a kubeconfig: %s\n\n"+
+						"Run `k3helper doctor` for the checks that work through the API server.\n",
+					targets.Cluster, check.HostReason)
+				return nil
+			}
 			anyFail, anyWarn := false, false
 			for _, node := range targets.Nodes {
 				client, err := ssh.Dial(node.SSH())
@@ -37,14 +48,7 @@ dead k3s does.`,
 					anyFail = true
 					continue
 				}
-				runner := check.NewRunner(
-					check.DiskUsageCheck{},
-					check.MemoryCheck{},
-					check.SwapCheck{},
-					check.CgroupCheck{},
-					check.ServiceCheck{Role: node.Role},
-					check.RegistryCheck{},
-				)
+				runner := check.NewRunner(check.HostChecks(node.Role)...)
 				results := runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 				client.Close()
 

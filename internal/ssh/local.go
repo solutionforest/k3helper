@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 )
 
 // This file backs nodes marked Local: k3helper running directly on the box it
@@ -16,7 +17,26 @@ import (
 
 const localShell = "/bin/sh"
 
+// errNoLocalShell explains a `local: true` node on a platform that has no
+// POSIX shell. k3helper builds and runs on Windows, but the local transport
+// means "run these commands on the machine k3helper is on" — and every command
+// it runs is a Linux one, aimed at a node that hosts k3s. There is nothing
+// sensible to do here except say so.
+//
+// The bare failure is "exec: /bin/sh: executable file not found in %PATH%",
+// which reads like a broken install rather than a targets file describing
+// something that cannot exist.
+func errNoLocalShell() error {
+	return fmt.Errorf("local: true needs a POSIX shell at %s, which %s does not have — "+
+		"a local node is the machine k3helper runs on, and k3s nodes are Linux hosts. "+
+		"Describe the node with host/user/key to reach it over SSH instead",
+		localShell, runtime.GOOS)
+}
+
 func runLocal(cmd string) (string, int, error) {
+	if runtime.GOOS == "windows" {
+		return "", -1, errNoLocalShell()
+	}
 	out, err := exec.Command(localShell, "-c", cmd).CombinedOutput()
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		return string(out), exitErr.ExitCode(), nil
@@ -28,6 +48,9 @@ func runLocal(cmd string) (string, int, error) {
 }
 
 func streamLocal(cmd string, w io.Writer) (int, error) {
+	if runtime.GOOS == "windows" {
+		return -1, errNoLocalShell()
+	}
 	c := exec.Command(localShell, "-c", cmd)
 	c.Stdout = w
 	c.Stderr = w

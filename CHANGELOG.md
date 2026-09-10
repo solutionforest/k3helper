@@ -4,6 +4,83 @@ Notable changes per release. The release workflow publishes the section
 matching the tag it is building, so this file is the source of the release
 notes on GitHub.
 
+## v0.5.0
+
+Clusters you cannot SSH into. k3helper now reaches a cluster either by its
+nodes or by a kubeconfig, which is what a managed cluster (EKS, GKE, AKS,
+Rancher, anything else that hands you credentials and keeps the machines)
+actually gives you.
+
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/solutionforest/k3helper/main/install.sh | sh
+```
+
+No breaking changes from v0.4.0. Existing targets files keep working exactly
+as they did.
+
+### Added
+
+- **`kubeconfig:` clusters.** A targets file entry with `kubeconfig:` (and an
+  optional `kube_context:`) instead of `nodes:` drives a local `kubectl`
+  against the API server. `k3helper init --kubeconfig ~/.kube/config
+  --kube-context prod` writes one.
+- **Everything that works through the API server works there**: `doctor`'s
+  cluster and workload signatures, `deploy`, `verify --dry-run-server`, `gen`,
+  and the TUI including logs, describe and port-forward.
+- **`k3helper ctx` gained a REACHED column**, so `0 nodes` reads as "reached by
+  kubeconfig" rather than as a broken file. One file can mix both kinds.
+- **Windows binaries, released.** `k3helper-windows-amd64.exe` and
+  `k3helper-windows-arm64.exe` are built by `make release`, listed in
+  `checksums.txt`, and published with every tag. One file, no installer,
+  nothing written outside the folder you put it in. The kubeconfig transport
+  runs kubectl by argument rather than through a shell, so it needs no
+  `/bin/sh`.
+- **`make portable-check`**, and CI runs it on Linux, macOS and Windows.
+  "Single portable binary" is a claim about the runtime rather than the build,
+  so it is checked by running the binary from a directory it has never seen:
+  it must start, explain a missing targets file, refuse a kubeconfig that is
+  not there without writing anything, complete the kubeconfig and SSH init
+  flows, generate and verify YAML with no cluster and no network, and leave
+  nothing behind in `$HOME`.
+- **A macOS CI job.** macOS is what most operators drive a cluster from and
+  nothing in CI ran there before; it now gets vet, race tests and the portable
+  check on every push, the same as Linux.
+
+### Fixed
+
+- **`doctor` now catches a crash loop it happens to sample mid-restart.** A
+  container in backoff only reads as CrashLoopBackOff while it is waiting
+  between attempts; the moment it starts again the pod is Running with no
+  reason attached, and the diagnosis saw nothing worse than an unready pod.
+  Restart counts were already parsed and thrown away — they are now kept, and a
+  pod that is not ready after three or more restarts is called a crash loop
+  whichever half of the cycle we caught. This is why the fault matrix could
+  catch that fault or miss it depending on timing.
+
+### Changed
+
+- **`doctor` separates scope notes from faults.** A finding that describes what
+  could *not* be looked at — incomplete evidence, or a missing host layer — is
+  printed under "Notes on what was looked at" and no longer sets the exit code.
+  A healthy managed cluster exits 0 instead of 2.
+- **`check` and the TUI build their host check list from one place**
+  (`check.HostChecks`), so a check added to one cannot go missing from the
+  other.
+
+### Not available on a kubeconfig cluster
+
+By nature, not by omission — a kubeconfig reaches the API server, not the
+machines behind it:
+
+- Host-layer checks: disk, memory, swap, cgroups, systemd units, container
+  runtime, clock skew. `doctor` reports the gap rather than implying those are
+  fine; `check` says it has nothing to check.
+- `vm setup` and `registry apply`. Both write files on the nodes, and both
+  refuse with an explanation rather than doing half the job.
+- Certificate expiry, which reads `k3s certificate check` on the node.
+
 ## v0.4.0
 
 Private registries: declared once, applied to every node, and diagnosed

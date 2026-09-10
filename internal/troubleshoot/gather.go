@@ -23,6 +23,9 @@ type Gatherer struct {
 	// to assess etcd quorum from host evidence when the API server — the thing
 	// quorum loss takes down — cannot be reached to ask.
 	ServerNodes []string
+	// NoHostLayer says there is no host layer to gather, as opposed to one
+	// that was not reachable. Set for kubeconfig clusters.
+	NoHostLayer bool
 }
 
 // Collect assembles an Evidence bundle. Never fails: collection problems
@@ -50,6 +53,8 @@ func (g Gatherer) Collect() Evidence {
 		NodeAlias:        map[string]string{},
 		ServerNodes:      g.ServerNodes,
 		Unreachable:      g.Unreachable,
+
+		HostLayerUnavailable: g.NoHostLayer,
 	}
 
 	// --- cluster layer via kubectl ---

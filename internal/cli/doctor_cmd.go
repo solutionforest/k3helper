@@ -12,7 +12,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/config"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/solutionforest/k3helper/internal/troubleshoot"
 	"github.com/spf13/cobra"
 )
@@ -62,10 +63,8 @@ func newDoctorCmd() *cobra.Command {
 				if err := enc.Encode(report); err != nil {
 					return err
 				}
-				for _, d := range diagnoses {
-					if d.SignatureID != "cluster.partial-evidence" {
-						os.Exit(2)
-					}
+				if !troubleshoot.OnlyInformational(diagnoses) {
+					os.Exit(2)
 				}
 				return nil
 			}
@@ -94,24 +93,26 @@ func newDoctorCmd() *cobra.Command {
 				fmt.Fprintln(out, "✓ no issues detected — cluster looks healthy")
 				return nil
 			}
+			// Scope notes are not faults. Leading with "1 likely issue" for a
+			// healthy managed cluster is how a working setup gets reported to
+			// the client as broken.
+			if troubleshoot.OnlyInformational(diagnoses) {
+				w.Flush()
+				fmt.Fprintln(out, "✓ no issues detected — cluster looks healthy")
+				fmt.Fprintln(out, "\nNotes on what was looked at:")
+				for _, d := range diagnoses {
+					fmt.Fprintf(w, " \t%s\n", d.Title)
+					fmt.Fprintf(w, " \t  %s\n", wrapText(d.Remediation, " \t  "))
+				}
+				w.Flush()
+				return nil
+			}
 			fmt.Fprintf(out, "Found %d likely issue(s), ranked by confidence:\n\n", len(diagnoses))
 			for i, d := range diagnoses {
 				fmt.Fprintf(w, "%d.\t[%d%%]\t%s\n", i+1, d.Confidence, d.Title)
 				fmt.Fprintf(w, " \tfix:\t%s\n", wrapText(d.Remediation, " \t      "))
 			}
 			w.Flush()
-			// Incomplete evidence on its own is a caveat, not a fault: exiting
-			// non-zero for it alone would turn every RBAC-scoped kubeconfig
-			// into a red CI run.
-			onlyPartial := true
-			for _, d := range diagnoses {
-				if d.SignatureID != "cluster.partial-evidence" {
-					onlyPartial = false
-				}
-			}
-			if onlyPartial {
-				return nil
-			}
 			os.Exit(2)
 			return nil
 		},
@@ -216,34 +217,22 @@ func diagnoseOnce(targetsPath string) (diagnosis, error) {
 	if err != nil {
 		return diagnosis{}, err
 	}
-	srvNode, err := targets.Server()
+	server, err := transport.Server(targets)
 	if err != nil {
 		return diagnosis{}, err
 	}
-	server, err := ssh.Dial(srvNode.SSH())
-	if err != nil {
-		return diagnosis{}, fmt.Errorf("connect to server: %w", err)
-	}
 	defer server.Close()
 
-	// Every node gets its own connection except the one already dialled for
+	// Every node gets its own connection except the one already opened for
 	// kubectl. A node we cannot reach is evidence, not something to skip:
 	// silently dropping it lets doctor report a healthy cluster while a node
-	// is down.
-	hosts := map[string]ssh.Executor{}
+	// is down. A kubeconfig cluster has no nodes here at all, which is a
+	// different thing and is recorded as such.
+	hosts, failures, closeHosts := transport.Hosts(targets, server, transport.ServerName(targets))
+	defer closeHosts()
 	var unreachable []troubleshoot.UnreachableNode
-	for _, n := range targets.Nodes {
-		if n.Name == srvNode.Name {
-			hosts[n.Name] = server
-			continue
-		}
-		c, err := ssh.Dial(n.SSH())
-		if err != nil {
-			unreachable = append(unreachable, troubleshoot.UnreachableNode{Name: n.Name, Reason: err.Error()})
-			continue
-		}
-		defer c.Close()
-		hosts[n.Name] = c
+	for _, f := range failures {
+		unreachable = append(unreachable, troubleshoot.UnreachableNode{Name: f.Name, Reason: f.Reason})
 	}
 
 	var serverNames []string
@@ -252,6 +241,7 @@ func diagnoseOnce(targetsPath string) (diagnosis, error) {
 	}
 	g := troubleshoot.Gatherer{
 		Server: server, Hosts: hosts, Unreachable: unreachable, ServerNodes: serverNames,
+		NoHostLayer: targets.Mode() == config.ModeKubeconfig,
 	}
 	evidence := g.Collect()
 	return diagnosis{

@@ -12,7 +12,7 @@ import (
 
 	"github.com/solutionforest/k3helper/internal/deploy"
 	"github.com/solutionforest/k3helper/internal/kyaml"
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 )
 
 // --- YAML studio (:gen) ------------------------------------------------------
@@ -126,7 +126,7 @@ type deployMsg struct {
 
 // dryRunDeploy shows what applying a manifest would change, without changing
 // anything. The operator applies it with a second keystroke.
-func dryRunDeploy(client *ssh.Client, path, namespace string) tea.Cmd {
+func dryRunDeploy(client transport.Cluster, path, namespace string) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return deployMsg{file: path, err: fmt.Errorf("no server connection")}
@@ -145,7 +145,7 @@ func dryRunDeploy(client *ssh.Client, path, namespace string) tea.Cmd {
 }
 
 // applyDeploy applies for real and waits for rollout.
-func applyDeploy(client *ssh.Client, path, namespace string) tea.Cmd {
+func applyDeploy(client transport.Cluster, path, namespace string) tea.Cmd {
 	return func() tea.Msg {
 		if client == nil {
 			return deployMsg{file: path, applied: true, err: fmt.Errorf("no server connection")}

@@ -25,6 +25,14 @@ const (
 	kubeadmBase = `sudo -n kubectl --kubeconfig /etc/kubernetes/admin.conf`
 )
 
+// Based is a transport that already knows its own kubectl invocation and must
+// not be probed for one. The local kubeconfig transport is the case: it has no
+// node to look at, and the probes below would all fail and leave it building
+// k3s commands for a cluster that is not k3s.
+type Based interface {
+	Base() string
+}
+
 // DetectBase picks the kubectl invocation this node can actually use.
 //
 // It probes once rather than chaining the candidates with || on every call.
@@ -33,6 +41,9 @@ const (
 // the caller would be shown the *second* arm's "no such file" instead of the
 // validation error it actually needed.
 func DetectBase(exec Executor) string {
+	if b, ok := exec.(Based); ok {
+		return b.Base()
+	}
 	if _, code, err := exec.Run(`test -x /usr/local/bin/k3s || command -v k3s >/dev/null 2>&1`); err == nil && code == 0 {
 		return k3sBase
 	}
