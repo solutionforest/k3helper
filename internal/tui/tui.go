@@ -20,6 +20,7 @@ import (
 	"github.com/solutionforest/k3helper/internal/kube"
 	"github.com/solutionforest/k3helper/internal/kyaml"
 	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/solutionforest/k3helper/internal/troubleshoot"
 	"github.com/solutionforest/k3helper/internal/vm"
 )
@@ -40,7 +41,7 @@ type checkDoneMsg struct {
 
 // serverReadyMsg carries the connection used for cluster queries.
 type serverReadyMsg struct {
-	client *ssh.Client
+	client transport.Cluster
 	err    error
 }
 
@@ -67,9 +68,10 @@ type Model struct {
 	// status is a transient one-line notice (a file saved, a context switched).
 	status string
 
-	// server is the connection cluster queries run through. Nil until the
-	// dial completes, or when it failed.
-	server    *ssh.Client
+	// server is the connection cluster queries run through. Nil until it is
+	// opened, or when opening failed. It is an interface because the cluster
+	// may be reached over SSH or through a local kubectl and a kubeconfig.
+	server    transport.Cluster
 	serverErr error
 
 	// resource browser state
@@ -173,12 +175,11 @@ func tickEvery() tea.Cmd {
 // dialServer opens the connection cluster queries run through.
 func dialServer(targets *config.Targets) tea.Cmd {
 	return func() tea.Msg {
-		srv, err := targets.Server()
+		c, err := transport.Server(targets)
 		if err != nil {
 			return serverReadyMsg{err: err}
 		}
-		c, err := ssh.Dial(srv.SSH())
-		return serverReadyMsg{client: c, err: err}
+		return serverReadyMsg{client: c}
 	}
 }
 
@@ -186,6 +187,12 @@ func doChecks(targets *config.Targets) tea.Cmd {
 	return func() tea.Msg {
 		results := map[string][]check.Result{}
 		samples := map[string]hostSample{}
+		if targets.Mode() == config.ModeKubeconfig {
+			// No machines to probe. Report the host checks as skipped rather
+			// than as an empty dashboard, which would read as "all clear".
+			results[transport.ServerName(targets)] = check.SkippedHostResults("server")
+			return checkDoneMsg{nodeResults: results, samples: samples}
+		}
 		for _, node := range targets.Nodes {
 			client, err := ssh.Dial(node.SSH())
 			if err != nil {
@@ -195,14 +202,7 @@ func doChecks(targets *config.Targets) tea.Cmd {
 				}}
 				continue
 			}
-			runner := check.NewRunner(
-				check.DiskUsageCheck{},
-				check.MemoryCheck{},
-				check.SwapCheck{},
-				check.CgroupCheck{},
-				check.ServiceCheck{Role: node.Role},
-				check.RegistryCheck{},
-			)
+			runner := check.NewRunner(check.HostChecks(node.Role)...)
 			results[node.Name] = runner.RunAll(check.Context{Exec: execAdapter{client}, Node: node.Name})
 			samples[node.Name] = sampleHost(client)
 			client.Close()
@@ -800,11 +800,8 @@ func (m Model) switchContext() (tea.Model, tea.Cmd) {
 		m.server.Close()
 	}
 	for _, f := range m.forwards {
-		if f.tunnel != nil {
-			f.tunnel.Close()
-		}
-		if f.pf != nil {
-			f.pf.Stop()
+		if f.fwd != nil {
+			f.fwd.Close()
 		}
 	}
 	m.targets = t

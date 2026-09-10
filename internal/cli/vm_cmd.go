@@ -7,6 +7,7 @@ import (
 	"github.com/solutionforest/k3helper/internal/config"
 	"github.com/solutionforest/k3helper/internal/registry"
 	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/solutionforest/k3helper/internal/vm"
 	"github.com/spf13/cobra"
 )
@@ -84,6 +85,9 @@ func newVMSetupCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			targets, err := loadTargets(targetsPath)
 			if err != nil {
+				return err
+			}
+			if err := transport.RequireHosts(targets, "vm setup"); err != nil {
 				return err
 			}
 			// Servers first, then agents. Multiple servers switch k3s to

@@ -141,20 +141,55 @@ func TestK3sServiceCheckDistinguishesStoppedFromMissing(t *testing.T) {
 	}
 }
 
-// check and the TUI must use the distro-aware ServiceCheck. Wiring the
-// k3s-only predecessor told the operator of a healthy kubeadm node to install
-// a second Kubernetes distribution.
-func TestCheckWiringUsesServiceCheck(t *testing.T) {
+// The host runner must use the distro-aware ServiceCheck. Wiring the k3s-only
+// predecessor told the operator of a healthy kubeadm node to install a second
+// Kubernetes distribution.
+//
+// HostChecks is now the one list both `check` and the TUI build from, so this
+// asserts against the list itself rather than grepping each call site.
+func TestHostChecksUseDistroAwareServiceCheck(t *testing.T) {
+	var found bool
+	for _, c := range HostChecks("server") {
+		if _, isK3sOnly := c.(K3sServiceCheck); isK3sOnly {
+			t.Error("HostChecks wires the k3s-only K3sServiceCheck; use ServiceCheck")
+		}
+		if _, ok := c.(ServiceCheck); ok {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("HostChecks does not run a service check at all")
+	}
+}
+
+// Both callers must build their runner from HostChecks, or a check added to
+// the list silently goes missing from one of them.
+func TestCheckWiringUsesHostChecks(t *testing.T) {
 	for _, path := range []string{"../cli/check_cmd.go", "../tui/tui.go"} {
 		src, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}
-		if strings.Contains(string(src), "K3sServiceCheck{") {
-			t.Errorf("%s still wires the k3s-only K3sServiceCheck; use ServiceCheck", path)
+		if !strings.Contains(string(src), "check.HostChecks(") {
+			t.Errorf("%s builds its own check list instead of using check.HostChecks", path)
 		}
-		if !strings.Contains(string(src), "ServiceCheck{") {
-			t.Errorf("%s does not run a service check at all", path)
+	}
+}
+
+// A kubeconfig cluster reports every host check as skipped, with the reason.
+// Reporting nothing would read as a clean bill of health for a layer that was
+// never looked at.
+func TestSkippedHostResultsCoverEveryHostCheck(t *testing.T) {
+	results := SkippedHostResults("server")
+	if len(results) != len(HostChecks("server")) {
+		t.Fatalf("got %d skipped results for %d host checks", len(results), len(HostChecks("server")))
+	}
+	for _, r := range results {
+		if r.Status != Skip {
+			t.Errorf("%s: status %v, want Skip — a managed cluster is not unhealthy for having no SSH", r.ID, r.Status)
+		}
+		if !strings.Contains(r.Summary, "kubeconfig") {
+			t.Errorf("%s: summary %q does not say why it was skipped", r.ID, r.Summary)
 		}
 	}
 }

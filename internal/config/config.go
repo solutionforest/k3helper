@@ -44,15 +44,80 @@ func (n Node) SSH() ssh.Node {
 	}
 }
 
-// Targets is one cluster: a name and the machines that make it up.
+// Mode is how k3helper reaches a cluster.
+type Mode int
+
+const (
+	// ModeSSH reaches the cluster by connecting to its nodes and running the
+	// kubectl that lives on them. It is the only mode that can see the host
+	// layer — disks, systemd units, the container runtime.
+	ModeSSH Mode = iota
+	// ModeKubeconfig reaches the cluster through the API server with a local
+	// kubectl and a kubeconfig. It is the only mode that works against a
+	// managed cluster (EKS/GKE/AKS and friends), where there is no SSH to a
+	// control-plane node and no admin.conf to read.
+	ModeKubeconfig
+)
+
+func (m Mode) String() string {
+	if m == ModeKubeconfig {
+		return "kubeconfig"
+	}
+	return "ssh"
+}
+
+// Targets is one cluster: a name, and either the machines that make it up or
+// the kubeconfig that reaches it.
 type Targets struct {
 	Cluster string `json:"cluster"`
-	Nodes   []Node `json:"nodes"`
+	Nodes   []Node `json:"nodes,omitempty"`
+	// Kubeconfig is a path on *this* machine. Setting it selects
+	// ModeKubeconfig: commands run through a local kubectl instead of over
+	// SSH, and the host layer is not available at all.
+	Kubeconfig string `json:"kubeconfig,omitempty"`
+	// KubeContext names a context inside that kubeconfig. Empty uses the
+	// file's current-context. It is deliberately not called "context": that
+	// word already means "which cluster in this targets file" everywhere else
+	// in k3helper, including the --context flag.
+	KubeContext string `json:"kube_context,omitempty"`
 	// Registries are the image registries every node in this cluster pulls
 	// from. Cluster-level rather than per-node: a mirror configured on some
 	// nodes and not others produces pods that run on two machines out of
 	// three, which is a miserable thing to debug.
 	Registries []Registry `json:"registries,omitempty"`
+}
+
+// Mode reports how this cluster is reached.
+func (t *Targets) Mode() Mode {
+	if t.Kubeconfig != "" {
+		return ModeKubeconfig
+	}
+	return ModeSSH
+}
+
+// KubeconfigPath is the kubeconfig with a leading ~ expanded. Tilde expansion
+// is done here rather than left to a shell: the path is handed to os.Stat and
+// to kubectl as an argument, and neither expands it.
+func (t *Targets) KubeconfigPath() string {
+	return expandHome(t.Kubeconfig)
+}
+
+// expandHome expands a leading ~ or ~/ to the user's home directory. A path
+// that does not start with ~ is returned unchanged, as is one whose home
+// cannot be determined — the caller's os.Stat will report that better than a
+// guess would.
+func expandHome(p string) string {
+	if p != "~" && !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == "~" {
+		return home
+	}
+	return home + p[1:]
 }
 
 // Registry is a container image registry the nodes pull from — a private
@@ -144,6 +209,10 @@ type File struct {
 	// single-cluster form
 	Cluster string `json:"cluster,omitempty"`
 	Nodes   []Node `json:"nodes,omitempty"`
+	// Kubeconfig/KubeContext are the single-cluster form of the same fields on
+	// Targets: one cluster reached through its API server rather than by SSH.
+	Kubeconfig  string `json:"kubeconfig,omitempty"`
+	KubeContext string `json:"kube_context,omitempty"`
 	// multi-cluster form
 	Clusters []Targets `json:"clusters,omitempty"`
 	Current  string    `json:"current,omitempty"`
@@ -174,16 +243,27 @@ func Load(path string) (*File, error) {
 	if err := yaml.Unmarshal(data, f); err != nil {
 		return nil, fmt.Errorf("parse targets %s: %w", path, err)
 	}
-	if len(f.Clusters) > 0 && (f.Cluster != "" || len(f.Nodes) > 0) {
+	if len(f.Clusters) > 0 && (f.Cluster != "" || len(f.Nodes) > 0 || f.Kubeconfig != "") {
 		return nil, fmt.Errorf("invalid targets %s: use either top-level cluster/nodes or a clusters list, not both", path)
 	}
 	if len(f.Clusters) == 0 {
-		f.Clusters = []Targets{{Cluster: f.Cluster, Nodes: f.Nodes, Registries: f.Registries}}
-		f.Cluster, f.Nodes = "", nil
+		single := Targets{
+			Cluster: f.Cluster, Nodes: f.Nodes,
+			Kubeconfig: f.Kubeconfig, KubeContext: f.KubeContext,
+		}
+		// Registries at the top of a single-cluster file are that cluster's
+		// own, not a default to inherit — but a kubeconfig cluster cannot act
+		// on them, and Validate says so rather than dropping them silently.
+		single.Registries = f.Registries
+		f.Clusters = []Targets{single}
+		f.Cluster, f.Nodes, f.Kubeconfig, f.KubeContext = "", nil, "", ""
 	} else {
 		// File-level registries are the default for clusters that declare none.
+		// Kubeconfig clusters are skipped: registry config is written on the
+		// nodes, and inheriting a block they cannot act on would turn a
+		// perfectly good file into a validation error.
 		for i := range f.Clusters {
-			if len(f.Clusters[i].Registries) == 0 {
+			if len(f.Clusters[i].Registries) == 0 && f.Clusters[i].Mode() == ModeSSH {
 				f.Clusters[i].Registries = f.Registries
 			}
 		}
@@ -251,8 +331,11 @@ func (t *Targets) Validate() error {
 	if t.Cluster == "" {
 		return fmt.Errorf("cluster name is required")
 	}
+	if t.Mode() == ModeKubeconfig {
+		return t.validateKubeconfig()
+	}
 	if len(t.Nodes) == 0 {
-		return fmt.Errorf("at least one node is required")
+		return fmt.Errorf("at least one node is required (or set kubeconfig: to reach the cluster through its API server)")
 	}
 	seen := map[string]bool{}
 	servers := 0
@@ -299,6 +382,37 @@ func (t *Targets) Validate() error {
 	return t.validateRegistries()
 }
 
+// validateKubeconfig checks a kubeconfig-mode cluster.
+//
+// Nodes and a kubeconfig are rejected together rather than merged. The two
+// describe the same cluster through different doors, and a file that lists
+// both leaves every command guessing which door to use — including the ones
+// that write to hosts, where guessing wrong writes to the wrong machine.
+func (t *Targets) validateKubeconfig() error {
+	if len(t.Nodes) > 0 {
+		return fmt.Errorf("cluster %q: set either nodes or kubeconfig, not both "+
+			"(nodes: reach the cluster over SSH; kubeconfig: reach it through its API server)", t.Cluster)
+	}
+	path := t.KubeconfigPath()
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("cluster %q: no kubeconfig at %s", t.Cluster, path)
+		}
+		return fmt.Errorf("cluster %q: kubeconfig %s: %w", t.Cluster, path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("cluster %q: kubeconfig %s is a directory", t.Cluster, path)
+	}
+	if len(t.Registries) > 0 {
+		// Registry configuration is written to files on the nodes. There are no
+		// nodes here, so accepting the block would silently do nothing.
+		return fmt.Errorf("cluster %q: registries cannot be configured on a kubeconfig cluster — "+
+			"k3helper writes registry config on the nodes themselves, which needs SSH access", t.Cluster)
+	}
+	return nil
+}
+
 // validateRegistries rejects registry entries that cannot mean what they say.
 func (t *Targets) validateRegistries() error {
 	seen := map[string]bool{}
@@ -340,6 +454,12 @@ func (t *Targets) Server() (*Node, error) {
 		if t.Nodes[i].Role == "server" {
 			return &t.Nodes[i], nil
 		}
+	}
+	if t.Mode() == ModeKubeconfig {
+		// A caller that reached here wants a machine to run something on, and
+		// this cluster has none. Say that rather than "no server node", which
+		// reads like a malformed file.
+		return nil, fmt.Errorf("cluster %q is reached through a kubeconfig and has no nodes to connect to", t.Cluster)
 	}
 	return nil, fmt.Errorf("no server node in targets")
 }

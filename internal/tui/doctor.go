@@ -9,7 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/solutionforest/k3helper/internal/config"
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/solutionforest/k3helper/internal/troubleshoot"
 )
 
@@ -29,30 +29,17 @@ type doctorMsg struct {
 // it was made.
 func runDoctor(targets *config.Targets) tea.Cmd {
 	return func() tea.Msg {
-		srvNode, err := targets.Server()
+		server, err := transport.Server(targets)
 		if err != nil {
 			return doctorMsg{err: err}
 		}
-		server, err := ssh.Dial(srvNode.SSH())
-		if err != nil {
-			return doctorMsg{err: fmt.Errorf("connect to server: %w", err)}
-		}
 		defer server.Close()
 
-		hosts := map[string]ssh.Executor{}
+		hosts, failures, closeHosts := transport.Hosts(targets, server, transport.ServerName(targets))
+		defer closeHosts()
 		var unreachable []troubleshoot.UnreachableNode
-		for _, n := range targets.Nodes {
-			if n.Name == srvNode.Name {
-				hosts[n.Name] = server
-				continue
-			}
-			c, err := ssh.Dial(n.SSH())
-			if err != nil {
-				unreachable = append(unreachable, troubleshoot.UnreachableNode{Name: n.Name, Reason: err.Error()})
-				continue
-			}
-			defer c.Close()
-			hosts[n.Name] = c
+		for _, f := range failures {
+			unreachable = append(unreachable, troubleshoot.UnreachableNode{Name: f.Name, Reason: f.Reason})
 		}
 		var serverNames []string
 		for _, n := range targets.Servers() {
@@ -60,6 +47,7 @@ func runDoctor(targets *config.Targets) tea.Cmd {
 		}
 		evidence := troubleshoot.Gatherer{
 			Server: server, Hosts: hosts, Unreachable: unreachable, ServerNodes: serverNames,
+			NoHostLayer: targets.Mode() == config.ModeKubeconfig,
 		}.Collect()
 		return doctorMsg{
 			diagnoses:   troubleshoot.Diagnose(evidence),

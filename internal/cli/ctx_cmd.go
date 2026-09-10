@@ -24,7 +24,10 @@ func newCtxCmd() *cobra.Command {
 				return err
 			}
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "\tCLUSTER\tNODES\tSERVER")
+			// REACHED is worth a column of its own: it decides which commands
+			// are available, and "0 nodes" alone looks like a broken file
+			// rather than a kubeconfig cluster.
+			fmt.Fprintln(w, "\tCLUSTER\tREACHED\tNODES\tSERVER")
 			for i := range f.Clusters {
 				c := &f.Clusters[i]
 				marker := " "
@@ -32,13 +35,18 @@ func newCtxCmd() *cobra.Command {
 					marker = "*"
 				}
 				server := "-"
-				if s, err := c.Server(); err == nil {
+				if c.Mode() == config.ModeKubeconfig {
+					server = c.Kubeconfig
+					if c.KubeContext != "" {
+						server += " (" + c.KubeContext + ")"
+					}
+				} else if s, err := c.Server(); err == nil {
 					server = s.Host
 					if s.Local {
 						server = "local"
 					}
 				}
-				fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", marker, c.Cluster, len(c.Nodes), server)
+				fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", marker, c.Cluster, c.Mode(), len(c.Nodes), server)
 			}
 			w.Flush()
 			if len(f.Clusters) > 1 {

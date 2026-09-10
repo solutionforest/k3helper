@@ -72,6 +72,16 @@ type Evidence struct {
 	// only good news if we actually looked, so these are reported rather than
 	// silently narrowing the diagnosis.
 	ProbeErrors map[string]string
+	// HostLayerUnavailable: this cluster is reached through a kubeconfig, so
+	// there is no host layer to gather — no disks, no systemd units, no
+	// container runtime state.
+	//
+	// Deliberately not a ProbeError and deliberately not an Unreachable node.
+	// Both of those mean "we tried and failed", which is a fault. This means
+	// "there was never anything there to try", which is how managed clusters
+	// work and is not a fault. Conflating them would report every healthy EKS
+	// cluster as degraded.
+	HostLayerUnavailable bool
 
 	// livePVCs: namespace/pvc keys of PVCs that currently exist.
 	livePVCs map[string]bool
@@ -134,6 +144,30 @@ type Diagnosis struct {
 	Confidence  int    `json:"confidence"`
 	Remediation string `json:"remediation"`
 	Evidence    string `json:"evidence"`
+}
+
+// Informational reports whether this finding describes the scope of the
+// diagnosis rather than a fault in the cluster.
+//
+// These must not set doctor's exit code. An RBAC-scoped kubeconfig or a
+// managed cluster with no host layer would otherwise fail every CI run while
+// being perfectly healthy.
+func (d Diagnosis) Informational() bool {
+	switch d.SignatureID {
+	case "cluster.partial-evidence", "cluster.host-layer-unavailable":
+		return true
+	}
+	return false
+}
+
+// OnlyInformational reports whether nothing but scope notes were found.
+func OnlyInformational(ds []Diagnosis) bool {
+	for _, d := range ds {
+		if !d.Informational() {
+			return false
+		}
+	}
+	return true
 }
 
 // pullFailures counts image-pull failures by what the registry actually said.
@@ -227,7 +261,20 @@ var registry = []Signature{
 			// exists so "nothing found" is never mistaken for "nothing wrong".
 			return 30
 		},
-		Remediation: "One or more probes failed, so faults they would have caught cannot be ruled out. Check that the kubeconfig the server node uses has list access to pods, events, PVCs, endpoints and services, and that the API server is responsive.",
+		Remediation: "One or more probes failed, so faults they would have caught cannot be ruled out. Check that the credentials in use have list access to pods, events, PVCs, endpoints and services, and that the API server is responsive.",
+	},
+	{
+		ID:    "cluster.host-layer-unavailable",
+		Title: "Host layer not visible — findings cover the cluster only",
+		Match: func(e Evidence) int {
+			if !e.HostLayerUnavailable {
+				return 0
+			}
+			// Low, like cluster.partial-evidence: this is a note on the scope
+			// of the diagnosis, not a fault competing with real findings.
+			return 20
+		},
+		Remediation: "This cluster is reached through a kubeconfig, so k3helper can see the API server but not the machines behind it. Disk pressure, swap, cgroups, systemd units, the container runtime and certificate expiry are not checked. For a self-managed cluster, describe its nodes in the targets file to get the host layer as well; for a managed cluster, that layer belongs to the provider.",
 	},
 	{
 		ID:    "node.unreachable",

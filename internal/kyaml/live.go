@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/solutionforest/k3helper/internal/kube"
@@ -42,7 +43,7 @@ const KubectlBase = `sudo -n k3s kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml`
 func VerifyLive(t Target, data []byte, name string) (*Result, error) {
 	res := Verify(data)
 
-	remote, err := RemotePath(name)
+	remote, err := RemotePathIn(StageDir(t), name)
 	if err != nil {
 		return res, err
 	}
@@ -69,9 +70,29 @@ func VerifyLive(t Target, data []byte, name string) (*Result, error) {
 	return res, nil
 }
 
+// StageDir is where a manifest is written on the machine kubectl runs on.
+//
+// It is asked of the transport rather than hardcoded because the local
+// kubectl transport stages on this machine, which may be Windows and have no
+// /tmp. Transports that do not answer get the SSH default, since every machine
+// k3helper connects to over SSH is a Unix host with one.
+func StageDir(t any) string {
+	if s, ok := t.(interface{ StageDir() string }); ok {
+		if dir := s.StageDir(); dir != "" {
+			return dir
+		}
+	}
+	return "/tmp"
+}
+
 // RemotePath builds a collision-resistant /tmp path from a manifest name,
 // keeping only characters that are safe inside a single-quoted shell word.
 func RemotePath(name string) (string, error) {
+	return RemotePathIn("/tmp", name)
+}
+
+// RemotePathIn is RemotePath with the staging directory named explicitly.
+func RemotePathIn(dir, name string) (string, error) {
 	base := name
 	if i := strings.LastIndexByte(base, '/'); i >= 0 {
 		base = base[i+1:]
@@ -95,5 +116,18 @@ func RemotePath(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("/tmp/k3helper-%s-%s", suffix, base), nil
+	return joinPath(dir, fmt.Sprintf("k3helper-%s-%s", suffix, base)), nil
+}
+
+// joinPath joins in the style of the directory it is given.
+//
+// filepath.Join alone is wrong here: on a Windows machine deploying to a Linux
+// node over SSH it would build "\tmp\manifest.yaml" for a path that the node
+// has to read. The separator has to follow the target, not the host running
+// k3helper.
+func joinPath(dir, name string) string {
+	if strings.ContainsRune(dir, '\\') {
+		return filepath.Join(dir, name)
+	}
+	return strings.TrimSuffix(dir, "/") + "/" + name
 }

@@ -8,7 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/solutionforest/k3helper/internal/deploy"
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/spf13/cobra"
 )
 
@@ -32,13 +32,9 @@ func newDeployCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			srv, err := targets.Server()
+			server, err := transport.Server(targets)
 			if err != nil {
 				return err
-			}
-			server, err := ssh.Dial(toSSHNode(*srv))
-			if err != nil {
-				return fmt.Errorf("connect to server: %w", err)
 			}
 			defer server.Close()
 

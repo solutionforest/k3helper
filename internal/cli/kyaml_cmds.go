@@ -7,7 +7,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/solutionforest/k3helper/internal/kyaml"
-	"github.com/solutionforest/k3helper/internal/ssh"
+	"github.com/solutionforest/k3helper/internal/transport"
 	"github.com/spf13/cobra"
 )
 
@@ -25,19 +25,15 @@ func newVerifyCmd() *cobra.Command {
 			// --dry-run=server adds validation layer 3: submit each manifest to
 			// the real API server, which catches unknown fields, admission
 			// rejections and CRD schemas that offline rules cannot.
-			var server *ssh.Client
+			var server transport.Cluster
 			if serverDry {
 				targets, err := loadTargets(targetsPath)
 				if err != nil {
 					return err
 				}
-				srvNode, err := targets.Server()
+				server, err = transport.Server(targets)
 				if err != nil {
 					return err
-				}
-				server, err = ssh.Dial(toSSHNode(*srvNode))
-				if err != nil {
-					return fmt.Errorf("connect to server: %w", err)
 				}
 				defer server.Close()
 			}
