@@ -11,7 +11,7 @@ import (
 // version is overridden at build time by the Makefile's ldflags. The literal
 // here is the fallback for a bare `go build`, so keep it in step with
 // Makefile's VERSION or `go run` reports a stale number.
-var version = "0.4.0"
+var version = "0.5.0"
 
 // contextName is the --context value: which cluster to use from a
 // multi-cluster targets file. Empty means the file's `current`, or its only
