@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -219,8 +220,16 @@ func TestWriteAndRemoveFile(t *testing.T) {
 		t.Fatalf("stat: %v", err)
 	}
 	// Manifests can carry Secrets; the mode has to survive the umask.
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Errorf("mode = %o, want 600", perm)
+	//
+	// Windows has no POSIX permission bits — Go maps a file mode onto the
+	// read-only attribute and reports 0666 for anything writable — so there is
+	// nothing to assert there. The file is still created under the user's own
+	// profile directory, which is where the protection comes from on that
+	// platform.
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("mode = %o, want 600", perm)
+		}
 	}
 	if err := l.RemoveFile(path); err != nil {
 		t.Fatalf("RemoveFile: %v", err)

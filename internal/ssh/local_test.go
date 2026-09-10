@@ -4,9 +4,24 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// requireLocalShell skips a test that needs the POSIX shell the local
+// transport runs commands through.
+//
+// Local mode means "manage the machine k3helper is on", and the commands it
+// runs are Linux ones aimed at a k3s node — so it is a Unix-only path by
+// design, not an unimplemented one. Windows gets a clear error instead, which
+// TestLocalOnWindowsExplainsItself covers.
+func requireLocalShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("local mode needs /bin/sh; on Windows it is refused with an explanation instead")
+	}
+}
 
 // dialLocal is the path a targets file with `local: true` takes.
 func dialLocal(t *testing.T) *Client {
@@ -29,6 +44,7 @@ func TestDialLocalDoesNotConnect(t *testing.T) {
 }
 
 func TestLocalRunExitCodes(t *testing.T) {
+	requireLocalShell(t)
 	c := dialLocal(t)
 
 	out, code, err := c.Run("echo hello")
@@ -53,6 +69,7 @@ func TestLocalRunExitCodes(t *testing.T) {
 }
 
 func TestLocalStream(t *testing.T) {
+	requireLocalShell(t)
 	c := dialLocal(t)
 	var buf bytes.Buffer
 	code, err := c.Stream("echo streamed; exit 7", &buf)
@@ -68,6 +85,7 @@ func TestLocalStream(t *testing.T) {
 }
 
 func TestLocalSudoPrefix(t *testing.T) {
+	requireLocalShell(t)
 	c := dialLocal(t)
 	want := "sudo -n "
 	if os.Geteuid() == 0 {
@@ -85,6 +103,7 @@ func TestLocalSudoPrefix(t *testing.T) {
 }
 
 func TestLocalWriteAndRemoveFile(t *testing.T) {
+	requireLocalShell(t)
 	c := dialLocal(t)
 	path := filepath.Join(t.TempDir(), "manifest.yaml")
 
@@ -119,8 +138,28 @@ func TestLocalWriteAndRemoveFile(t *testing.T) {
 }
 
 func TestLocalWriteFileRejectsBadPath(t *testing.T) {
+	requireLocalShell(t)
 	c := dialLocal(t)
 	if err := c.WriteFile("/tmp/bad'name", []byte("x"), 0o600); err == nil {
 		t.Error("expected quoted path to be rejected on the local transport too")
+	}
+}
+
+// On Windows the local transport must explain itself rather than failing with
+// "exec: /bin/sh: executable file not found", which reads like a broken
+// install rather than a targets file describing something that cannot exist.
+func TestLocalOnWindowsExplainsItself(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("the refusal only happens on Windows")
+	}
+	c := dialLocal(t)
+	_, _, err := c.Run("echo hi")
+	if err == nil {
+		t.Fatal("local mode ran a command on a platform with no POSIX shell")
+	}
+	for _, want := range []string{"local: true", "over SSH"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
 	}
 }

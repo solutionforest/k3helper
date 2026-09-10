@@ -80,7 +80,8 @@ OUT=$($K init --server "$SERVER_IP" --agent "$AGENT1_IP" --user sandbox \
         -o "$WORK/targets.yaml" 2>&1)
 assert_contains "init writes a targets file" "$OUT" "wrote $WORK/targets.yaml"
 OUT=$($K ctx -t "$WORK/targets.yaml" 2>&1)
-assert_matches "the generated file loads back" "$OUT" "my-cluster +2"
+# ctx prints CLUSTER, REACHED, NODES: an SSH cluster with two nodes.
+assert_matches "the generated file loads back" "$OUT" "my-cluster +ssh +2"
 OUT=$($K init -o "$WORK/targets.yaml" 2>&1); RC=$?
 assert_exit "init refuses to clobber an existing file" 1 $RC
 OUT=$($K init --local -o "$WORK/local.yaml" 2>&1)

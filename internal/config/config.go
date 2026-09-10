@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/solutionforest/k3helper/internal/ssh"
@@ -106,6 +107,12 @@ func (t *Targets) KubeconfigPath() string {
 // that does not start with ~ is returned unchanged, as is one whose home
 // cannot be determined — the caller's os.Stat will report that better than a
 // guess would.
+//
+// The result is joined rather than concatenated so it comes back in the
+// platform's own separators: "~/.kube/config" on Windows should become
+// C:\Users\you\.kube\config, not C:\Users\you/.kube/config. Go accepts the
+// mixed form, but the path is printed in errors and passed to kubectl, and
+// half-and-half reads like a bug.
 func expandHome(p string) string {
 	if p != "~" && !strings.HasPrefix(p, "~/") {
 		return p
@@ -117,7 +124,7 @@ func expandHome(p string) string {
 	if p == "~" {
 		return home
 	}
-	return home + p[1:]
+	return filepath.Join(home, filepath.FromSlash(p[2:]))
 }
 
 // Registry is a container image registry the nodes pull from — a private
