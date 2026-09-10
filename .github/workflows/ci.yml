@@ -43,6 +43,37 @@ jobs:
       - name: Unit tests
         run: go test -race -count=1 ./...
 
+      - name: Portable check
+        run: |
+          go build -o bin/k3helper ./cmd/k3helper
+          scripts/portable-check.sh ./bin/k3helper
+
+  # macOS is a first-class target — it is what most operators drive a cluster
+  # from — and nothing else in CI runs there. Darwin differs where it matters
+  # for this binary: its own temp directory layout, a different libc for the
+  # cgo-free build, and BSD userland for anything shelled out to.
+  macos:
+    name: macOS build + tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+      - name: Portable check
+        run: |
+          go build -o bin/k3helper ./cmd/k3helper
+          scripts/portable-check.sh ./bin/k3helper
+
   build:
     name: Cross-compile
     runs-on: ubuntu-latest
@@ -57,10 +88,93 @@ jobs:
       - name: Build all platforms
         run: make build-all
 
+      # The Windows assets must carry .exe or Windows will not execute them,
+      # and that suffix is applied in a shell loop rather than by the Go
+      # toolchain — so assert it rather than trusting the loop.
+      - name: Windows binaries carry .exe and are PE executables
+        run: |
+          for arch in amd64 arm64; do
+            f="bin/k3helper-windows-$arch.exe"
+            [ -f "$f" ] || { echo "::error::$f was not built"; exit 1; }
+            case "$(file -b "$f")" in
+              *"PE32"*|*"MS Windows"*) echo "✓ $f" ;;
+              *) echo "::error::$f is not a Windows executable: $(file -b "$f")"; exit 1 ;;
+            esac
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: k3helper-binaries
           path: bin/
+          retention-days: 7
+
+  # Windows is not just another cross-compile target here. The kubeconfig
+  # transport exists partly because Windows has no /bin/sh: it runs kubectl by
+  # argument rather than through a shell, and it stages manifests in the OS
+  # temp directory rather than /tmp. None of that is exercised by building on
+  # Linux — it has to actually run.
+  windows:
+    name: Windows build + tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race needs a C toolchain; windows-latest has one, but the point of
+      # this job is the platform-specific paths rather than the race detector,
+      # which the Linux job already covers.
+      - name: Unit tests
+        run: go test -count=1 ./...
+
+      - name: Build the .exe
+        run: go build -o k3helper.exe ./cmd/k3helper
+
+      - name: The .exe actually runs
+        run: |
+          .\k3helper.exe version
+          .\k3helper.exe --help
+
+      # The same portable check Linux and macOS run, so the three platforms are
+      # held to one standard rather than to whatever each job happened to test.
+      - name: Portable check
+        shell: bash
+        run: scripts/portable-check.sh ./k3helper.exe
+
+      # The portable check above runs under the runner's Git Bash. This one
+      # deliberately does not: it drives the .exe from PowerShell, with native
+      # Windows paths and no POSIX shell anywhere in the picture, which is the
+      # environment a client actually double-clicks into. Native paths are also
+      # where a path check tends to quietly pass while being wrong.
+      - name: Runs from a bare directory under PowerShell
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\portable | Out-Null
+          Copy-Item k3helper.exe C:\portable\
+          Set-Location C:\portable
+
+          & .\k3helper.exe init --kubeconfig C:\portable\missing.yaml --cluster demo
+          if ($LASTEXITCODE -eq 0) { throw "init accepted a kubeconfig that does not exist" }
+          if (Test-Path targets.yaml) { throw "init wrote a targets file after failing" }
+
+          "apiVersion: v1" | Out-File -Encoding ascii C:\portable\kube.yaml
+          & .\k3helper.exe init --kubeconfig C:\portable\kube.yaml --cluster demo
+          if ($LASTEXITCODE -ne 0) { throw "init failed on a valid kubeconfig with a native path" }
+          Get-Content targets.yaml
+
+          & .\k3helper.exe ctx
+          if ($LASTEXITCODE -ne 0) { throw "ctx failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: k3helper-windows-exe
+          path: k3helper.exe
           retention-days: 7
 
   # Sandbox E2E on the container driver — three privileged systemd containers

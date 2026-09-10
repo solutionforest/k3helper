@@ -5,7 +5,10 @@ LDFLAGS    := -ldflags "-X $(VERPKG)=$(VERSION)"
 # -s -w strips the symbol table and DWARF: ~25% smaller downloads, and Go
 # panics keep their function names because the runtime carries its own tables.
 RELFLAGS   := -ldflags "-s -w -X $(VERPKG)=$(VERSION)"
-PLATFORMS  := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64
+PLATFORMS  := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64
+# Windows will not execute a downloaded file without the extension, so those
+# two assets carry .exe. Everything else stays extensionless; install.sh builds
+# the asset name the same way.
 DIST       := dist
 TARGETS    := test/sandbox/targets.sandbox.yaml
 SSH_KEY    := test/sandbox/ssh/id_ed25519
@@ -14,7 +17,7 @@ SSH_OPTS   := -i $(SSH_KEY) -o StrictHostKeyChecking=no -o UserKnownHostsFile=/d
 # Sandbox nodes are OrbStack Linux VMs (NOT Docker containers — OrbStack
 # containers share the macOS kernel and kubelet PLEG kills pods falsely).
 
-.PHONY: help build build-all test test-integration clean e2e e2e-fast e2e-quick \
+.PHONY: help build build-all test test-integration portable-check clean e2e e2e-fast e2e-quick \
         sandbox-up sandbox-down sandbox-reset sandbox-verify sandbox-ssh \
         bootstrap check doctor fault-clean fault-list fault-check-all release release-upload bundle
 
@@ -42,20 +45,29 @@ help:
 	@echo "  make fault-list       list faults + the signature each should trigger"
 	@echo "  make fault-<name>     inject one fault (e.g. make fault-oom)"
 	@echo "  make fault-check-all  inject every fault, assert doctor catches each"
+	@echo "  make portable-check   run the built binary from a bare directory"
 	@echo "  make fault-clean      undo injected faults"
 
 build:
 	go build $(LDFLAGS) -o bin/$(BINARY) ./cmd/k3helper
 
 build-all:
-	@for platform in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do \
-	  GOOS=$${platform%/*} GOARCH=$${platform#*/} go build $(LDFLAGS) \
-	    -o bin/$(BINARY)-$${platform%/*}-$${platform#*/} ./cmd/k3helper; \
-	  echo "✓ bin/$(BINARY)-$${platform%/*}-$${platform#*/}"; \
+	@for platform in $(PLATFORMS); do \
+	  os=$${platform%/*}; arch=$${platform#*/}; ext=""; \
+	  [ "$$os" = windows ] && ext=".exe"; \
+	  GOOS=$$os GOARCH=$$arch go build $(LDFLAGS) \
+	    -o bin/$(BINARY)-$$os-$$arch$$ext ./cmd/k3helper || exit 1; \
+	  echo "✓ bin/$(BINARY)-$$os-$$arch$$ext"; \
 	done
 
 test:
 	go test ./...
+
+# "Single portable binary" is a runtime claim, so it is checked by running the
+# binary from a directory it has never seen. CI runs this on Linux, macOS and
+# Windows against the same script.
+portable-check: build
+	@scripts/portable-check.sh ./bin/$(BINARY)
 
 test-integration:
 	go test -tags=integration ./...
@@ -79,9 +91,10 @@ e2e-quick:
 release:
 	@rm -rf $(DIST) && mkdir -p $(DIST)
 	@for platform in $(PLATFORMS); do \
-	  os=$${platform%/*}; arch=$${platform#*/}; \
-	  GOOS=$$os GOARCH=$$arch go build $(RELFLAGS) -o $(DIST)/$(BINARY)-$$os-$$arch ./cmd/k3helper || exit 1; \
-	  echo "✓ $(DIST)/$(BINARY)-$$os-$$arch"; \
+	  os=$${platform%/*}; arch=$${platform#*/}; ext=""; \
+	  [ "$$os" = windows ] && ext=".exe"; \
+	  GOOS=$$os GOARCH=$$arch go build $(RELFLAGS) -o $(DIST)/$(BINARY)-$$os-$$arch$$ext ./cmd/k3helper || exit 1; \
+	  echo "✓ $(DIST)/$(BINARY)-$$os-$$arch$$ext"; \
 	done
 	@cd $(DIST) && (command -v sha256sum >/dev/null && sha256sum $(BINARY)-* || shasum -a 256 $(BINARY)-*) > checksums.txt
 	@cp install.sh $(DIST)/install.sh

@@ -49,6 +49,19 @@ fi
 OS="${K3HELPER_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
 case "$OS" in
   linux|darwin) ;;
+  # Git Bash, MSYS2 and Cygwin all report their own kernel name. They can run
+  # this script, but "install to /usr/local/bin" means something different
+  # under each of them and none of it is on the Windows PATH. Windows ships a
+  # single self-contained .exe instead — say so rather than installing
+  # something the user cannot then run.
+  mingw*|msys*|cygwin*|windows*)
+    log "k3helper on Windows is a single .exe — no installer needed."
+    log ""
+    log "  https://github.com/$REPO/releases/latest/download/k3helper-windows-amd64.exe"
+    log ""
+    log "Download it, put it anywhere, and run it:  k3helper-windows-amd64.exe version"
+    log "(On Windows on ARM, take k3helper-windows-arm64.exe instead.)"
+    exit 0 ;;
   *) fail "unsupported OS: $OS" ;;
 esac
 
@@ -75,6 +88,10 @@ else
 fi
 
 ASSET="${BIN_NAME}-${OS}-${ARCH}"
+# The Windows assets carry an extension because Windows will not execute a file
+# without one. Reachable only through K3HELPER_OS=windows, since a native
+# Windows shell does not run this script.
+[ "$OS" = windows ] && ASSET="${ASSET}.exe"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM
