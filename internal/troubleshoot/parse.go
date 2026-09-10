@@ -114,6 +114,14 @@ func parsePods(data string, e *Evidence) bool {
 			// separately or it goes entirely unreported.
 			if total > 0 && ready < total {
 				e.NotReadyPods = append(e.NotReadyPods, key)
+				// Keep the restart count with it. A crashlooping container
+				// spends part of its cycle Running rather than waiting, and a
+				// diagnosis taken in that window sees an unready pod with no
+				// reason attached — the restarts are what tell the two apart.
+				if e.PodRestarts == nil {
+					e.PodRestarts = map[string]int{}
+				}
+				e.PodRestarts[key] = restarts
 			}
 		case "Succeeded":
 			e.settledPods[key] = true

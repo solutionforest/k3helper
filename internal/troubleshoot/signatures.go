@@ -33,6 +33,14 @@ type Evidence struct {
 	// NotReadyPods: namespace/pod of pods that are Running but have containers
 	// that never became ready.
 	NotReadyPods []string
+	// PodRestarts: namespace/pod → total container restarts, for pods that are
+	// Running and not ready.
+	//
+	// A crashlooping container only reads as "CrashLoopBackOff" while it is
+	// waiting between attempts; the moment it starts again the status is
+	// Running, and a diagnosis taken then sees an unready pod and no reason.
+	// The restart count is the durable evidence, so it is kept.
+	PodRestarts map[string]int
 	// K3sService: node → systemd state ("active", "failed", "inactive", ""=not found)
 	K3sService map[string]string
 	// HostMetrics: node → {disk used %, availMemMB}
@@ -94,6 +102,12 @@ type Evidence struct {
 	// Unexported: internal to the gather/parse pipeline.
 	livePods map[string]bool
 }
+
+// restartsMeaningCrashLoop is how many restarts an unready pod needs before it
+// is called a crash loop rather than a pod that had a bad start. kubelet's
+// backoff reaches 40s by the third restart, so a pod at this count has been
+// failing for the best part of a minute.
+const restartsMeaningCrashLoop = 3
 
 // HostMetric is a node's host-level vitals.
 type HostMetric struct {
@@ -607,13 +621,27 @@ var registry = []Signature{
 		ID:    "pod.crashloop",
 		Title: "Container crashing on start (CrashLoopBackOff)",
 		Match: func(e Evidence) int {
-			n := 0
-			for _, st := range e.PodStatuses {
+			crashing := map[string]bool{}
+			for pod, st := range e.PodStatuses {
 				if st == "CrashLoopBackOff" {
-					n++
+					crashing[pod] = true
 				}
 			}
-			return min(90, n*40)
+			// A container in backoff is only reported as CrashLoopBackOff while
+			// it is waiting; between attempts it is Running with no reason
+			// attached, and a diagnosis taken in that window used to see
+			// nothing but an unready pod. Restarts are what does not go away:
+			// a pod that is not ready and has restarted repeatedly is
+			// crashlooping whichever half of the cycle we happened to catch.
+			//
+			// The threshold is deliberately not 1. A single restart is a pod
+			// that fell over once and came back, which is not this finding.
+			for _, pod := range e.NotReadyPods {
+				if e.PodRestarts[pod] >= restartsMeaningCrashLoop {
+					crashing[pod] = true
+				}
+			}
+			return min(90, len(crashing)*40)
 		},
 		Remediation: "Read the container logs: `kubectl logs <pod> --previous`. Typical causes: bad command/args, missing config/env, app failing at startup. Fix the cause — do NOT use restart policies to mask it.",
 	},

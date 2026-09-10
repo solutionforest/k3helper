@@ -103,3 +103,71 @@ func TestGathererCarriesNoHostLayer(t *testing.T) {
 		t.Error("Gatherer.NoHostLayer did not reach the evidence")
 	}
 }
+
+// A crashlooping container is only reported as CrashLoopBackOff while it is
+// waiting between attempts. Sampled the moment it restarts, the pod is Running
+// with no reason attached — which used to read as nothing worse than an
+// unready pod, and made the fault matrix catch the fault or miss it depending
+// on when doctor happened to look.
+func TestCrashLoopFoundFromRestartsWhenSampledMidRestart(t *testing.T) {
+	e := Evidence{
+		NotReadyPods: []string{"default/fault-crashloop"},
+		PodRestarts:  map[string]int{"default/fault-crashloop": 5},
+		// No PodStatuses entry: kubectl said Running, because it was.
+	}
+	var found bool
+	for _, d := range Diagnose(e) {
+		if d.SignatureID == "pod.crashloop" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a pod that is not ready after 5 restarts was not called a crash loop")
+	}
+}
+
+// The waiting half of the cycle must still work, and the same pod seen both
+// ways must not be counted twice — a doubled count inflates the confidence.
+func TestCrashLoopCountsEachPodOnce(t *testing.T) {
+	both := Evidence{
+		PodStatuses:  map[string]string{"default/web": "CrashLoopBackOff"},
+		NotReadyPods: []string{"default/web"},
+		PodRestarts:  map[string]int{"default/web": 9},
+	}
+	waitingOnly := Evidence{
+		PodStatuses: map[string]string{"default/web": "CrashLoopBackOff"},
+	}
+	if got, want := confidenceOf(Diagnose(both), "pod.crashloop"),
+		confidenceOf(Diagnose(waitingOnly), "pod.crashloop"); got != want {
+		t.Errorf("one pod seen two ways scored %d, want %d", got, want)
+	}
+}
+
+// A pod that fell over once and came back is not a crash loop, and a pod that
+// is simply slow to pass readiness is not one either. Reporting them would
+// send people to `kubectl logs --previous` for a healthy rollout.
+func TestCrashLoopIgnoresFewRestartsAndReadyPods(t *testing.T) {
+	tests := []struct {
+		name string
+		e    Evidence
+	}{
+		{"one restart, still starting up", Evidence{
+			NotReadyPods: []string{"default/web"},
+			PodRestarts:  map[string]int{"default/web": 1},
+		}},
+		{"never restarted, failing readiness", Evidence{
+			NotReadyPods: []string{"default/web"},
+			PodRestarts:  map[string]int{"default/web": 0},
+		}},
+		{"restarted often but now ready", Evidence{
+			PodRestarts: map[string]int{"default/web": 12},
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if c := confidenceOf(Diagnose(tc.e), "pod.crashloop"); c != 0 {
+				t.Errorf("pod.crashloop fired at %d%%", c)
+			}
+		})
+	}
+}

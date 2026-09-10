@@ -48,6 +48,17 @@ as they did.
   nothing in CI ran there before; it now gets vet, race tests and the portable
   check on every push, the same as Linux.
 
+### Fixed
+
+- **`doctor` now catches a crash loop it happens to sample mid-restart.** A
+  container in backoff only reads as CrashLoopBackOff while it is waiting
+  between attempts; the moment it starts again the pod is Running with no
+  reason attached, and the diagnosis saw nothing worse than an unready pod.
+  Restart counts were already parsed and thrown away — they are now kept, and a
+  pod that is not ready after three or more restarts is called a crash loop
+  whichever half of the cycle we caught. This is why the fault matrix could
+  catch that fault or miss it depending on timing.
+
 ### Changed
 
 - **`doctor` separates scope notes from faults.** A finding that describes what
