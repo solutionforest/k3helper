@@ -138,7 +138,11 @@ fi
 # ── 4. bootstrap ─────────────────────────────────────────────────────────────
 step "4. Bootstrap k3s on all 3 nodes over SSH"
 rm -f "$WORK/kubeconfig"
+# The version is pinned rather than resolved from a channel: a channel is a
+# lookup against update.k3s.io, and an outage there fails the install with a
+# TLS error that has nothing to do with anything this suite is testing.
 OUT=$($K vm setup -t $TARGETS \
+  --k3s-version "${K3S_VERSION:-v1.36.4+k3s1}" \
   --server-extra-args "--snapshotter=native --disable=traefik" \
   --agent-extra-args "--snapshotter=native" \
   --kubeconfig "$WORK/kubeconfig" 2>&1)

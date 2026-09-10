@@ -5,6 +5,12 @@ LDFLAGS    := -ldflags "-X $(VERPKG)=$(VERSION)"
 # -s -w strips the symbol table and DWARF: ~25% smaller downloads, and Go
 # panics keep their function names because the runtime carries its own tables.
 RELFLAGS   := -ldflags "-s -w -X $(VERPKG)=$(VERSION)"
+# The k3s release the sandbox and the E2E install. Pinned on purpose: a channel
+# is a lookup against update.k3s.io, and when that served a Traefik default
+# certificate from every one of its addresses it took every `curl -sfL
+# https://get.k3s.io | sh -` on the internet down with it — including CI's.
+# A pinned version fetches straight from the GitHub release.
+K3S_VERSION := v1.36.4+k3s1
 PLATFORMS  := linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64 windows/arm64
 # Windows will not execute a downloaded file without the extension, so those
 # two assets carry .exe. Everything else stays extensionless; install.sh builds
@@ -157,6 +163,7 @@ sandbox-ssh:
 
 bootstrap:
 	go run ./cmd/k3helper vm setup -t $(TARGETS) \
+	  --k3s-version $(K3S_VERSION) \
 	  --server-extra-args "--snapshotter=native --disable=traefik" \
 	  --agent-extra-args "--snapshotter=native" \
 	  --kubeconfig sandbox-kubeconfig.yaml
