@@ -3,6 +3,7 @@ package vm
 
 import (
 	"fmt"
+	"github.com/solutionforest/k3helper/internal/bundle"
 	"io"
 	"regexp"
 	"strings"
@@ -15,8 +16,21 @@ import (
 type Options struct {
 	// InstallURL overrides the k3s install script (tests use a local stub).
 	InstallURL string
-	// Channel: stable, latest, or a fixed version like v1.31.2+k3s1
+	// Channel: stable, latest, or testing. Resolved by update.k3s.io at
+	// install time, so it needs that service to be up.
 	Channel string
+	// Version pins an exact k3s release, e.g. v1.31.2+k3s1. When set it wins
+	// over Channel and the install skips update.k3s.io entirely, fetching the
+	// build straight from its GitHub release.
+	Version string
+	// BundleDir installs from a k3s bundle instead of downloading anything.
+	// The nodes need no internet at all: see internal/bundle.
+	BundleDir string
+	// JoinAddress overrides the address the other nodes dial to reach the
+	// first server. Needed when k3helper connects over one network and the
+	// cluster talks over another — a public IP for SSH, a private one between
+	// nodes.
+	JoinAddress string
 	// ExtraArgs appended to the install command (e.g. "--disable traefik")
 	ServerExtraArgs string
 	AgentExtraArgs  string
@@ -33,11 +47,84 @@ func (o *Options) installURL() string {
 	return "https://get.k3s.io"
 }
 
+// installFailure explains why an install step did not work.
+//
+// A step fails in two different ways and they need different words: the
+// connection itself broke (err is non-nil), or the command ran and exited
+// non-zero (err is nil, and the reason is in the output already streamed to
+// the operator). Passing a nil error to %w printed "%!w(<nil>)" where the
+// reason should have been — seen against a real VM, and it is the last thing
+// on screen when an install fails.
+func installFailure(what string, code int, err error) error {
+	if err != nil {
+		return fmt.Errorf("%s failed: %w", what, err)
+	}
+	return fmt.Errorf("%s failed (exit %d) — the install output above says why", what, code)
+}
+
 func (o Options) channel() string {
 	if o.Channel == "" {
 		return "stable"
 	}
 	return o.Channel
+}
+
+// release renders the environment that tells the k3s installer which build to
+// fetch: either an exact version, or a channel to resolve.
+//
+// A channel is a lookup against update.k3s.io, which is a second service that
+// has to be up and correctly certificated. It was neither during live testing
+// — it served a Traefik default certificate from all three of its addresses,
+// so every `curl -sfL https://get.k3s.io | sh -` on the internet failed TLS
+// verification and then failed to download. Pinning a version skips that
+// service entirely and fetches straight from the GitHub release, which was
+// healthy throughout.
+func (o Options) release() string {
+	if o.Version != "" {
+		return "INSTALL_K3S_VERSION=" + shellQuote(o.Version)
+	}
+	return "INSTALL_K3S_CHANNEL=" + o.channel()
+}
+
+// offline reports whether this install comes from a bundle.
+func (o Options) offline() bool { return o.BundleDir != "" }
+
+// serverInstallCmd builds the first server's install command.
+//
+// The online and offline forms differ only in where the installer and the
+// binary come from; the arguments after `server` are identical, so they are
+// built once here rather than in three places that would drift.
+func (o Options) serverInstallCmd(t Target, tokenArg, initArgs string) string {
+	if o.offline() {
+		return offlineInstallCmd(t.Client.SudoPrefix(), strings.TrimSpace(tokenArg)+" ", "server", withSpace(initArgs))
+	}
+	return fmt.Sprintf(
+		`curl -sfL %s | %s%s%s sh -s - server%s`,
+		o.installURL(), t.Client.SudoPrefix(), o.release(), tokenArg, withSpace(initArgs),
+	)
+}
+
+func (o Options) joinServerCmd(t Target, token, ip string) string {
+	args := fmt.Sprintf(" --server https://%s:6443%s", ip, withSpace(o.ServerExtraArgs))
+	if o.offline() {
+		return offlineInstallCmd(t.Client.SudoPrefix(),
+			"K3S_TOKEN="+shellQuote(token)+" ", "server", args)
+	}
+	return fmt.Sprintf(
+		`curl -sfL %s | %sK3S_TOKEN=%s %s sh -s - server%s`,
+		o.installURL(), t.Client.SudoPrefix(), shellQuote(token), o.release(), args,
+	)
+}
+
+func (o Options) agentInstallCmd(t Target, token, ip string) string {
+	env := fmt.Sprintf("K3S_URL=https://%s:6443 K3S_TOKEN=%s ", ip, shellQuote(token))
+	if o.offline() {
+		return offlineInstallCmd(t.Client.SudoPrefix(), env, "agent", withSpace(o.AgentExtraArgs))
+	}
+	return fmt.Sprintf(
+		`curl -sfL %s | %s%s%s sh -s - agent%s`,
+		o.installURL(), t.Client.SudoPrefix(), env, o.release(), withSpace(o.AgentExtraArgs),
+	)
 }
 
 // Host is what Setup needs from a connection. *ssh.Client satisfies it; tests
@@ -70,6 +157,22 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 			fmt.Fprintf(opts.Progress, format+"\n", a...)
 		}
 	}
+	// An offline install has to put the bundle on every node before anything
+	// is installed anywhere. Doing it per node as we go would leave a cluster
+	// half built when the last node turns out to be missing a file that was
+	// never in the bundle to begin with.
+	if opts.offline() {
+		m, err := bundle.Load(opts.BundleDir)
+		if err != nil {
+			return err
+		}
+		progressf("offline install from %s (k3s %s, %s)", opts.BundleDir, m.Version, m.Arch)
+		for _, t := range append(append([]Target{}, servers...), agents...) {
+			if err := stageBundle(t, opts.BundleDir, m, opts.Progress); err != nil {
+				return err
+			}
+		}
+	}
 	if len(servers) == 0 {
 		return fmt.Errorf("at least one server is required")
 	}
@@ -96,12 +199,9 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	if opts.Token != "" {
 		tokenArg = " K3S_TOKEN=" + shellQuote(opts.Token)
 	}
-	cmd := fmt.Sprintf(
-		`curl -sfL %s | %sINSTALL_K3S_CHANNEL=%s%s sh -s - server%s`,
-		opts.installURL(), first.Client.SudoPrefix(), opts.channel(), tokenArg, withSpace(initArgs),
-	)
+	cmd := opts.serverInstallCmd(first, tokenArg, initArgs)
 	if code, err := streamSudo(first.Client, cmd, opts.Progress); err != nil || code != 0 {
-		return fmt.Errorf("server install failed (exit %d): %w", code, err)
+		return installFailure("server install", code, err)
 	}
 
 	// 2. the join token and the address the others will reach it on
@@ -110,21 +210,18 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("fetch token: %w", err)
 	}
-	ip, err := serverInternalIP(first.Client)
+	ip, err := opts.joinAddress(first, first.Client)
 	if err != nil {
-		return fmt.Errorf("fetch server IP: %w", err)
+		return fmt.Errorf("determine the address the other nodes join on: %w", err)
 	}
+	progressf("[%s] other nodes will join at https://%s:6443", first.Node.Host, ip)
 
 	// 3. remaining servers join the etcd cluster
 	for _, s := range servers[1:] {
 		progressf("[%s] joining as server (etcd member)...", s.Node.Host)
-		joinCmd := fmt.Sprintf(
-			`curl -sfL %s | %sK3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - server --server https://%s:6443%s`,
-			opts.installURL(), s.Client.SudoPrefix(), shellQuote(token), opts.channel(), ip,
-			withSpace(opts.ServerExtraArgs),
-		)
+		joinCmd := opts.joinServerCmd(s, token, ip)
 		if code, err := streamSudo(s.Client, joinCmd, opts.Progress); err != nil || code != 0 {
-			return fmt.Errorf("server %s join failed (exit %d): %w", s.Node.Host, code, err)
+			return installFailure("server "+s.Node.Host+" join", code, err)
 		}
 		// Servers are added one at a time on purpose: etcd learners join
 		// sequentially, and adding several at once can cost quorum.
@@ -136,13 +233,9 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	// 4. agents
 	for _, a := range agents {
 		progressf("[%s] installing k3s agent...", a.Node.Host)
-		joinCmd := fmt.Sprintf(
-			`curl -sfL %s | %sK3S_URL=https://%s:6443 K3S_TOKEN=%s INSTALL_K3S_CHANNEL=%s sh -s - agent%s`,
-			opts.installURL(), a.Client.SudoPrefix(), ip, shellQuote(token), opts.channel(),
-			withSpace(opts.AgentExtraArgs),
-		)
+		joinCmd := opts.agentInstallCmd(a, token, ip)
 		if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
-			return fmt.Errorf("agent %s install failed (exit %d): %w", a.Node.Host, code, err)
+			return installFailure("agent "+a.Node.Host+" install", code, err)
 		}
 	}
 
@@ -205,6 +298,31 @@ func serverInternalIP(server Runner) (string, error) {
 		return "", fmt.Errorf("no internal IP found")
 	}
 	return ip, nil
+}
+
+// joinAddress is the address agents and joining servers dial to reach the
+// first server.
+//
+// It is the address from the targets file, not one discovered on the node.
+// The operator chose it and k3helper has just proved it works by connecting
+// over it, whereas `hostname -I` returns whatever the machine lists first —
+// which on a cloud VM is the public address. That address is often the one
+// thing the cluster's own network cannot use: an air-gapped node with egress
+// blocked can reach its neighbour's private IP and nothing else, so the agents
+// sat retrying "failed to get CA certs" against a public IP forever while the
+// server ran perfectly well beside them.
+//
+// Discovery remains the fallback for a local node, which has no host address
+// to take.
+func (o Options) joinAddress(first Target, client Runner) (string, error) {
+	if o.JoinAddress != "" {
+		return o.JoinAddress, nil
+	}
+	h := strings.TrimSpace(first.Node.Host)
+	if h != "" && !first.Node.Local && h != "localhost" && h != "127.0.0.1" {
+		return h, nil
+	}
+	return serverInternalIP(client)
 }
 
 // waitReady polls until `expected` nodes have registered and all are Ready.

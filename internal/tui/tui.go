@@ -1060,10 +1060,17 @@ func (m Model) header() string {
 
 // healthScore is the share of check results that are OK, which is what the
 // dashboard ring and the status bar both report.
+// A skipped check is not a failed one, so it is left out of both halves of the
+// fraction. On a kubeconfig cluster every host check is skipped, and counting
+// them as "not OK" scored a perfectly healthy managed cluster at 0% — which is
+// the most alarming thing on the screen and means nothing at all.
 func (m Model) healthScore() (int, bool) {
 	ok, total := 0, 0
 	for _, rs := range m.results {
 		for _, r := range rs {
+			if r.Status == check.Skip {
+				continue
+			}
 			total++
 			if r.Status == check.OK {
 				ok++

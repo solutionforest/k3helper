@@ -86,6 +86,53 @@ Windows reaches clusters through a kubeconfig rather than over SSH — see
 reachable, but the host-layer commands (`vm setup`, `registry apply`) target
 Linux nodes.
 
+### Air-gapped nodes
+
+Nodes with no route to the internet cannot run the usual installer: it reaches
+update.k3s.io to resolve a channel, GitHub for the k3s binary, and a registry
+for every image a pod pulls. Build a bundle where there *is* a connection, then
+install from it:
+
+```bash
+# on a machine with internet (a laptop, or a jump host inside the network)
+k3helper bundle k3s --version v1.31.2+k3s1 --arch amd64 -o ./k3s-bundle
+#   k3s                        75MB
+#   k3s-airgap-images.tar.zst  184MB   ← imported into containerd on first start
+#   install.sh                 37KB
+#   all verified against the release sha256 manifest
+
+# from anywhere that can reach the nodes over SSH
+k3helper vm setup -t targets.yaml --bundle ./k3s-bundle
+```
+
+The nodes need nothing but SSH from wherever k3helper runs, and a route to each
+other. `--bundle` uploads the binary and the image archive to every node, puts
+them where the installer looks, and runs it with `INSTALL_K3S_SKIP_DOWNLOAD`.
+
+Two things worth knowing:
+
+- **Agents join on the address in your targets file**, not one discovered on
+  the server. `hostname -I` reports a cloud VM's public address first, which is
+  usually the one address an air-gapped network cannot use. Override it with
+  `--join-address` when k3helper reaches the nodes over one network and the
+  cluster talks over another.
+- **Workload images still have to come from somewhere.** The bundle covers the
+  cluster's own images; for yours, point the nodes at an internal registry with
+  a `registries:` block and `k3helper registry apply`.
+
+### If the k3s channel service is down
+
+`--k3s-version` pins an exact release and skips the channel lookup entirely:
+
+```bash
+k3helper vm setup -t targets.yaml --k3s-version v1.31.2+k3s1
+```
+
+This is not hypothetical. During live testing `update.k3s.io` served a Traefik
+default certificate from all three of its addresses, so every
+`curl -sfL https://get.k3s.io | sh -` on the internet failed TLS verification.
+Pinning a version fetches straight from the GitHub release and is unaffected.
+
 ### From source
 
 ```bash

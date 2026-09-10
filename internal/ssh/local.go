@@ -76,6 +76,19 @@ func writeFileLocal(path string, data []byte, mode os.FileMode) error {
 	return nil
 }
 
+// writeFileStreamLocal backs WriteFileFrom for a local node.
+func writeFileStreamLocal(path string, r io.Reader, mode os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return fmt.Errorf("create %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, r); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return os.Chmod(path, mode.Perm())
+}
+
 func removeFileLocal(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("rm %s: %w", path, err)

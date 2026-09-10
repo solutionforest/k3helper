@@ -68,3 +68,34 @@ func stringsIndexOf(s, sub string) int {
 	}
 	return -1
 }
+
+// A skipped check must not drag the health score down.
+//
+// Every host check is skipped on a kubeconfig cluster, and counting those as
+// "not OK" put "score 0%" at the top of a screen showing a perfectly healthy
+// cluster — spotted in a screenshot of a live DigitalOcean cluster.
+func TestHealthScoreIgnoresSkippedChecks(t *testing.T) {
+	m := Model{results: map[string][]check.Result{
+		"kubeconfig": check.SkippedHostResults("server"),
+	}}
+	if score, have := m.healthScore(); have {
+		t.Errorf("a cluster with nothing but skipped checks reported a score of %d%%, want none", score)
+	}
+
+	m = Model{results: map[string][]check.Result{
+		"node1": {
+			{Status: check.OK},
+			{Status: check.OK},
+			{Status: check.Skip},
+			{Status: check.Fail},
+		},
+	}}
+	score, have := m.healthScore()
+	if !have {
+		t.Fatal("no score for a node with real results")
+	}
+	// 2 OK out of 3 that were actually run; the skip is not a third failure.
+	if score != 66 {
+		t.Errorf("score = %d%%, want 66%% (2 of 3 run, skip excluded)", score)
+	}
+}

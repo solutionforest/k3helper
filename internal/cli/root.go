@@ -45,6 +45,7 @@ func NewRootCmd() *cobra.Command {
   check       run cluster/node/k3s health checks
   doctor      troubleshoot: find issues + remediation (--watch to keep looking)
   registry    configure the private registries the cluster pulls from
+  bundle      build an offline install bundle for air-gapped nodes
   ctx         list clusters defined in the targets file
   init        create a targets.yaml describing your nodes
   tui         interactive dashboard + resource browser`,
@@ -78,6 +79,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newVMCmd())
 	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newRegistryCmd())
+	root.AddCommand(newBundleCmd())
 	root.AddCommand(newDeployCmd())
 	root.AddCommand(newTUICmd())
 	return root

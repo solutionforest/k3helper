@@ -4,6 +4,50 @@ Notable changes per release. The release workflow publishes the section
 matching the tag it is building, so this file is the source of the release
 notes on GitHub.
 
+## Unreleased
+
+Live testing against real DigitalOcean VMs, and the four bugs it found.
+
+### Added
+
+- **`k3helper bundle k3s`** builds an offline install bundle — the k3s binary,
+  the airgap image archive and the installer — verified against the release
+  sha256 manifest. `k3helper vm setup --bundle <dir>` installs from it with
+  `INSTALL_K3S_SKIP_DOWNLOAD`, so the nodes need no internet at all. Proven on
+  two DigitalOcean droplets with egress blocked at the provider firewall:
+  `github=000, get.k3s.io=000`, cluster Ready.
+- **`--k3s-version`** pins an exact release and skips the update.k3s.io channel
+  lookup. During testing that service served a Traefik default certificate from
+  every one of its addresses, which breaks `curl -sfL https://get.k3s.io | sh -`
+  everywhere; a pinned version fetches from the GitHub release instead.
+- **`--join-address`** overrides the address other nodes dial to reach the
+  first server, for when k3helper reaches the nodes over one network and the
+  cluster talks over another.
+- **`ssh.Client.WriteFileFrom`** streams a file to a node with progress,
+  instead of holding it in memory. The airgap image archive is 184MB.
+
+### Fixed
+
+- **Agents joined on the wrong address.** The join address was discovered with
+  `hostname -I`, which returns a cloud VM's public address first — the one
+  address an air-gapped network cannot reach. Agents retried "failed to get CA
+  certs" indefinitely while the server ran fine beside them. It now comes from
+  the targets file: the address the operator chose, and the one k3helper has
+  just proved works by connecting over it.
+- **`%!w(<nil>)` in install failures.** A command that ran and exited non-zero
+  has no error to wrap, and the `%w` verb printed its own failure as the last
+  thing an operator saw when an install failed.
+- **A healthy managed cluster scored 0% in the TUI.** Every host check is
+  skipped on a kubeconfig cluster, and skips were counted as "not OK". A skip
+  is now left out of both halves of the fraction, so the score reads `n/a`
+  rather than putting the most alarming number on screen for a healthy cluster.
+
+### Testing
+
+- `test/do/do.sh` provisions, air-gaps and destroys DigitalOcean droplets
+  through the v2 API for live scenario testing. Everything it creates is tagged
+  `k3helper-test`, so teardown can never touch anything else.
+
 ## v0.5.0
 
 Clusters you cannot SSH into. k3helper now reaches a cluster either by its

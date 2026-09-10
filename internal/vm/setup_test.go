@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"errors"
 	"io"
 
 	"github.com/solutionforest/k3helper/internal/ssh"
@@ -328,14 +329,16 @@ func TestHAServersInitialiseThenJoin(t *testing.T) {
 		if strings.Contains(line, "--cluster-init") {
 			t.Errorf("%s must join, not re-initialise: %s", name, line)
 		}
-		if !strings.Contains(line, "--server https://10.0.0.1:6443") {
+		// The join address is the first server's host from the targets file,
+		// not an address discovered on the node.
+		if !strings.Contains(line, "--server https://s1:6443") {
 			t.Errorf("%s did not join the first server: %s", name, line)
 		}
 		if !strings.Contains(line, "K3S_TOKEN='K10secret::server:node'") {
 			t.Errorf("%s joined without the quoted token: %s", name, line)
 		}
 	}
-	if !strings.Contains(a1, "K3S_URL=https://10.0.0.1:6443") || strings.Contains(a1, "--server ") {
+	if !strings.Contains(a1, "K3S_URL=https://s1:6443") || strings.Contains(a1, "--server ") {
 		t.Errorf("the agent should join with K3S_URL, not --server: %s", a1)
 	}
 }
@@ -492,5 +495,125 @@ func TestKubeadmPrereqRunsAsRoot(t *testing.T) {
 	}
 	if !strings.Contains(prep, "bash -s") {
 		t.Errorf("script is not fed to a shell: %s", prep)
+	}
+}
+
+// A pinned version must skip the channel entirely. Live testing found
+// update.k3s.io serving a Traefik default certificate from every one of its
+// addresses, which broke `curl -sfL https://get.k3s.io | sh -` worldwide —
+// pinning is the way past an outage in a service we do not control.
+func TestVersionPinSkipsTheChannel(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1"), nil, Options{Version: "v1.31.2+k3s1"}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "INSTALL_K3S_VERSION='v1.31.2+k3s1'") {
+		t.Errorf("version not pinned:\n%s", all)
+	}
+	if strings.Contains(all, "INSTALL_K3S_CHANNEL") {
+		t.Errorf("a pinned version still resolved a channel:\n%s", all)
+	}
+}
+
+// Without a pin the channel is still used, so existing behaviour is unchanged.
+func TestChannelUsedWhenNoVersionPinned(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1"), nil, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "INSTALL_K3S_CHANNEL=stable") {
+		t.Errorf("channel missing:\n%s", all)
+	}
+}
+
+// The agents and joining servers must honour the pin too, or a cluster ends up
+// running two different k3s builds.
+func TestVersionPinReachesAgents(t *testing.T) {
+	var rec []string
+	servers := fakeTargets(&rec, "s1")
+	agents := fakeTargets(&rec, "a1")
+	if err := Setup(servers, agents, Options{Version: "v1.31.2+k3s1"}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	for _, line := range rec {
+		if strings.Contains(line, "sh -s - agent") && !strings.Contains(line, "INSTALL_K3S_VERSION=") {
+			t.Errorf("agent install did not carry the pinned version: %s", line)
+		}
+	}
+}
+
+// A command that ran and exited non-zero has no error to wrap. Passing nil to
+// %w printed "%!w(<nil>)" as the last thing an operator saw when an install
+// failed on a real VM.
+func TestInstallFailureMessageHasNoFormatVerbLeak(t *testing.T) {
+	got := installFailure("server install", 1, nil).Error()
+	if strings.Contains(got, "%!") {
+		t.Errorf("format verb leaked into the message: %s", got)
+	}
+	if !strings.Contains(got, "exit 1") {
+		t.Errorf("exit code missing from: %s", got)
+	}
+	wrapped := installFailure("server install", 0, errors.New("connection reset"))
+	if !strings.Contains(wrapped.Error(), "connection reset") {
+		t.Errorf("underlying error lost: %s", wrapped)
+	}
+}
+
+// The address the other nodes join on comes from the targets file, because
+// that is the address the operator chose and the one k3helper has just proved
+// works by connecting over it.
+//
+// Live testing is what turned this up: `hostname -I` returns a cloud VM's
+// public address first, and on air-gapped nodes with egress blocked that is
+// the one address the cluster cannot use. The agents retried "failed to get CA
+// certs" against it indefinitely while the server ran fine next to them.
+func TestJoinAddressComesFromTheTargetsFile(t *testing.T) {
+	var rec []string
+	servers := fakeTargets(&rec, "10.104.0.13")
+	agents := fakeTargets(&rec, "10.104.0.12")
+	if err := Setup(servers, agents, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "K3S_URL=https://10.104.0.13:6443") {
+		t.Errorf("the agent did not join on the server's configured address:\n%s", all)
+	}
+	// 10.0.0.1 is what the fake `hostname -I` reports.
+	if strings.Contains(all, "https://10.0.0.1:6443") {
+		t.Errorf("the join address was discovered on the node instead:\n%s", all)
+	}
+}
+
+// --join-address covers the split case: k3helper reaches the nodes over one
+// network and the cluster talks over another.
+func TestJoinAddressOverride(t *testing.T) {
+	var rec []string
+	servers := fakeTargets(&rec, "203.0.113.10")
+	agents := fakeTargets(&rec, "203.0.113.11")
+	if err := Setup(servers, agents, Options{JoinAddress: "10.104.0.13"}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "K3S_URL=https://10.104.0.13:6443") {
+		t.Errorf("the override was ignored:\n%s", all)
+	}
+	if strings.Contains(all, "K3S_URL=https://203.0.113.10:6443") {
+		t.Errorf("the public address was used despite the override:\n%s", all)
+	}
+}
+
+// A local node has no host address to take, so discovery is still the fallback.
+func TestJoinAddressFallsBackToDiscoveryForLocalNode(t *testing.T) {
+	var rec []string
+	servers := []Target{{Node: ssh.Node{Host: "localhost", Local: true}, Client: fakeHost{name: "s1", rec: &rec}}}
+	agents := fakeTargets(&rec, "10.104.0.12")
+	if err := Setup(servers, agents, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "K3S_URL=https://10.0.0.1:6443") {
+		t.Errorf("a local server did not fall back to a discovered address:\n%s", all)
 	}
 }

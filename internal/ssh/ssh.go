@@ -160,6 +160,55 @@ func (c *Client) WriteFile(remotePath string, data []byte, mode os.FileMode) err
 	return nil
 }
 
+// WriteFileFrom streams a file to the node instead of holding it in memory.
+//
+// WriteFile takes a []byte, which is fine for a manifest and wrong for a k3s
+// airgap image archive: those run to a few hundred megabytes, and buffering
+// one per node to send it a chunk at a time serves no purpose. Progress, when
+// given, is called with the running byte count so a long upload can say what
+// it is doing rather than appearing hung.
+func (c *Client) WriteFileFrom(remotePath string, r io.Reader, mode os.FileMode, progress func(sent int64)) error {
+	if err := validRemotePath(remotePath); err != nil {
+		return err
+	}
+	if c.local {
+		return writeFileStreamLocal(remotePath, r, mode)
+	}
+	sess, err := c.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("new session: %w", err)
+	}
+	defer sess.Close()
+	sess.Stdin = &countingReader{r: r, cb: progress}
+	var errBuf bytes.Buffer
+	sess.Stderr = &errBuf
+	cmd := fmt.Sprintf("umask 077 && cat > '%s' && chmod %o '%s'", remotePath, mode.Perm(), remotePath)
+	if err := sess.Run(cmd); err != nil {
+		return fmt.Errorf("write %s: %w: %s", remotePath, err, strings.TrimSpace(errBuf.String()))
+	}
+	return nil
+}
+
+// countingReader reports progress as the bytes go past.
+type countingReader struct {
+	r    io.Reader
+	n    int64
+	cb   func(int64)
+	next int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	// Report every 8MB rather than every read: a callback per 32KB chunk turns
+	// a progress line into a flood.
+	if c.cb != nil && c.n >= c.next {
+		c.next = c.n + 8<<20
+		c.cb(c.n)
+	}
+	return n, err
+}
+
 // RemoveFile deletes remotePath, ignoring "already gone".
 func (c *Client) RemoveFile(remotePath string) error {
 	if err := validRemotePath(remotePath); err != nil {

@@ -8,3 +8,11 @@ dist/
 # Fetched kubeconfigs embed cluster client certificates and keys.
 *kubeconfig*.yaml
 sandbox-kubeconfig.yaml
+
+# Credentials for live testing. The DigitalOcean token in .env.production is a
+# working key against a real account, and this repository is public — one
+# `git add -A` is all it takes.
+.env
+.env.*
+!.env.example
+test/do/.state/

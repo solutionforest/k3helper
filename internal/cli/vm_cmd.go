@@ -75,6 +75,9 @@ func newVMSetupCmd() *cobra.Command {
 		extraArgs   string
 		distro      string
 		k8sVersion  string
+		k3sVersion  string
+		bundleDir   string
+		joinAddress string
 		cni         string
 		noConntrack bool
 		regFlags    registryFlags
@@ -176,6 +179,9 @@ func newVMSetupCmd() *cobra.Command {
 
 			err = vm.Setup(servers, agents, vm.Options{
 				Channel:         channel,
+				Version:         k3sVersion,
+				BundleDir:       bundleDir,
+				JoinAddress:     joinAddress,
 				Token:           token,
 				ServerExtraArgs: extraArgs,
 				AgentExtraArgs:  agentExtraArgs,
@@ -201,6 +207,12 @@ func newVMSetupCmd() *cobra.Command {
 	cmd.Flags().StringVar(&extraArgs, "server-extra-args", "", "extra args for the server install (k3s install script, or `kubeadm init`)")
 	cmd.Flags().StringVar(&distro, "distro", "k3s", "distribution to install: k3s or kubeadm")
 	cmd.Flags().StringVar(&k8sVersion, "k8s-version", "", "Kubernetes minor series for kubeadm, e.g. v1.31")
+	cmd.Flags().StringVar(&k3sVersion, "k3s-version", "",
+		"pin an exact k3s release, e.g. v1.31.2+k3s1 (skips the update.k3s.io channel lookup)")
+	cmd.Flags().StringVar(&bundleDir, "bundle", "",
+		"install from an offline bundle (see `k3helper bundle k3s`); the nodes need no internet")
+	cmd.Flags().StringVar(&joinAddress, "join-address", "",
+		"address the other nodes dial to reach the first server (default: its host from the targets file)")
 	cmd.Flags().StringVar(&cni, "cni", "flannel", "CNI for kubeadm: flannel or calico")
 	cmd.Flags().BoolVar(&noConntrack, "no-conntrack-tuning", false,
 		"stop kube-proxy managing nf_conntrack_max; needed where that sysctl is read-only or capped (nested VMs, containers)")
