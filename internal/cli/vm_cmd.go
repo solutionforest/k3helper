@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/solutionforest/k3helper/internal/config"
+	"github.com/solutionforest/k3helper/internal/proxy"
 	"github.com/solutionforest/k3helper/internal/registry"
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"github.com/solutionforest/k3helper/internal/transport"
@@ -78,6 +79,10 @@ func newVMSetupCmd() *cobra.Command {
 		k3sVersion  string
 		bundleDir   string
 		joinAddress string
+		aptMirror   string
+		k8sAptRepo  string
+		viaProxy    bool
+		proxyAllow  []string
 		cni         string
 		noConntrack bool
 		regFlags    registryFlags
@@ -86,6 +91,25 @@ func newVMSetupCmd() *cobra.Command {
 		Use:   "setup",
 		Short: "Install k3s server + agents on all nodes in targets file",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Flag combinations are settled before anything is dialled. A
+			// contradiction is not worth an SSH round trip to every node to
+			// discover, and one of these decides whether the nodes are given
+			// a route to the internet at all.
+			if err := checkSetupFlags(distro, bundleDir, k3sVersion, viaProxy, proxyAllow); err != nil {
+				return err
+			}
+			if viaProxy {
+				// Said out loud, every time. Lending an isolated machine a
+				// route out is the operator's decision to make knowingly, and
+				// in some environments it is not theirs to make at all.
+				fmt.Fprintf(cmd.OutOrStdout(),
+					"--via-proxy: these nodes will reach the internet through this machine for the "+
+						"length of the install, and only through it.\n"+
+						"  allowed: %s\n"+
+						"  the tunnel and its configuration are removed when the install finishes.\n\n",
+					strings.Join(proxyAllowSummary(proxyAllow), ", "))
+			}
+
 			targets, err := loadTargets(targetsPath)
 			if err != nil {
 				return err
@@ -154,25 +178,6 @@ func newVMSetupCmd() *cobra.Command {
 				}
 			}
 
-			// Flags that only mean something for one distribution are refused
-			// rather than ignored. An operator who asks for an offline install
-			// and silently gets an online one finds out on an air-gapped node,
-			// from a TLS error, at the worst possible moment.
-			if distro == "kubeadm" {
-				if bundleDir != "" {
-					return fmt.Errorf("--bundle builds a k3s bundle and only the k3s installer can use it; " +
-						"an offline kubeadm install needs distribution packages and registry.k8s.io images, " +
-						"which this does not yet assemble. Use --distro k3s, or install kubeadm's prerequisites yourself")
-				}
-				if k3sVersion != "" {
-					return fmt.Errorf("--k3s-version applies to --distro k3s; for kubeadm use --k8s-version")
-				}
-			}
-			if bundleDir != "" && k3sVersion != "" {
-				return fmt.Errorf("--bundle and --k3s-version contradict each other: " +
-					"a bundle already contains one exact k3s release, recorded in its bundle.json")
-			}
-
 			if distro == "kubeadm" {
 				if err := vm.SetupKubeadm(servers, agents, vm.KubeadmOptions{
 					Version:             k8sVersion,
@@ -180,6 +185,9 @@ func newVMSetupCmd() *cobra.Command {
 					InitExtraArgs:       extraArgs,
 					SkipConntrackTuning: noConntrack,
 					JoinAddress:         joinAddress,
+					Mirror:              vm.AptMirror{URL: aptMirror, K8sRepo: k8sAptRepo},
+					ViaProxy:            viaProxy,
+					ProxyAllow:          proxyAllow,
 					Progress:            cmd.OutOrStdout(),
 				}); err != nil {
 					return err
@@ -202,6 +210,9 @@ func newVMSetupCmd() *cobra.Command {
 				Version:         k3sVersion,
 				BundleDir:       bundleDir,
 				JoinAddress:     joinAddress,
+				Mirror:          vm.AptMirror{URL: aptMirror, K8sRepo: k8sAptRepo},
+				ViaProxy:        viaProxy,
+				ProxyAllow:      proxyAllow,
 				Token:           token,
 				ServerExtraArgs: extraArgs,
 				AgentExtraArgs:  agentExtraArgs,
@@ -233,6 +244,16 @@ func newVMSetupCmd() *cobra.Command {
 		"install from an offline bundle (see `k3helper bundle k3s`); the nodes need no internet")
 	cmd.Flags().StringVar(&joinAddress, "join-address", "",
 		"address the other nodes dial to reach the first server (default: its host from the targets file)")
+	cmd.Flags().StringVar(&aptMirror, "apt-mirror", "",
+		"point the nodes' package manager at this archive instead of the distribution's, "+
+			"e.g. https://nexus.corp/repository/ubuntu")
+	cmd.Flags().StringVar(&k8sAptRepo, "k8s-apt-repo", "",
+		"mirror of the Kubernetes package repository (default: pkgs.k8s.io); kubeadm only")
+	cmd.Flags().BoolVar(&viaProxy, "via-proxy", false,
+		"lend the nodes this machine's internet connection for the length of the install, "+
+			"over the SSH connection already open to them")
+	cmd.Flags().StringArrayVar(&proxyAllow, "proxy-allow", nil,
+		"extra host allowed through --via-proxy; repeat for more, or \"*\" for anything")
 	cmd.Flags().StringVar(&cni, "cni", "flannel", "CNI for kubeadm: flannel or calico")
 	cmd.Flags().BoolVar(&noConntrack, "no-conntrack-tuning", false,
 		"stop kube-proxy managing nf_conntrack_max; needed where that sysctl is read-only or capped (nested VMs, containers)")
@@ -245,4 +266,51 @@ var agentExtraArgs string
 
 func toSSHNode(n config.Node) ssh.Node {
 	return n.SSH()
+}
+
+// proxyAllowSummary describes what --via-proxy will permit, for the notice
+// printed before it is opened.
+func proxyAllowSummary(extra []string) []string {
+	for _, a := range extra {
+		if a == "*" {
+			return []string{"anything (--proxy-allow \"*\")"}
+		}
+	}
+	out := []string{fmt.Sprintf("%d default hosts (distribution mirrors, pkgs.k8s.io, registry.k8s.io, docker.io)",
+		len(proxy.DefaultAllow))}
+	if len(extra) > 0 {
+		out = append(out, strings.Join(extra, ", "))
+	}
+	return out
+}
+
+// checkSetupFlags rejects combinations that cannot mean what they say.
+//
+// Silently ignoring one of these is how an operator asks for an offline
+// install, gets an online one, and finds out on an air-gapped node from a TLS
+// error at the worst possible moment.
+func checkSetupFlags(distro, bundleDir, k3sVersion string, viaProxy bool, proxyAllow []string) error {
+	if distro == "kubeadm" {
+		if bundleDir != "" {
+			return fmt.Errorf("--bundle builds a k3s bundle and only the k3s installer can use it; " +
+				"an offline kubeadm install needs distribution packages and registry.k8s.io images. " +
+				"Use --apt-mirror and --k8s-apt-repo to point at your own mirrors, --via-proxy to " +
+				"lend the nodes this machine's connection, or --distro k3s, which installs fully offline")
+		}
+		if k3sVersion != "" {
+			return fmt.Errorf("--k3s-version applies to --distro k3s; for kubeadm use --k8s-version")
+		}
+	}
+	if bundleDir != "" && k3sVersion != "" {
+		return fmt.Errorf("--bundle and --k3s-version contradict each other: " +
+			"a bundle already contains one exact k3s release, recorded in its bundle.json")
+	}
+	if viaProxy && bundleDir != "" {
+		return fmt.Errorf("--via-proxy and --bundle are two answers to the same problem: " +
+			"a bundle installs with no network at all, so lending the nodes one does nothing")
+	}
+	if len(proxyAllow) > 0 && !viaProxy {
+		return fmt.Errorf("--proxy-allow only means something with --via-proxy")
+	}
+	return nil
 }

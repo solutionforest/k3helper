@@ -120,6 +120,59 @@ Two things worth knowing:
   cluster's own images; for yours, point the nodes at an internal registry with
   a `registries:` block and `k3helper registry apply`.
 
+### Air-gapped kubeadm: a mirror, or your own connection
+
+k3s installs offline from a bundle because it is one binary and one image
+archive. kubeadm cannot: it needs apt packages and images from
+`registry.k8s.io`, and neither fits in a file you carry in. Two answers.
+
+**Point at your own mirror.** Most sites that run air-gapped Kubernetes already
+have one — Artifactory, Nexus, Satellite. This does not replace it, it points
+at it:
+
+```bash
+k3helper vm setup -t targets.yaml --distro kubeadm   --apt-mirror   https://nexus.corp/repository/ubuntu   --k8s-apt-repo https://nexus.corp/repository/kubernetes
+```
+
+The distribution archive is substituted in both source formats — 24.04's
+deb822 `.sources` files and older `.list` entries — and every file is backed up
+as `*.k3helper.bak` first. Third-party repositories are left alone.
+
+**Or lend the nodes your connection.** When there is no mirror either,
+`--via-proxy` opens a proxy on the machine running k3helper and reaches the
+nodes through the SSH connection already open to them:
+
+```bash
+k3helper vm setup -t targets.yaml --distro kubeadm --via-proxy
+```
+
+```
+--via-proxy: these nodes will reach the internet through this machine for the
+length of the install, and only through it.
+  allowed: 30 default hosts (distribution mirrors, pkgs.k8s.io, registry.k8s.io, docker.io)
+  the tunnel and its configuration are removed when the install finishes.
+```
+
+The proxy resolves names on your side, so the nodes need no working DNS either
+— which a genuinely cut-off machine does not have. Traffic is restricted to an
+allowlist; anything else is refused with the flag that would permit it
+(`--proxy-allow HOST`, or `--proxy-allow "*"`). Cluster-internal addresses
+never go through the tunnel.
+
+Three things to be clear about:
+
+- **This gives an isolated machine a route out.** It is temporary, proxied and
+  allowlisted, but in some environments opening one at all is a policy breach
+  regardless. It is off unless asked for, and it says what it is doing every
+  time. That call is the operator's, and sometimes not theirs to make.
+- **The tunnel is install-time only.** When `vm setup` finishes it is removed,
+  and the cluster goes back to having no internet — so it cannot pull a
+  workload image afterwards. For anything beyond the install, point the nodes
+  at an internal registry with a `registries:` block.
+- **For a genuinely disconnected site, prefer k3s.** `--bundle` installs it with
+  no network at all, which is a better fit than a cluster that needed a
+  temporary hole to be built.
+
 ### If the k3s channel service is down
 
 `--k3s-version` pins an exact release and skips the channel lookup entirely:

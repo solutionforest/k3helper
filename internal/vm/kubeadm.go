@@ -38,6 +38,26 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 
 	all := append(append([]Target{}, servers...), agents...)
 
+	// A node that cannot reach a distribution mirror cannot install kubeadm at
+	// all: unlike k3s it is apt packages and registry images, not one binary.
+	// Both answers are set up before any of it runs.
+	var proxies []*nodeProxy
+	if opts.ViaProxy {
+		var err error
+		proxies, err = startProxies(all, opts.ProxyAllow, opts.Progress)
+		if err != nil {
+			return err
+		}
+		defer stopProxies(proxies)
+	}
+	if !opts.Mirror.empty() {
+		for _, t := range all {
+			if err := applyAptMirror(t, opts.Mirror, opts.Progress); err != nil {
+				return err
+			}
+		}
+	}
+
 	// 1. prerequisites, every node
 	for _, t := range all {
 		// Before apt runs, or it collides with cloud-init's dpkg lock on a
@@ -47,9 +67,10 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 		// The script is multi-line and contains quotes of its own, so it is
 		// shipped base64-encoded and fed to a root shell rather than being
 		// interpolated into one.
-		run := fmt.Sprintf(`printf %%s %s | base64 -d | %sbash -s`,
-			shellQuote(base64.StdEncoding.EncodeToString([]byte(kubeadmPrereqScript(opts.Version)))),
-			t.Client.SudoPrefix())
+		run := fmt.Sprintf(`printf %%s %s | base64 -d | %s%sbash -s`,
+			shellQuote(base64.StdEncoding.EncodeToString([]byte(
+				kubeadmPrereqScript(opts.Version, opts.Mirror)))),
+			t.Client.SudoPrefix(), proxyEnv(proxies, t.Node.Host))
 		if code, err := streamSudo(t.Client, run, opts.Progress); err != nil || code != 0 {
 			return fmt.Errorf("prepare %s: %s", t.Node.Host, exitReason(code, err))
 		}
@@ -74,9 +95,13 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 	}
 
 	progressf("[%s] kubeadm init (pod network %s)...", first.Node.Host, opts.podCIDR())
+	// The environment goes after sudo, not before it: sudo resets it, so a
+	// prefix on the outside reaches the shell and not the command that
+	// actually fetches anything.
+	firstEnv := proxyEnv(proxies, first.Node.Host)
 	initCmd := fmt.Sprintf(
-		`%skubeadm init --pod-network-cidr=%s%s%s`,
-		first.Client.SudoPrefix(), shellQuote(opts.podCIDR()), advertise, withSpace(opts.InitExtraArgs))
+		`%s%skubeadm init --pod-network-cidr=%s%s%s`,
+		first.Client.SudoPrefix(), firstEnv, shellQuote(opts.podCIDR()), advertise, withSpace(opts.InitExtraArgs))
 	if opts.SkipConntrackTuning {
 		// A config file rather than flags: kube-proxy's conntrack settings
 		// have no command-line equivalent on kubeadm init.
@@ -87,8 +112,8 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 		)); err != nil || code != 0 {
 			return fmt.Errorf("write kubeadm config: %s", exitReason(code, err))
 		}
-		initCmd = fmt.Sprintf(`%skubeadm init --config /etc/kubernetes/k3helper-init.yaml%s%s`,
-			first.Client.SudoPrefix(), advertise, withSpace(opts.InitExtraArgs))
+		initCmd = fmt.Sprintf(`%s%skubeadm init --config /etc/kubernetes/k3helper-init.yaml%s%s`,
+			first.Client.SudoPrefix(), firstEnv, advertise, withSpace(opts.InitExtraArgs))
 	}
 	if code, err := streamSudo(first.Client, initCmd, opts.Progress); err != nil || code != 0 {
 		return fmt.Errorf("kubeadm init failed: %s", exitReason(code, err))
@@ -105,8 +130,12 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 	// 3. CNI — without one every node stays NotReady, which looks like a
 	// broken install rather than a missing component.
 	progressf("[%s] installing CNI (%s)...", first.Node.Host, opts.cni())
-	cniCmd := fmt.Sprintf(`%skubectl --kubeconfig /etc/kubernetes/admin.conf apply -f %s`,
-		first.Client.SudoPrefix(), shellQuote(opts.cniManifest()))
+	// The CNI manifest is a URL, and kubectl fetches it itself — so this needs
+	// the proxy as much as apt did. Without it the step failed with a bare
+	// "dial tcp 20.205.243.166:443: i/o timeout" on a node that had just
+	// installed Kubernetes perfectly well through the tunnel.
+	cniCmd := fmt.Sprintf(`%s%skubectl --kubeconfig /etc/kubernetes/admin.conf apply -f %s`,
+		first.Client.SudoPrefix(), firstEnv, shellQuote(opts.cniManifest()))
 	if code, err := streamSudo(first.Client, cniCmd, opts.Progress); err != nil || code != 0 {
 		return fmt.Errorf("install CNI: %s", exitReason(code, err))
 	}
@@ -124,7 +153,8 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 		}
 		for _, a := range agents {
 			progressf("[%s] joining cluster...", a.Node.Host)
-			if code, err := streamSudo(a.Client, a.Client.SudoPrefix()+join, opts.Progress); err != nil || code != 0 {
+			joinCmd := a.Client.SudoPrefix() + proxyEnv(proxies, a.Node.Host) + join
+			if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 				return fmt.Errorf("join %s failed: %s", a.Node.Host, exitReason(code, err))
 			}
 		}
@@ -149,6 +179,15 @@ type KubeadmOptions struct {
 	// the address the join command hands to every agent. Empty takes it from
 	// the targets file.
 	JoinAddress string
+	// Mirror points the node's package manager at an internal mirror instead
+	// of the distribution's own archive.
+	Mirror AptMirror
+	// ViaProxy lends each node this machine's internet connection for the
+	// length of the install, over the SSH connection already open to it.
+	// Off unless asked for: see viaproxy.go.
+	ViaProxy bool
+	// ProxyAllow extends the proxy's host allowlist.
+	ProxyAllow []string
 	// SkipConntrackTuning stops kube-proxy managing nf_conntrack_max.
 	//
 	// kube-proxy raises that sysctl at startup and dies if it cannot. On hosts
@@ -206,12 +245,28 @@ func (o KubeadmOptions) readyTimeout() int {
 // kubelet refuse to start, the br_netfilter module and its sysctls are what
 // let pod traffic be seen by iptables, and without a CRI there is nothing to
 // run containers with.
-func kubeadmPrereqScript(version string) string {
+func kubeadmPrereqScript(version string, m AptMirror) string {
 	if version == "" {
 		version = "v1.31"
 	}
+	// The Kubernetes packages live on their own service, mirrored separately
+	// from the distribution's archive — a site may well have one and not the
+	// other.
+	k8sRepo := "https://pkgs.k8s.io/core:/stable:/" + version + "/deb/"
+	if m.K8sRepo != "" {
+		k8sRepo = strings.TrimRight(m.K8sRepo, "/") + "/"
+	}
 	return `set -e
 export DEBIAN_FRONTEND=noninteractive
+
+# Wait for the apt lock rather than failing on it.
+#
+# Waiting for cloud-init is not enough: apt-daily and unattended-upgrades are
+# on timers and can take the lock minutes after boot, long after cloud-init has
+# finished. The failure is "Could not get lock /var/lib/apt/lists/lock", which
+# says nothing about the timer that is holding it. apt has taken this option
+# since 1.9, and Ubuntu 24.04 is well past that.
+APT="apt-get -o DPkg::Lock::Timeout=300"
 
 # kubelet refuses to start with swap enabled.
 swapoff -a || true
@@ -232,11 +287,11 @@ printf 'overlay\nbr_netfilter\nnf_conntrack\n' > /etc/modules-load.d/k8s.conf
 printf 'net.bridge.bridge-nf-call-iptables  = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward                 = 1\nnet.netfilter.nf_conntrack_max      = 1048576\n' > /etc/sysctl.d/k8s.conf
 sysctl --system >/dev/null 2>&1 || true
 
-apt-get update -qq
+$APT update -qq
 # conntrack is a hard kubeadm preflight requirement; socat is what
 # "kubectl port-forward" uses on the node; ethtool and iptables are needed by
 # most CNIs. Missing any of them fails late and unhelpfully.
-apt-get install -y -qq apt-transport-https ca-certificates curl gpg containerd \
+$APT install -y -qq apt-transport-https ca-certificates curl gpg containerd \
   conntrack socat ethtool iptables
 
 # containerd's shipped default disables CRI; kubeadm needs it, and the cgroup
@@ -248,12 +303,12 @@ systemctl restart containerd
 systemctl enable containerd
 
 install -m 755 -d /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/` + version + `/deb/Release.key |
+curl -fsSL ` + k8sRepo + `Release.key |
   gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg --yes
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/` + version + `/deb/ /" \
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] ` + k8sRepo + ` /" \
   > /etc/apt/sources.list.d/kubernetes.list
-apt-get update -qq
-apt-get install -y -qq kubelet kubeadm kubectl
+$APT update -qq
+$APT install -y -qq kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl >/dev/null
 systemctl enable kubelet
 `

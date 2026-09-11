@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -247,6 +248,9 @@ func (f fakeHost) Run(cmd string) (string, int, error) {
 	case strings.Contains(cmd, "get nodes"):
 		// enough Ready nodes to satisfy any arrangement these tests build
 		return "a=True\nb=True\nc=True\nd=True\n", 0, nil
+	case strings.Contains(cmd, "print-join-command"):
+		return "kubeadm join 10.0.0.1:6443 --token abcdef.0123456789abcdef " +
+			"--discovery-token-ca-cert-hash sha256:deadbeef\n", 0, nil
 	}
 	return "", 0, nil
 }
@@ -413,7 +417,7 @@ func TestKubeadmRefusesMultipleServers(t *testing.T) {
 // The prerequisite script must do the things kubeadm requires and does not do
 // itself; each omission fails much later and confusingly.
 func TestKubeadmPrereqScriptCoversTheRequirements(t *testing.T) {
-	script := kubeadmPrereqScript("v1.31")
+	script := kubeadmPrereqScript("v1.31", AptMirror{})
 	for _, want := range []string{
 		"swapoff -a",   // kubelet refuses to start with swap on
 		"br_netfilter", // pod traffic must be visible to iptables
@@ -433,7 +437,7 @@ func TestKubeadmPrereqScriptCoversTheRequirements(t *testing.T) {
 		}
 	}
 	// The version must be threaded through, not hardcoded.
-	if strings.Contains(kubeadmPrereqScript("v1.30"), "stable:/v1.31") {
+	if strings.Contains(kubeadmPrereqScript("v1.30", AptMirror{}), "stable:/v1.31") {
 		t.Error("the requested version was ignored")
 	}
 }
@@ -831,5 +835,191 @@ func TestOfflineInstallsWithoutDownloading(t *testing.T) {
 	// The staged copy is a few hundred megabytes on a real node.
 	if !strings.Contains(all, "rm -rf '"+remoteStage+"'") {
 		t.Errorf("the staging directory was left behind:\n%s", all)
+	}
+}
+
+// A tunnelHost is a fakeHost that can also open a listener, so the --via-proxy
+// path can be driven without a VM.
+type tunnelHost struct {
+	fakeHost
+	l net.Listener
+}
+
+func (h *tunnelHost) ListenRemote(addr string) (net.Listener, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	h.l = l
+	return l, err
+}
+
+// --via-proxy must point apt and containerd at the tunnel, and must take both
+// settings away again. A node left pointing at a proxy that no longer exists
+// cannot reach its own package manager, and "apt hangs on 127.0.0.1" points
+// nowhere near k3helper.
+func TestViaProxyConfiguresAndCleansUp(t *testing.T) {
+	var rec []string
+	host := &tunnelHost{fakeHost: fakeHost{name: "s1", rec: &rec}}
+	err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil, Options{ViaProxy: true})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	for _, want := range []string{
+		`Acquire::http::Proxy`,
+		`Acquire::https::Proxy`,
+		aptProxyConf,
+		containerdProxyConf,
+		`HTTP_PROXY=http://127.0.0.1:`,
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("the proxy was not configured (%q missing):\n%s", want, all)
+		}
+	}
+	if !strings.Contains(all, "rm -f "+aptProxyConf) {
+		t.Errorf("the apt proxy config was left on the node:\n%s", all)
+	}
+	// The install itself must carry the environment: the k3s installer is
+	// fetched with curl, which reads http_proxy and nothing else.
+	var install string
+	for _, c := range rec {
+		if strings.Contains(c, "get.k3s.io") {
+			install = c
+		}
+	}
+	// Once for curl, which fetches the installer, and once after sudo for the
+	// installer itself, which fetches the k3s binary — sudo resets the
+	// environment, so one copy is not enough.
+	if n := strings.Count(install, "http_proxy=http://127.0.0.1:"); n < 2 {
+		t.Errorf("the proxy environment appears %d time(s); it is needed either side of sudo: %s", n, install)
+	}
+}
+
+// Cluster-internal traffic must not be sent through the operator's machine.
+func TestViaProxyExemptsClusterTraffic(t *testing.T) {
+	var rec []string
+	host := &tunnelHost{fakeHost: fakeHost{name: "s1", rec: &rec}}
+	if err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil,
+		Options{ViaProxy: true}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	for _, want := range []string{"10.0.0.0/8", ".svc", ".cluster.local"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("NO_PROXY does not exempt %s:\n%s", want, all)
+		}
+	}
+}
+
+// Without --via-proxy nothing is tunnelled and nothing is written.
+func TestNoProxyByDefault(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1"), nil, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	if strings.Contains(all, "Acquire::http::Proxy") || strings.Contains(all, "HTTP_PROXY") {
+		t.Errorf("a proxy was configured without being asked for:\n%s", all)
+	}
+}
+
+// --apt-mirror rewrites both source formats: Ubuntu 24.04 uses deb822
+// .sources files and everything older uses one-line .list entries. Missing one
+// leaves half the sources pointing at an archive the node cannot reach.
+func TestAptMirrorRewritesBothSourceFormats(t *testing.T) {
+	script := aptMirrorScript(AptMirror{URL: "https://nexus.corp/repository/ubuntu"})
+	for _, want := range []string{
+		"/etc/apt/sources.list.d/*.sources",
+		"/etc/apt/sources.list.d/*.list",
+		"/etc/apt/sources.list",
+		"k3helper.bak",
+		"nexus.corp/repository/ubuntu",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the rewrite does not cover %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestAptMirrorIsOptional(t *testing.T) {
+	if s := aptMirrorScript(AptMirror{}); s != "" {
+		t.Errorf("an empty mirror produced a script:\n%s", s)
+	}
+	if !(AptMirror{}).empty() {
+		t.Error("an empty AptMirror does not report itself empty")
+	}
+	if (AptMirror{K8sRepo: "https://nexus.corp/k8s"}).empty() {
+		t.Error("a mirror with only a Kubernetes repo reports itself empty")
+	}
+}
+
+// The Kubernetes packages come from their own service, mirrored separately —
+// a site may have one mirror and not the other.
+func TestK8sAptRepoOverride(t *testing.T) {
+	script := kubeadmPrereqScript("v1.31", AptMirror{K8sRepo: "https://nexus.corp/repository/k8s"})
+	if !strings.Contains(script, "https://nexus.corp/repository/k8s/Release.key") {
+		t.Errorf("the repository key is still fetched upstream:\n%s", script)
+	}
+	if strings.Contains(script, "pkgs.k8s.io") {
+		t.Errorf("pkgs.k8s.io is still referenced after an override:\n%s", script)
+	}
+}
+
+func TestK8sAptRepoDefaultsUpstream(t *testing.T) {
+	script := kubeadmPrereqScript("v1.31", AptMirror{})
+	if !strings.Contains(script, "https://pkgs.k8s.io/core:/stable:/v1.31/deb/") {
+		t.Errorf("the default repository is wrong:\n%s", script)
+	}
+}
+
+// The proxy lives inside a running k3helper. If the operator's machine goes
+// away mid-install, apt has no timeout of its own: it waits on the dead tunnel
+// forever, holding the apt lock. One was found still holding it 31 minutes
+// later, failing every later run on that node with a lock error that pointed
+// nowhere near the cause.
+func TestViaProxyGivesAptATimeout(t *testing.T) {
+	var rec []string
+	host := &tunnelHost{fakeHost: fakeHost{name: "s1", rec: &rec}}
+	if err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil,
+		Options{ViaProxy: true}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	for _, want := range []string{
+		`Acquire::http::Timeout`,
+		`Acquire::https::Timeout`,
+		`Acquire::http::Pipeline-Depth "0"`,
+	} {
+		if !strings.Contains(all, want) {
+			t.Errorf("the apt configuration is missing %s:\n%s", want, all)
+		}
+	}
+}
+
+// Cluster traffic must never go through the tunnel. kubeadm talks to the API
+// server it has just started, and with only localhost exempted it sent that
+// through the proxy — which refused the node's own address, because an
+// allowlist of internet hosts does not contain it, and the install failed.
+func TestViaProxyExemptsTheClusterFromItself(t *testing.T) {
+	var rec []string
+	host := &tunnelHost{fakeHost: fakeHost{name: "s1", rec: &rec}}
+	if err := Setup([]Target{{Node: ssh.Node{Host: "10.104.0.5"}, Client: host}}, nil,
+		Options{ViaProxy: true}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	all := strings.Join(rec, "\n")
+	// The private ranges cover a node's own address without having to know it.
+	for _, want := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", ".cluster.local"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("NO_PROXY does not exempt %s:\n%s", want, all)
+		}
+	}
+	// And it has to reach the commands, not only containerd's unit file.
+	var install string
+	for _, c := range rec {
+		if strings.Contains(c, "get.k3s.io") {
+			install = c
+		}
+	}
+	if !strings.Contains(install, "no_proxy=") || !strings.Contains(install, "10.0.0.0/8") {
+		t.Errorf("the install command carries no cluster exemption: %s", install)
 	}
 }

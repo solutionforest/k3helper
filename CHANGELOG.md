@@ -26,6 +26,19 @@ Live testing against real DigitalOcean VMs, and the four bugs it found.
 - **`ssh.Client.WriteFileFrom`** streams a file to a node with progress,
   instead of holding it in memory. The airgap image archive is 184MB.
 
+- **`--apt-mirror` and `--k8s-apt-repo`** point a node's package manager at
+  mirrors you run instead of the distribution's own archive. Both source
+  formats are rewritten — 24.04's deb822 `.sources` and older `.list` entries —
+  with a backup of every file first, and third-party repositories left alone.
+- **`--via-proxy`** lends the nodes the operator's internet connection for the
+  length of an install, over the SSH connection already open to them, through a
+  proxy with a host allowlist. It is what makes an air-gapped kubeadm install
+  possible at all: unlike k3s, kubeadm needs apt packages and registry images
+  that do not fit in a bundle. Off unless asked for, announced when used, and
+  removed from the node afterwards. Proven on two DigitalOcean droplets with
+  egress blocked at the provider firewall: `✓ cluster ready`, both nodes Ready,
+  ten pods Running, `github=000`.
+
 ### Fixed
 
 - **kubeadm advertised the wrong API server address**, for the same reason the

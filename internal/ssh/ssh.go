@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -207,6 +208,28 @@ func (c *countingReader) Read(p []byte) (int, error) {
 		c.cb(c.n)
 	}
 	return n, err
+}
+
+// ListenRemote opens a listener on the *node*, carried back over this
+// connection.
+//
+// It is how a node with no route out borrows the operator's: k3helper runs a
+// proxy here, the node connects to a port on its own loopback, and the SSH
+// channel carries the traffic. Nothing new is exposed to the network — the
+// listener is on the node's loopback and the traffic rides a connection that
+// already exists.
+//
+// Needs AllowTcpForwarding on the node's sshd, which is the default; a server
+// with it disabled fails here rather than half way through an install.
+func (c *Client) ListenRemote(addr string) (net.Listener, error) {
+	if c.local {
+		return nil, fmt.Errorf("a local node does not need a tunnel: it is this machine")
+	}
+	l, err := c.conn.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("open a listener on the node (is AllowTcpForwarding enabled in its sshd?): %w", err)
+	}
+	return l, nil
 }
 
 // RemoveFile deletes remotePath, ignoring "already gone".

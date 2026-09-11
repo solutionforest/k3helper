@@ -31,6 +31,15 @@ type Options struct {
 	// cluster talks over another — a public IP for SSH, a private one between
 	// nodes.
 	JoinAddress string
+	// Mirror points the node's package manager at an internal mirror. k3s
+	// itself needs no packages, but a node may still want a reachable archive
+	// for everything else on it.
+	Mirror AptMirror
+	// ViaProxy lends each node this machine's internet connection for the
+	// length of the install. Off unless asked for: see viaproxy.go.
+	ViaProxy bool
+	// ProxyAllow extends the proxy's host allowlist.
+	ProxyAllow []string
 	// ExtraArgs appended to the install command (e.g. "--disable traefik")
 	ServerExtraArgs string
 	AgentExtraArgs  string
@@ -95,36 +104,36 @@ func (o Options) offline() bool { return o.BundleDir != "" }
 // The online and offline forms differ only in where the installer and the
 // binary come from; the arguments after `server` are identical, so they are
 // built once here rather than in three places that would drift.
-func (o Options) serverInstallCmd(t Target, tokenArg, initArgs string) string {
+func (o Options) serverInstallCmd(t Target, env, tokenArg, initArgs string) string {
 	if o.offline() {
 		return offlineInstallCmd(t.Client.SudoPrefix(), strings.TrimSpace(tokenArg)+" ", "server", withSpace(initArgs))
 	}
 	return fmt.Sprintf(
-		`curl -sfL %s | %s%s%s sh -s - server%s`,
-		o.installURL(), t.Client.SudoPrefix(), o.release(), tokenArg, withSpace(initArgs),
+		`curl -sfL %s | %s%s%s%s sh -s - server%s`,
+		o.installURL(), t.Client.SudoPrefix(), env, o.release(), tokenArg, withSpace(initArgs),
 	)
 }
 
-func (o Options) joinServerCmd(t Target, token, ip string) string {
+func (o Options) joinServerCmd(t Target, env, token, ip string) string {
 	args := fmt.Sprintf(" --server https://%s:6443%s", ip, withSpace(o.ServerExtraArgs))
 	if o.offline() {
 		return offlineInstallCmd(t.Client.SudoPrefix(),
 			"K3S_TOKEN="+shellQuote(token)+" ", "server", args)
 	}
 	return fmt.Sprintf(
-		`curl -sfL %s | %sK3S_TOKEN=%s %s sh -s - server%s`,
-		o.installURL(), t.Client.SudoPrefix(), shellQuote(token), o.release(), args,
+		`curl -sfL %s | %s%sK3S_TOKEN=%s %s sh -s - server%s`,
+		o.installURL(), t.Client.SudoPrefix(), env, shellQuote(token), o.release(), args,
 	)
 }
 
-func (o Options) agentInstallCmd(t Target, token, ip string) string {
-	env := fmt.Sprintf("K3S_URL=https://%s:6443 K3S_TOKEN=%s ", ip, shellQuote(token))
+func (o Options) agentInstallCmd(t Target, env, token, ip string) string {
+	join := fmt.Sprintf("K3S_URL=https://%s:6443 K3S_TOKEN=%s ", ip, shellQuote(token))
 	if o.offline() {
-		return offlineInstallCmd(t.Client.SudoPrefix(), env, "agent", withSpace(o.AgentExtraArgs))
+		return offlineInstallCmd(t.Client.SudoPrefix(), join, "agent", withSpace(o.AgentExtraArgs))
 	}
 	return fmt.Sprintf(
-		`curl -sfL %s | %s%s%s sh -s - agent%s`,
-		o.installURL(), t.Client.SudoPrefix(), env, o.release(), withSpace(o.AgentExtraArgs),
+		`curl -sfL %s | %s%s%s%s sh -s - agent%s`,
+		o.installURL(), t.Client.SudoPrefix(), env, join, o.release(), withSpace(o.AgentExtraArgs),
 	)
 }
 
@@ -190,10 +199,32 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 			fmt.Fprintf(opts.Progress, format+"\n", a...)
 		}
 	}
+	nodes := append(append([]Target{}, servers...), agents...)
+
 	// Every node is given a chance to finish booting before anything is
 	// installed on it.
-	for _, t := range append(append([]Target{}, servers...), agents...) {
+	for _, t := range nodes {
 		waitForCloudInit(t, opts.Progress)
+	}
+
+	// A node with no route out can borrow this machine's, or be pointed at a
+	// mirror the operator runs. Neither is needed for an offline bundle, which
+	// is why both are optional.
+	var proxies []*nodeProxy
+	if opts.ViaProxy {
+		var err error
+		proxies, err = startProxies(nodes, opts.ProxyAllow, opts.Progress)
+		if err != nil {
+			return err
+		}
+		defer stopProxies(proxies)
+	}
+	if !opts.Mirror.empty() {
+		for _, t := range nodes {
+			if err := applyAptMirror(t, opts.Mirror, opts.Progress); err != nil {
+				return err
+			}
+		}
 	}
 
 	// An offline install has to put the bundle on every node before anything
@@ -206,7 +237,7 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 			return err
 		}
 		progressf("offline install from %s (k3s %s, %s)", opts.BundleDir, m.Version, m.Arch)
-		all := append(append([]Target{}, servers...), agents...)
+		all := nodes
 		// Every node's architecture is checked before any node is uploaded to.
 		// Finding the mismatch on the last one, after two full transfers, is
 		// the same waste this check exists to avoid.
@@ -253,7 +284,12 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	if opts.Token != "" {
 		tokenArg = " K3S_TOKEN=" + shellQuote(opts.Token)
 	}
-	cmd := opts.serverInstallCmd(first, tokenArg, initArgs)
+	// The environment goes on both sides of the pipe. Outside sudo it reaches
+	// curl, which fetches the installer; inside it reaches the installer
+	// itself, which fetches the k3s binary — sudo resets the environment, so
+	// the outer copy alone leaves the larger download unproxied.
+	env := proxyEnv(proxies, first.Node.Host)
+	cmd := env + opts.serverInstallCmd(first, env, tokenArg, initArgs)
 	if code, err := streamSudo(first.Client, cmd, opts.Progress); err != nil || code != 0 {
 		return installFailure("server install", code, err)
 	}
@@ -273,7 +309,8 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	// 3. remaining servers join the etcd cluster
 	for _, s := range servers[1:] {
 		progressf("[%s] joining as server (etcd member)...", s.Node.Host)
-		joinCmd := opts.joinServerCmd(s, token, ip)
+		env := proxyEnv(proxies, s.Node.Host)
+		joinCmd := env + opts.joinServerCmd(s, env, token, ip)
 		if code, err := streamSudo(s.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 			return installFailure("server "+s.Node.Host+" join", code, err)
 		}
@@ -287,7 +324,8 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 	// 4. agents
 	for _, a := range agents {
 		progressf("[%s] installing k3s agent...", a.Node.Host)
-		joinCmd := opts.agentInstallCmd(a, token, ip)
+		env := proxyEnv(proxies, a.Node.Host)
+		joinCmd := env + opts.agentInstallCmd(a, env, token, ip)
 		if code, err := streamSudo(a.Client, joinCmd, opts.Progress); err != nil || code != 0 {
 			return installFailure("agent "+a.Node.Host+" install", code, err)
 		}
