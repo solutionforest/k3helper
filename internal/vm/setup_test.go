@@ -1,8 +1,15 @@
 package vm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/solutionforest/k3helper/internal/bundle"
 
 	"github.com/solutionforest/k3helper/internal/ssh"
 	"strings"
@@ -615,5 +622,214 @@ func TestJoinAddressFallsBackToDiscoveryForLocalNode(t *testing.T) {
 	all := strings.Join(rec, "\n")
 	if !strings.Contains(all, "K3S_URL=https://10.0.0.1:6443") {
 		t.Errorf("a local server did not fall back to a discovered address:\n%s", all)
+	}
+}
+
+// A fresh cloud VM answers sshd before cloud-init has finished with it, and in
+// that window apt is still replacing ca-certificates — so every https download
+// on the box fails TLS verification. Installing into that window produced
+// "curl failed to verify the legitimacy of the server" on real DigitalOcean
+// droplets, which reads like a firewall problem and is not one.
+func TestSetupWaitsForCloudInitBeforeInstalling(t *testing.T) {
+	var rec []string
+	servers := fakeTargets(&rec, "s1")
+	agents := fakeTargets(&rec, "a1")
+	if err := Setup(servers, agents, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	firstInstall, cloudInit := -1, -1
+	for i, c := range rec {
+		if cloudInit < 0 && strings.Contains(c, "cloud-init status --wait") {
+			cloudInit = i
+		}
+		if firstInstall < 0 && strings.Contains(c, "get.k3s.io") {
+			firstInstall = i
+		}
+	}
+	if cloudInit < 0 {
+		t.Fatal("cloud-init was never waited on")
+	}
+	if firstInstall < 0 {
+		t.Fatal("nothing was installed")
+	}
+	if cloudInit > firstInstall {
+		t.Errorf("waited for cloud-init at step %d, after installing at step %d", cloudInit, firstInstall)
+	}
+}
+
+// kubeadm's prerequisites run apt, which collides with cloud-init's dpkg lock
+// on a machine that has only just booted.
+func TestKubeadmWaitsForCloudInitBeforeApt(t *testing.T) {
+	var rec []string
+	if err := SetupKubeadm(fakeTargets(&rec, "s1"), nil, KubeadmOptions{}); err != nil {
+		t.Fatalf("SetupKubeadm: %v", err)
+	}
+	cloudInit, prereq := -1, -1
+	for i, c := range rec {
+		if cloudInit < 0 && strings.Contains(c, "cloud-init status --wait") {
+			cloudInit = i
+		}
+		if prereq < 0 && strings.Contains(c, "base64 -d") {
+			prereq = i
+		}
+	}
+	if cloudInit < 0 {
+		t.Fatal("cloud-init was never waited on")
+	}
+	if prereq >= 0 && cloudInit > prereq {
+		t.Errorf("ran the prerequisites at step %d before waiting for cloud-init at step %d", prereq, cloudInit)
+	}
+}
+
+// A machine without cloud-init must not be held up by the check.
+func TestCloudInitWaitIsGuarded(t *testing.T) {
+	var rec []string
+	if err := Setup(fakeTargets(&rec, "s1"), nil, Options{}); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var wait string
+	for _, c := range rec {
+		if strings.Contains(c, "cloud-init status --wait") {
+			wait = c
+		}
+	}
+	if !strings.Contains(wait, "command -v cloud-init") {
+		t.Errorf("the wait is not guarded by a presence check: %s", wait)
+	}
+	if !strings.Contains(wait, "timeout 300") {
+		t.Errorf("a stuck cloud-init would hang the install forever: %s", wait)
+	}
+}
+
+// uploadHost is a fakeHost that can also receive files, so the offline path
+// can be driven without a VM.
+type uploadHost struct {
+	fakeHost
+	uploaded map[string]int64
+	uname    string
+	sums     map[string]string
+}
+
+func (u *uploadHost) Run(cmd string) (string, int, error) {
+	if strings.Contains(cmd, "uname -m") {
+		return u.uname + "\n", 0, nil
+	}
+	if strings.Contains(cmd, "sha256sum") {
+		// Match the exact staged path, not a substring: "k3s" is also a
+		// substring of "k3s-airgap-images.tar.zst", so a looser match hands
+		// back the binary's hash for the image archive.
+		for name, sum := range u.sums {
+			if strings.Contains(cmd, "'"+remoteStage+"/"+name+"'") {
+				return sum + "\n", 0, nil
+			}
+		}
+		return "", 0, nil
+	}
+	return u.fakeHost.Run(cmd)
+}
+
+func (u *uploadHost) WriteFileFrom(path string, r io.Reader, mode os.FileMode, progress func(int64)) error {
+	n, err := io.Copy(io.Discard, r)
+	if u.uploaded == nil {
+		u.uploaded = map[string]int64{}
+	}
+	u.uploaded[path] = n
+	return err
+}
+
+// writeBundle creates a bundle on disk for the offline path to install from.
+func writeBundle(t *testing.T, arch string) (string, *bundle.Manifest) {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		bundle.BinaryName:  "#!/bin/false\n",
+		bundle.ImagesName:  "not really a tarball",
+		bundle.InstallName: "#!/bin/sh\n",
+	}
+	m := &bundle.Manifest{Version: "v1.31.2+k3s1", Arch: arch}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(body))
+		switch name {
+		case bundle.BinaryName:
+			m.BinarySHA = hex.EncodeToString(sum[:])
+		case bundle.ImagesName:
+			m.ImagesSHA = hex.EncodeToString(sum[:])
+		}
+	}
+	data, _ := json.Marshal(m)
+	if err := os.WriteFile(filepath.Join(dir, bundle.ManifestName), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return dir, m
+}
+
+// A bundle for the wrong architecture is refused before anything is uploaded.
+// Finding out afterwards means a few hundred megabytes sent to a machine that
+// was never going to run it.
+func TestOfflineRefusesWrongArchBeforeUploading(t *testing.T) {
+	var rec []string
+	dir, _ := writeBundle(t, "arm64")
+	host := &uploadHost{fakeHost: fakeHost{name: "s1", rec: &rec}, uname: "x86_64"}
+	err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil, Options{BundleDir: dir})
+	if err == nil {
+		t.Fatal("an arm64 bundle was accepted on an amd64 node")
+	}
+	if !strings.Contains(err.Error(), "arm64") || !strings.Contains(err.Error(), "amd64") {
+		t.Errorf("the error does not name both architectures: %v", err)
+	}
+	if len(host.uploaded) != 0 {
+		t.Errorf("uploaded %d file(s) before checking the architecture", len(host.uploaded))
+	}
+}
+
+// An upload that did not survive the link is caught by its hash, rather than
+// becoming a cluster that installs cleanly and then will not run pods.
+func TestOfflineDetectsACorruptedUpload(t *testing.T) {
+	var rec []string
+	dir, _ := writeBundle(t, "amd64")
+	host := &uploadHost{
+		fakeHost: fakeHost{name: "s1", rec: &rec},
+		uname:    "x86_64",
+		sums:     map[string]string{bundle.BinaryName: strings.Repeat("00", 32)},
+	}
+	err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil, Options{BundleDir: dir})
+	if err == nil {
+		t.Fatal("a corrupted upload was installed")
+	}
+	if !strings.Contains(err.Error(), "corrupted") {
+		t.Errorf("unhelpful error for a bad hash: %v", err)
+	}
+}
+
+// The happy path uploads all three files and installs with the download
+// skipped, which is the whole point: the node never reaches the internet.
+func TestOfflineInstallsWithoutDownloading(t *testing.T) {
+	var rec []string
+	dir, m := writeBundle(t, "amd64")
+	host := &uploadHost{
+		fakeHost: fakeHost{name: "s1", rec: &rec},
+		uname:    "x86_64",
+		sums:     map[string]string{bundle.BinaryName: m.BinarySHA, bundle.ImagesName: m.ImagesSHA},
+	}
+	if err := Setup([]Target{{Node: ssh.Node{Host: "s1"}, Client: host}}, nil,
+		Options{BundleDir: dir}); err != nil {
+		t.Fatalf("offline setup: %v", err)
+	}
+	if len(host.uploaded) != 3 {
+		t.Errorf("uploaded %d files, want 3: %v", len(host.uploaded), host.uploaded)
+	}
+	all := strings.Join(rec, "\n")
+	if !strings.Contains(all, "INSTALL_K3S_SKIP_DOWNLOAD=true") {
+		t.Errorf("the installer was not told to skip the download:\n%s", all)
+	}
+	if strings.Contains(all, "get.k3s.io") {
+		t.Errorf("an offline install still reached for the internet:\n%s", all)
+	}
+	// The staged copy is a few hundred megabytes on a real node.
+	if !strings.Contains(all, "rm -rf '"+remoteStage+"'") {
+		t.Errorf("the staging directory was left behind:\n%s", all)
 	}
 }

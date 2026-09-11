@@ -28,6 +28,33 @@ Live testing against real DigitalOcean VMs, and the four bugs it found.
 
 ### Fixed
 
+- **kubeadm advertised the wrong API server address**, for the same reason the
+  k3s path did: `kubeadm init` defaults it to the default route's interface,
+  which on a cloud VM is the public one, and the join command handed to every
+  agent is built from it. Both paths now share one resolver.
+- **The TUI dashboard was blank for a kubeconfig cluster.** It drew one card
+  per node in the targets file, and a kubeconfig cluster has no nodes — so the
+  skipped host checks and the reason for them never reached the screen. An
+  empty dashboard reads as "all clear", which is what those results exist to
+  prevent. Skipped checks are also now counted in the summary line instead of
+  vanishing from `0 ok, 0 warn, 0 fail`.
+- **`--bundle` was silently ignored with `--distro kubeadm`**, so an operator
+  asking for an offline install got an online one and found out on an
+  air-gapped node. It is refused now, as is `--bundle` with `--k3s-version`,
+  which contradict each other.
+- **A bundle's architecture was recorded and never checked.** Installing an
+  arm64 build on an amd64 node would have failed as "cannot execute binary
+  file" after a 260MB upload. Every node is checked before any node is uploaded
+  to.
+- **Uploaded bundles were neither verified nor cleaned up.** The manifest
+  already had the hashes; they are now checked on the node after the transfer,
+  and the staged copy is removed once the installer has run rather than left on
+  every node's disk.
+- **cloud-init raced the installer.** A fresh cloud image is still replacing
+  ca-certificates when sshd starts answering, and https downloads fail TLS
+  verification until it finishes — which looks like a firewall problem and is
+  not one. Both install paths wait first; kubeadm needed it more, since its
+  prerequisites run apt straight into cloud-init's dpkg lock.
 - **Agents joined on the wrong address.** The join address was discovered with
   `hostname -I`, which returns a cloud VM's public address first — the one
   address an air-gapped network cannot reach. Agents retried "failed to get CA

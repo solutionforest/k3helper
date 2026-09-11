@@ -4,6 +4,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1132,7 +1133,7 @@ func (m Model) footer() string {
 // dashboardBody renders the per-node check cards with load sparklines.
 func (m Model) dashboardBody() string {
 	var b strings.Builder
-	ok, warn, fail := 0, 0, 0
+	ok, warn, fail, skipped := 0, 0, 0, 0
 	for _, rs := range m.results {
 		for _, r := range rs {
 			switch r.Status {
@@ -1142,6 +1143,8 @@ func (m Model) dashboardBody() string {
 				warn++
 			case check.Fail:
 				fail++
+			case check.Skip:
+				skipped++
 			}
 		}
 	}
@@ -1151,13 +1154,26 @@ func (m Model) dashboardBody() string {
 	} else {
 		b.WriteString("  ")
 	}
-	b.WriteString(fmt.Sprintf("%s %d ok   %s %d warn   %s %d fail\n\n",
+	counts := fmt.Sprintf("%s %d ok   %s %d warn   %s %d fail",
 		statusOKStyle.Render("●"), ok,
 		statusWarnStyle.Render("●"), warn,
-		statusFailStyle.Render("●"), fail))
+		statusFailStyle.Render("●"), fail)
+	// Skipped checks are counted out loud. Without this a kubeconfig cluster
+	// reads "0 ok, 0 warn, 0 fail", which looks like nothing ran rather than
+	// like six host checks were deliberately not applicable.
+	if skipped > 0 {
+		counts += fmt.Sprintf("   %s %d skipped", helpStyle.Render("●"), skipped)
+	}
+	b.WriteString(counts + "\n\n")
 
-	for _, node := range m.targets.Nodes {
-		rs := m.results[node.Name]
+	// Nodes first, in the order the targets file lists them, then anything
+	// else that produced results. A kubeconfig cluster has no nodes at all,
+	// and iterating only over them drew an empty dashboard — which is exactly
+	// the "nothing shown reads as all clear" that the skipped results exist to
+	// avoid.
+	for _, name := range m.resultOrder() {
+		rs := m.results[name]
+		node := m.nodeNamed(name)
 		var lines []string
 		for _, r := range rs {
 			style := statusOKStyle
@@ -1172,13 +1188,52 @@ func (m Model) dashboardBody() string {
 				lines = append(lines, "    "+statusFailStyle.Render("↳ "+r.Remediation))
 			}
 		}
-		if graph := m.nodeGraphs(node.Name); graph != "" {
+		if graph := m.nodeGraphs(name); graph != "" {
 			lines = append(lines, graph)
 		}
-		card := fmt.Sprintf("%s (%s)\n%s", node.Name, node.Role, strings.Join(lines, "\n"))
+		title := name
+		if node.Role != "" {
+			title = fmt.Sprintf("%s (%s)", name, node.Role)
+		}
+		card := fmt.Sprintf("%s\n%s", title, strings.Join(lines, "\n"))
 		b.WriteString(paneBorder.Render(card) + "\n")
 	}
 	return b.String()
+}
+
+// resultOrder lists the groups the dashboard draws: the targets file's nodes
+// first, in its order, then any group that produced results without being a
+// node in the file — which is how a kubeconfig cluster's skipped host checks
+// reach the screen at all.
+func (m Model) resultOrder() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, n := range m.targets.Nodes {
+		if _, ok := m.results[n.Name]; ok {
+			out = append(out, n.Name)
+			seen[n.Name] = true
+		}
+	}
+	var rest []string
+	for name := range m.results {
+		if !seen[name] {
+			rest = append(rest, name)
+		}
+	}
+	sort.Strings(rest)
+	return append(out, rest...)
+}
+
+// nodeNamed returns the targets-file node with this name, or a zero node when
+// the group is not one — a kubeconfig cluster's results are filed under the
+// context, which is not a machine.
+func (m Model) nodeNamed(name string) config.Node {
+	for _, n := range m.targets.Nodes {
+		if n.Name == name {
+			return n
+		}
+	}
+	return config.Node{}
 }
 
 // nodeGraphs is the CPU/memory sparkline pair for one node's card.

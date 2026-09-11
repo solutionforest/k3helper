@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"time"
 )
@@ -39,6 +40,9 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 
 	// 1. prerequisites, every node
 	for _, t := range all {
+		// Before apt runs, or it collides with cloud-init's dpkg lock on a
+		// machine that has only just booted.
+		waitForCloudInit(t, opts.Progress)
 		progressf("[%s] preparing host (containerd, kernel modules, sysctls, kubeadm)...", t.Node.Host)
 		// The script is multi-line and contains quotes of its own, so it is
 		// shipped base64-encoded and fed to a root shell rather than being
@@ -53,10 +57,26 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 
 	// 2. control plane
 	first := servers[0]
+
+	// Pin the address the API server advertises, because the join command the
+	// agents are handed later is built from it.
+	//
+	// kubeadm's default is the address of the default route's interface, which
+	// on a cloud VM is the public one — the same trap the k3s path fell into,
+	// where agents on a private network were handed a public address they
+	// could not reach and retried against it indefinitely. The address from
+	// the targets file is the one the operator chose and the one k3helper has
+	// just proved works by connecting over it.
+	advertise := ""
+	if ip, err := resolveJoinAddress(opts.JoinAddress, first, first.Client); err == nil && net.ParseIP(ip) != nil {
+		advertise = " --apiserver-advertise-address=" + shellQuote(ip)
+		progressf("[%s] API server will advertise %s", first.Node.Host, ip)
+	}
+
 	progressf("[%s] kubeadm init (pod network %s)...", first.Node.Host, opts.podCIDR())
 	initCmd := fmt.Sprintf(
-		`%skubeadm init --pod-network-cidr=%s%s`,
-		first.Client.SudoPrefix(), shellQuote(opts.podCIDR()), withSpace(opts.InitExtraArgs))
+		`%skubeadm init --pod-network-cidr=%s%s%s`,
+		first.Client.SudoPrefix(), shellQuote(opts.podCIDR()), advertise, withSpace(opts.InitExtraArgs))
 	if opts.SkipConntrackTuning {
 		// A config file rather than flags: kube-proxy's conntrack settings
 		// have no command-line equivalent on kubeadm init.
@@ -67,8 +87,8 @@ func SetupKubeadm(servers []Target, agents []Target, opts KubeadmOptions) error 
 		)); err != nil || code != 0 {
 			return fmt.Errorf("write kubeadm config: %s", exitReason(code, err))
 		}
-		initCmd = fmt.Sprintf(`%skubeadm init --config /etc/kubernetes/k3helper-init.yaml%s`,
-			first.Client.SudoPrefix(), withSpace(opts.InitExtraArgs))
+		initCmd = fmt.Sprintf(`%skubeadm init --config /etc/kubernetes/k3helper-init.yaml%s%s`,
+			first.Client.SudoPrefix(), advertise, withSpace(opts.InitExtraArgs))
 	}
 	if code, err := streamSudo(first.Client, initCmd, opts.Progress); err != nil || code != 0 {
 		return fmt.Errorf("kubeadm init failed: %s", exitReason(code, err))
@@ -125,6 +145,10 @@ type KubeadmOptions struct {
 	CNI string
 	// InitExtraArgs is appended to `kubeadm init`.
 	InitExtraArgs string
+	// JoinAddress overrides the address the API server advertises, which is
+	// the address the join command hands to every agent. Empty takes it from
+	// the targets file.
+	JoinAddress string
 	// SkipConntrackTuning stops kube-proxy managing nf_conntrack_max.
 	//
 	// kube-proxy raises that sysctl at startup and dies if it cannot. On hosts

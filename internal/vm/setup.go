@@ -55,11 +55,12 @@ func (o *Options) installURL() string {
 // the operator). Passing a nil error to %w printed "%!w(<nil>)" where the
 // reason should have been — seen against a real VM, and it is the last thing
 // on screen when an install fails.
+//
+// The kubeadm path has always got this right through exitReason; this is the
+// k3s path being brought to the same place rather than a second way of saying
+// it.
 func installFailure(what string, code int, err error) error {
-	if err != nil {
-		return fmt.Errorf("%s failed: %w", what, err)
-	}
-	return fmt.Errorf("%s failed (exit %d) — the install output above says why", what, code)
+	return fmt.Errorf("%s failed: %s", what, exitReason(code, err))
 }
 
 func (o Options) channel() string {
@@ -127,6 +128,38 @@ func (o Options) agentInstallCmd(t Target, token, ip string) string {
 	)
 }
 
+// waitForCloudInit blocks until a freshly booted cloud VM has finished setting
+// itself up.
+//
+// sshd answers well before cloud-init is done. In that window the machine is
+// still running apt, which on a fresh Ubuntu image includes replacing
+// ca-certificates — and every https download on the box fails TLS
+// verification while it does. Installing k3s there fails with "curl failed to
+// verify the legitimacy of the server", which reads like a network policy
+// problem and is not one. The kubeadm path has it worse: its prerequisites run
+// apt straight into cloud-init's dpkg lock.
+//
+// Seen on real DigitalOcean droplets, roughly 30 seconds after boot.
+//
+// A machine without cloud-init returns immediately, and a cloud-init that
+// never finishes is waited on for five minutes and then left alone: an install
+// that proceeds and fails with a real message beats one that hangs forever.
+func waitForCloudInit(t Target, progress io.Writer) {
+	const script = `command -v cloud-init >/dev/null 2>&1 || exit 0
+if command -v timeout >/dev/null 2>&1; then
+  timeout 300 cloud-init status --wait >/dev/null 2>&1 || true
+else
+  cloud-init status --wait >/dev/null 2>&1 || true
+fi`
+	// A status check first, so the wait is only announced when there is
+	// actually something to wait for.
+	out, code, err := t.Client.Run(`command -v cloud-init >/dev/null 2>&1 && cloud-init status 2>/dev/null | head -1 || true`)
+	if err == nil && code == 0 && strings.Contains(out, "running") && progress != nil {
+		fmt.Fprintf(progress, "[%s] waiting for cloud-init to finish before installing...\n", t.Node.Host)
+	}
+	t.Client.Run(script)
+}
+
 // Host is what Setup needs from a connection. *ssh.Client satisfies it; tests
 // substitute a recorder so the install commands can be asserted without a VM.
 type Host interface {
@@ -157,6 +190,12 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 			fmt.Fprintf(opts.Progress, format+"\n", a...)
 		}
 	}
+	// Every node is given a chance to finish booting before anything is
+	// installed on it.
+	for _, t := range append(append([]Target{}, servers...), agents...) {
+		waitForCloudInit(t, opts.Progress)
+	}
+
 	// An offline install has to put the bundle on every node before anything
 	// is installed anywhere. Doing it per node as we go would leave a cluster
 	// half built when the last node turns out to be missing a file that was
@@ -167,11 +206,26 @@ func Setup(servers []Target, agents []Target, opts Options) error {
 			return err
 		}
 		progressf("offline install from %s (k3s %s, %s)", opts.BundleDir, m.Version, m.Arch)
-		for _, t := range append(append([]Target{}, servers...), agents...) {
+		all := append(append([]Target{}, servers...), agents...)
+		// Every node's architecture is checked before any node is uploaded to.
+		// Finding the mismatch on the last one, after two full transfers, is
+		// the same waste this check exists to avoid.
+		for _, t := range all {
+			if err := checkArch(t, m.Arch); err != nil {
+				return err
+			}
+		}
+		for _, t := range all {
 			if err := stageBundle(t, opts.BundleDir, m, opts.Progress); err != nil {
 				return err
 			}
 		}
+		// The staged copies are only needed until the installer has run.
+		defer func() {
+			for _, t := range all {
+				cleanStage(t)
+			}
+		}()
 	}
 	if len(servers) == 0 {
 		return fmt.Errorf("at least one server is required")
@@ -315,8 +369,14 @@ func serverInternalIP(server Runner) (string, error) {
 // Discovery remains the fallback for a local node, which has no host address
 // to take.
 func (o Options) joinAddress(first Target, client Runner) (string, error) {
-	if o.JoinAddress != "" {
-		return o.JoinAddress, nil
+	return resolveJoinAddress(o.JoinAddress, first, client)
+}
+
+// resolveJoinAddress is shared by the k3s and kubeadm paths, which have the
+// same problem and had better not answer it two different ways.
+func resolveJoinAddress(override string, first Target, client Runner) (string, error) {
+	if override != "" {
+		return override, nil
 	}
 	h := strings.TrimSpace(first.Node.Host)
 	if h != "" && !first.Node.Local && h != "localhost" && h != "127.0.0.1" {

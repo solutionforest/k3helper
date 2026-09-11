@@ -9,6 +9,7 @@ import (
 
 	"github.com/solutionforest/k3helper/internal/check"
 	"github.com/solutionforest/k3helper/internal/config"
+	"strings"
 )
 
 func testTargets() *config.Targets {
@@ -97,5 +98,49 @@ func TestHealthScoreIgnoresSkippedChecks(t *testing.T) {
 	// 2 OK out of 3 that were actually run; the skip is not a third failure.
 	if score != 66 {
 		t.Errorf("score = %d%%, want 66%% (2 of 3 run, skip excluded)", score)
+	}
+}
+
+// A kubeconfig cluster has no nodes in its targets file, and the dashboard
+// used to iterate only over those — so the skipped host checks, and the reason
+// they were skipped, never reached the screen. An empty dashboard reads as
+// "all clear", which is the one thing those results exist to prevent.
+func TestDashboardShowsResultsForClustersWithNoNodes(t *testing.T) {
+	m := Model{
+		targets: &config.Targets{Cluster: "prod", Kubeconfig: "/k/c.yaml"},
+		results: map[string][]check.Result{
+			"prod-admin (kubeconfig)": check.SkippedHostResults("server"),
+		},
+		hist: newHistory(),
+	}
+	body := m.dashboardBody()
+	if !strings.Contains(body, "prod-admin") {
+		t.Errorf("the result group is not on the dashboard:\n%s", body)
+	}
+	if !strings.Contains(body, "kubeconfig cluster") {
+		t.Errorf("the reason the checks were skipped is not shown:\n%s", body)
+	}
+	if !strings.Contains(body, "skipped") {
+		t.Errorf("the counter does not mention skipped checks:\n%s", body)
+	}
+}
+
+// Nodes keep the targets file's order, which is the order an operator wrote
+// them in and expects to read them in.
+func TestDashboardKeepsNodeOrder(t *testing.T) {
+	m := Model{
+		targets: &config.Targets{Nodes: []config.Node{
+			{Name: "server", Role: "server"},
+			{Name: "agent1", Role: "agent"},
+		}},
+		results: map[string][]check.Result{
+			"agent1": {{Name: "Disk", Status: check.OK, Summary: "fine"}},
+			"server": {{Name: "Disk", Status: check.OK, Summary: "fine"}},
+		},
+		hist: newHistory(),
+	}
+	body := m.dashboardBody()
+	if strings.Index(body, "server") > strings.Index(body, "agent1") {
+		t.Errorf("agent1 was drawn before server:\n%s", body)
 	}
 }

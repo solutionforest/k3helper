@@ -154,12 +154,32 @@ func newVMSetupCmd() *cobra.Command {
 				}
 			}
 
+			// Flags that only mean something for one distribution are refused
+			// rather than ignored. An operator who asks for an offline install
+			// and silently gets an online one finds out on an air-gapped node,
+			// from a TLS error, at the worst possible moment.
+			if distro == "kubeadm" {
+				if bundleDir != "" {
+					return fmt.Errorf("--bundle builds a k3s bundle and only the k3s installer can use it; " +
+						"an offline kubeadm install needs distribution packages and registry.k8s.io images, " +
+						"which this does not yet assemble. Use --distro k3s, or install kubeadm's prerequisites yourself")
+				}
+				if k3sVersion != "" {
+					return fmt.Errorf("--k3s-version applies to --distro k3s; for kubeadm use --k8s-version")
+				}
+			}
+			if bundleDir != "" && k3sVersion != "" {
+				return fmt.Errorf("--bundle and --k3s-version contradict each other: " +
+					"a bundle already contains one exact k3s release, recorded in its bundle.json")
+			}
+
 			if distro == "kubeadm" {
 				if err := vm.SetupKubeadm(servers, agents, vm.KubeadmOptions{
 					Version:             k8sVersion,
 					CNI:                 cni,
 					InitExtraArgs:       extraArgs,
 					SkipConntrackTuning: noConntrack,
+					JoinAddress:         joinAddress,
 					Progress:            cmd.OutOrStdout(),
 				}); err != nil {
 					return err

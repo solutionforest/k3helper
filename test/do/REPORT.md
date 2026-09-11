@@ -211,15 +211,74 @@ kubeconfig cluster, and the TUI counted a skip as "not OK" — putting
 **Fixed:** a skip is excluded from both halves of the fraction, so it reads
 `score n/a`.
 
-### 5. Confirmed working, unchanged
+### 5. cloud-init races the installer
+
+A fresh Ubuntu image is still replacing `ca-certificates` when sshd starts
+answering, and every https download on the box fails TLS verification while it
+does. An install in that window dies with "curl failed to verify the legitimacy
+of the server", which reads like a firewall problem and is not one. It bit this
+run about 30 seconds after boot.
+
+**Fixed in the product**, not just the test tooling: both install paths now
+wait for cloud-init before touching the machine — guarded by a presence check
+so a node without cloud-init is not delayed, and bounded at five minutes so a
+stuck one cannot hang the install. The kubeadm path needed it more than k3s:
+its prerequisites run `apt` straight into cloud-init's dpkg lock.
+
+### 6. Confirmed working, unchanged
 
 - **The crashloop fix from v0.5.0 earned itself.** The pod was caught with its
   container `terminated`, not `waiting: CrashLoopBackOff` — precisely the
   sampling window the old code missed. The restart count caught it.
-- **`cloud-init` races the installer.** A fresh Ubuntu image is still replacing
-  `ca-certificates` when sshd starts answering, and an install in that window
-  fails TLS verification for reasons that have nothing to do with the network.
-  The test tooling now waits; worth knowing before blaming a firewall.
+
+---
+
+## A second pass: what the audit found after the fixes
+
+Each fault above is an instance of a class, so the codebase was searched for
+siblings. Six more, none of which had been exercised live.
+
+**The same join-address bug exists in the kubeadm path.** `kubeadm init`
+defaults the API server's advertise address to the default route's interface —
+the public one on a cloud VM — and the join command handed to every agent is
+built from it. Identical failure, different installer. Fixed the same way, and
+the resolver is now shared rather than implemented twice. Found by reading, not
+by running: the kubeadm path was never live-tested here.
+
+**The dashboard was blank for a kubeconfig cluster.** It iterated the targets
+file's nodes, and a kubeconfig cluster has none — so the skipped host checks
+and their reason never reached the screen. An empty dashboard reads as "all
+clear", which is the one thing those skipped results exist to prevent. This is
+the same bug as the 0% score, one layer up.
+
+![kubeconfig dashboard](screenshots/dashkube.png)
+
+*The kubeconfig dashboard after the fix. Before it, this screen was empty.*
+
+**Skipped checks were invisible in the counter**, which read `0 ok, 0 warn,
+0 fail` on a cluster where six checks had been deliberately skipped. Now says
+`6 skipped`.
+
+**`--bundle` with `--distro kubeadm` was silently ignored.** An operator asking
+for an offline install would have got an online one, and found out on an
+air-gapped node at the worst possible moment. Now refused with the reason.
+`--bundle` with `--k3s-version` is refused too — they contradict.
+
+**The bundle's architecture was recorded but never checked.** The manifest
+carries it and a comment claimed it prevented installing an arm64 build on an
+amd64 node; nothing compared the two, so the first sign would have been "cannot
+execute binary file" after a 260MB upload. Now checked on every node before any
+node is uploaded to.
+
+**Uploads were neither verified nor cleaned up.** 260MB over a link that may be
+a tunnel, with the hashes already in the manifest and unused. A truncated k3s
+binary fails immediately; a truncated image archive fails much later, as pods
+that will not start on a cluster that installed cleanly. Now hashed on the node
+after upload, and the staging copy is removed once the installer has run rather
+than left on every node's disk.
+
+**One of my own:** `installFailure` duplicated `exitReason`, which the kubeadm
+path had been using correctly all along. Consolidated.
 
 ---
 

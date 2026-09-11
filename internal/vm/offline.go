@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/solutionforest/k3helper/internal/bundle"
 )
@@ -51,6 +52,14 @@ func stageBundle(t Target, dir string, m *bundle.Manifest, progress io.Writer) e
 		}
 	}
 
+	// Check the architecture before sending 260MB to a machine that cannot run
+	// it. The manifest records what the bundle is for; without comparing it to
+	// the node, the first sign of a mismatch is the installer reporting
+	// "cannot execute binary file" after the whole upload has finished.
+	if err := checkArch(t, m.Arch); err != nil {
+		return err
+	}
+
 	if _, code, err := t.Client.Run(fmt.Sprintf("mkdir -p '%s'", remoteStage)); err != nil || code != 0 {
 		return fmt.Errorf("node %s: could not create a staging directory", t.Node.Host)
 	}
@@ -85,6 +94,14 @@ func stageBundle(t Target, dir string, m *bundle.Manifest, progress io.Writer) e
 		}
 	}
 
+	// Verify what landed. 260MB over a link that may be slow and may be a
+	// tunnel is worth one hash: a truncated k3s binary fails as "cannot
+	// execute binary file" and a truncated image archive fails much later, as
+	// pods that will not start on a cluster that installed cleanly.
+	if err := verifyStaged(t, m); err != nil {
+		return err
+	}
+
 	// Put everything where the installer looks. The image archive keeps its
 	// architecture-qualified name: k3s does not care what the file is called,
 	// but an operator looking at the directory later does.
@@ -98,6 +115,50 @@ func stageBundle(t Target, dir string, m *bundle.Manifest, progress io.Writer) e
 		return fmt.Errorf("node %s: could not place the bundle (exit %d): %s", t.Node.Host, code, out)
 	}
 	return nil
+}
+
+// verifyStaged hashes the uploaded files on the node and compares them with
+// the manifest.
+//
+// A node without sha256sum is not failed over it — the check is a safeguard,
+// not a requirement — but one that answers with a different hash is, because
+// continuing means installing something that is not what was fetched.
+func verifyStaged(t Target, m *bundle.Manifest) error {
+	for _, f := range []struct{ name, want string }{
+		{bundle.BinaryName, m.BinarySHA},
+		{bundle.ImagesName, m.ImagesSHA},
+	} {
+		if f.want == "" {
+			continue
+		}
+		out, code, err := t.Client.Run(fmt.Sprintf(
+			`command -v sha256sum >/dev/null 2>&1 && sha256sum '%s/%s' | cut -d' ' -f1 || true`,
+			remoteStage, f.name))
+		if err != nil || code != 0 {
+			continue
+		}
+		got := strings.TrimSpace(out)
+		if got == "" {
+			continue // no sha256sum on this node
+		}
+		if !strings.EqualFold(got, f.want) {
+			return fmt.Errorf("node %s: %s arrived corrupted (expected %s, got %s) — "+
+				"the upload did not survive the link; try again",
+				t.Node.Host, f.name, f.want[:12], got[:min(12, len(got))])
+		}
+	}
+	return nil
+}
+
+// cleanStage removes the uploaded copies once they are installed.
+//
+// The bundle is a few hundred megabytes and the node keeps the parts it needs
+// elsewhere: the binary at /usr/local/bin/k3s and the archive under
+// /var/lib/rancher. Leaving the staging copy behind wastes that much disk on
+// every node, on machines whose disks k3helper itself warns about when they
+// fill up.
+func cleanStage(t Target) {
+	t.Client.SudoRun(fmt.Sprintf("rm -rf '%s'", remoteStage))
 }
 
 // offlineInstallCmd renders the install command for a staged bundle.
@@ -122,4 +183,37 @@ func humanSize(n int64) string {
 	default:
 		return fmt.Sprintf("%dKB", n/1024)
 	}
+}
+
+// checkArch compares the bundle's architecture with the node's.
+//
+// A node that will not say what it is passes: `uname -m` is not worth failing
+// an install over, and the installer will report a mismatch soon enough. A
+// node that says something different is refused, because that is a certainty
+// rather than a guess.
+func checkArch(t Target, want string) error {
+	out, code, err := t.Client.Run("uname -m")
+	if err != nil || code != 0 {
+		return nil
+	}
+	got := archFromUname(strings.TrimSpace(out))
+	if got == "" || got == want {
+		return nil
+	}
+	return fmt.Errorf("node %s is %s but the bundle is for %s — "+
+		"rebuild it with `k3helper bundle k3s --version <ver> --arch %s`",
+		t.Node.Host, got, want, got)
+}
+
+// archFromUname maps the kernel's name for an architecture onto Go's, which is
+// what k3s uses in its release assets. An unrecognised value returns "", which
+// checkArch treats as "do not know, do not block".
+func archFromUname(m string) string {
+	switch m {
+	case "x86_64", "amd64":
+		return "amd64"
+	case "aarch64", "arm64":
+		return "arm64"
+	}
+	return ""
 }
